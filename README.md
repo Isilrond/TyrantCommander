@@ -27,6 +27,7 @@ you should be able to choose your account now
 ==================================================
 HAUPTMENÜ
 ==================================================
+
 1.  Spieler-Info
 2.  XML-Dateien aktualisieren
 3.  Deck aktualisieren (Slot bearbeiten + Attack/Defense setzen)
@@ -35,23 +36,28 @@ HAUPTMENÜ
 6.  Gildennachricht senden
 7.  Belohnungen abholen
 8.  Gildendecks exportieren
+
 ==================================================
+
 ── SHOP & SALVAGE ──
-9.  Pakete kaufen
-10. Alle Commons salvagen
-11. Alle Rares salvagen
-12. Base Epics salvagen (behalte X)
-13. Workflow: Kaufen + Commons + Rares + Base Epics salvagen
+10.  Pakete kaufen
+11. Alle Commons salvagen
+12. Alle Rares salvagen
+13. Base Epics salvagen (behalte X)
+14. Workflow: Kaufen + Commons + Rares + Base Epics salvagen
+
 ==================================================
+
 ── BUYBACK ──
 16. Karte zurückkaufen (WIP)
 17. Mehrere Karten zurückkaufen (just for testing)
+
 ==================================================
+
 ── INVENTAR ──
 14. Karte bauen (Fusion-Rezept & SP-Kosten)
+
 ==================================================
+
 ── DOMINION ──
 15. Dominion bauen (Auto-Build) ⭐
-==================================================
-0.  Beenden
-==================================================
