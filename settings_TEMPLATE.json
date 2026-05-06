@@ -1,0 +1,17 @@
+{
+    "request_data": {
+        "user_id": "xxx",
+        "password": "xxx",
+        "syncode": "xxx",
+        "kong_id": "xxx",
+        "kong_token": "xxx",
+        "kong_name": "xxx",
+        "unity": "Unity5_4_2",
+        "client_version": "80",
+        "device_type": "Firefox+85.0",
+        "os_version": "Windows 10",
+        "platform": "Web"
+    },
+    "url": "mobile.tyrantonline.com",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.121 Safari/537.36",
+}
