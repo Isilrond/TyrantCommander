@@ -31,25 +31,25 @@ Communicates directly via the official game API — no game client required.
 
 ```
 TUO-Live/
-├── tuo.exe                     ← Custom-compiled TUO (hand-state patch)
-├── TyrantAPICommander.py       ← Main script
-├── generate_war_html.py        ← Standalone Guild War HTML generator
-├── missions.xml
-├── achievements.xml
-├── items.xml
+├── tuo.exe
 └── data/
-    ├── settings_1.json         ← Account configuration
+    ├── TyrantAPICommander.py       ← Main script
+    ├── generate_war_html.py        ← Standalone Guild War HTML generator
+    ├── settings_1.json             ← Account configuration
     ├── settings_2.json
-    ├── settings/               ← Alternative: settings files in subfolder
-    ├── arenagauntlet.txt       ← Defense deck database
-    ├── attackdecks.txt         ← Attack deck database (auto-generated)
-    ├── outdatedIDs.txt         ← Card IDs to salvage (shared)
-    ├── import/                 ← Drop *.txt here for deck import (D→18)
-    ├── ownedcards/             ← Inventory export target (all accounts)
-    ├── export/                 ← Gauntlet output files
-    ├── combatlog/              ← Per-account combat logs (Arena + Brawl)
-    ├── energylog/              ← Hourly energy snapshots
-    ├── guildwar_stats/         ← Guild War JSON + HTML snapshots
+    ├── settings/                   ← Alternative: settings files in subfolder
+    ├── arenagauntlet.txt           ← Defense deck database
+    ├── attackdecks.txt             ← Attack deck database (auto-generated)
+    ├── outdatedIDs.txt             ← Card IDs to salvage (shared)
+    ├── import/                     ← Drop *.txt here for deck import (D→18)
+    ├── ownedcards/                 ← Inventory export target (all accounts)
+    ├── export/                     ← Gauntlet output files
+    ├── combatlog/                  ← Per-account combat logs (Arena + Brawl)
+    ├── energylog/                  ← Hourly energy snapshots
+    ├── guildwar_stats/             ← Guild War JSON + HTML snapshots
+    ├── missions.xml
+    ├── achievements.xml
+    ├── items.xml
     ├── cards_section_*.xml
     ├── fusion_recipes_cj2.xml
     └── database.yml
