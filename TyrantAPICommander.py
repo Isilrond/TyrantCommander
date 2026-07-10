@@ -1105,6 +1105,23 @@ $(document).ready(function(){
             if verbose:
                 print("✓ API connection successfully initialized")
                 print("✓ Login data is correct")
+            # ── Cache guild name into settings file for proxy lookups ────
+            _faction = self.init_data.get('faction')
+            if _faction and isinstance(_faction, dict):
+                _gname = _faction.get('name', '')
+                if _gname and self.api.settings.get('_guild_cache') != _gname:
+                    self.api.settings['_guild_cache'] = _gname
+                    try:
+                        import json as _jini
+                        _sf_path = self.api.settings_file if hasattr(self.api, 'settings_file') else None
+                        if _sf_path and os.path.isfile(_sf_path):
+                            with open(_sf_path, 'r', encoding='utf-8') as _fini:
+                                _scfg = _jini.load(_fini)
+                            _scfg['_guild_cache'] = _gname
+                            with open(_sf_path, 'w', encoding='utf-8') as _fini:
+                                _jini.dump(_scfg, _fini, indent=2)
+                    except Exception:
+                        pass  # non-critical
             return True
         except ValueError as e:
             # Settings-file error
@@ -1848,6 +1865,92 @@ $(document).ready(function(){
         print(f"  ALL ACCOUNTS DONE  |  {total_w}W {total_l}L  |  Gold +{total_g:,}")
         print(f"{'='*65}")
 
+    def play_first_quest_mission_all_accounts(self):
+        """
+        Runs play_first_quest_mission_loop for all accounts with play_enabled=true.
+        """
+        import glob as _glob, json as _json
+
+        print(f"\n{'='*65}")
+        print(f"  PLAY FIRST QUEST MISSION – ALL ACCOUNTS")
+        print(f"{'='*65}")
+
+        _settings_dirs = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings')]
+        settings_files = []
+        for _sd in _settings_dirs:
+            settings_files += _glob.glob(os.path.join(_sd, 'settings_*.json'))
+        settings_files = [f for f in settings_files
+                          if not os.path.basename(f).startswith('settings_TEMPLATE')]
+        settings_files = sorted({os.path.normpath(f): f for f in settings_files}.values())
+
+        if not settings_files:
+            print("  ✗ No settings_*.json files found")
+            return
+
+        playable = []
+        skipped  = []
+        for sf in settings_files:
+            nick = os.path.basename(sf).replace('settings_', '').replace('.json', '')
+            try:
+                with open(sf, 'r', encoding='utf-8') as fh:
+                    cfg = _json.load(fh)
+                if cfg.get('play_enabled', True):
+                    playable.append((nick, sf))
+                else:
+                    skipped.append(nick)
+            except Exception:
+                skipped.append(nick)
+
+        if skipped:
+            print(f"  ⏭  Skipped (play_enabled=false): {', '.join(skipped)}")
+        if not playable:
+            print("  ✗ No eligible accounts found")
+            return
+
+        # ── Account range / loop selection ───────────────────────
+        active_accounts, loop_mode = _select_account_range(playable, 'QUEST MISSION')
+        if active_accounts is None:
+            return
+
+        total_w = total_l = total_g = 0
+        _loop_count = 0
+        while True:
+            _loop_count += 1
+            if loop_mode:
+                print(f"\n{'═'*65}")
+                print(f"  LOOP #{_loop_count}")
+                print(f"{'═'*65}")
+            for nick, sf in active_accounts:
+                print(f"\n{'─'*55}")
+                print(f"  ▶ {nick}")
+                print(f"{'─'*55}")
+                try:
+                    tmp = TyrantCommander(sf)
+                    if not tmp.initialize(verbose=False):
+                        print(f"  ✗ Login failed")
+                        continue
+                    w, l, g = tmp.play_first_quest_mission_loop()
+                    total_w += w; total_l += l; total_g += g
+                except PleaseWaitError as e:
+                    print(f"  ✗ API busy: {e}")
+                except Exception as e:
+                    print(f"  ✗ Error: {e}")
+                    import traceback; traceback.print_exc()
+                sleep(1)
+
+            if not loop_mode:
+                break
+            try:
+                print(f"\n  Loop {_loop_count} complete – press Ctrl+C to stop...")
+                import time as _t; _t.sleep(2)
+            except KeyboardInterrupt:
+                print("\n  ↩ Loop stopped by user")
+                break
+
+        print(f"\n{'='*65}")
+        print(f"  ALL ACCOUNTS DONE  |  {total_w}W {total_l}L  |  Gold +{total_g:,}")
+        print(f"{'='*65}")
+
     def pity_the_fool_runner(self):
         """
         Automated runner for the 'Pity the Fool' PvP Challenge.
@@ -2286,6 +2389,9 @@ $(document).ready(function(){
 
         if not missions:
             print(f"  ✗ No active quest missions found")
+            # ── Restore deck slot even on early exit ─────────────────
+            if _slot6_exists and _prev_slot_m != MISSION_SLOT:
+                self.api.call('setActiveDeck', deck_id=_prev_slot_m)
             return 0, 0, 0
 
         selected   = missions[0]
@@ -2356,22 +2462,6 @@ $(document).ready(function(){
             self.api.call('setActiveDeck', deck_id=_prev_slot_m)
 
         return wins, losses, gold_total
-        """
-        Plays the first available quest mission for all play_enabled accounts
-        using Deck 1 until energy is depleted - no interactive prompts.
-        """
-        import glob as _glob, json as _json
-
-        print(f"\n{'='*65}")
-        print(f"  PLAY FIRST QUEST MISSION – ALL ACCOUNTS")
-        print(f"{'='*65}")
-
-        _settings_dirs = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings')]
-        settings_files = []
-        for _sd in _settings_dirs:
-            settings_files += _glob.glob(os.path.join(_sd, 'settings_*.json'))
-        settings_files = [f for f in settings_files
-                          if not os.path.basename(f).startswith('settings_TEMPLATE')]
         settings_files = sorted({os.path.normpath(f): f for f in settings_files}.values())
 
         if not settings_files:
@@ -5026,7 +5116,8 @@ $(document).ready(function(){
 
         new_guild  = {}   # GUILD_Name_Guild  -> defense deck str
         new_attack = {}   # ATTACK_Name_Guild -> attack deck str
-        synced_guilds = set()
+        synced_guilds    = set()
+        no_guild_accounts = []  # accounts without a guild
 
         print(f"\n  Found {len(settings_files)} settings file(s):")
 
@@ -5042,6 +5133,7 @@ $(document).ready(function(){
                 faction = tmp.init_data.get('faction')
                 if not faction or not isinstance(faction, dict) or not faction.get('name'):
                     print(f"  ℹ {nick} is not in a guild – skipping")
+                    no_guild_accounts.append(nick)
                     continue
 
                 guild_name = faction['name']
@@ -5165,24 +5257,8 @@ $(document).ready(function(){
                 appended += 1
             return existing_lines, updated, appended, unchanged
 
-        gauntlet_lines, gu, ga, gn = _merge(
-            gauntlet_lines, gauntlet_keys, new_guild, 'GUILD_', synced_guilds)
-        attack_lines, au, aa, an = _merge(
-            attack_lines, attack_keys, new_attack, 'ATTACK_', synced_guilds)
-
-        # Post-merge cleanup: remove WIN_/LOSS_ entries for players that now have a
-        # GUILD_ entry.  WIN_/LOSS_ are fallback decks recorded during combat for players
-        # whose guild we couldn't sync.  Once a player is in a synced guild their GUILD_
-        # entry is authoritative and the WIN_/LOSS_ entry is redundant.
-        #
-        # Matching rule: for a WIN_/LOSS_ inner W and a GUILD_ inner G, remove W if:
-        #   G == W               (guildless player who joined a guild)
-        #   G.startswith(W+'_')  (player was recorded without guild, now has one)
-        #   W == G               (identical key, different prefix)
-        #   W.startswith(G_player+'_') handled via Case B in _merge already
-        #
-        # We use the full inner string (not just first token) to avoid false positives
-        # like WIN_Player_123 matching GUILD_Player_456_SomeGuild.
+        # Write phase — under lock, re-read fresh, strip+append, atomic write
+        # (see _GAUNTLET_LOCK block below)
         def _remove_win_loss_shadowed_by_guild(lines):
             """Remove WIN_/LOSS_ entries that have a corresponding GUILD_ entry."""
             guild_inners = set()
@@ -5232,14 +5308,102 @@ $(document).ready(function(){
         if wl_removed:
             print(f"  🗑  Removed {wl_removed} WIN_/LOSS_ entries superseded by GUILD_ entries")
 
-        with open(gauntlet_file, 'w', encoding='utf-8') as f:
-            f.writelines(gauntlet_lines)
-        with open(attack_file, 'w', encoding='utf-8') as f:
-            f.writelines(attack_lines)
+        with _GAUNTLET_LOCK:
+            # Re-read files under lock — bots may have written WIN_/LOSS_ entries
+            # while the sync was collecting API data (long-running).
+            fresh_gauntlet, _ = _load_file(gauntlet_file)
+            fresh_attack,   _ = _load_file(attack_file)
+
+            from datetime import datetime as _dt2
+            _comment = f"//Last seen on: {_dt2.now().strftime('%Y-%m-%d %H:%M')}\n"
+
+            # ── arenagauntlet.txt ────────────────────────────────────
+            # 1. Strip ALL existing GUILD_ entries for synced guilds
+            #    (plus their //Last seen on: comment lines) — simpler
+            #    and safer than selective in-place merge.
+            def _strip_guild_entries(lines, guilds):
+                out = []
+                i = 0
+                removed = 0
+                while i < len(lines):
+                    s = lines[i].strip()
+                    if s.startswith('GUILD_'):
+                        key_inner = s.split(': ')[0][len('GUILD_'):]
+                        guild = next((g for g in guilds
+                                      if key_inner.endswith('_' + g)
+                                      or key_inner == g), None)
+                        if guild:
+                            # Also remove preceding comment line
+                            if out and out[-1].strip().startswith('//Last seen on:'):
+                                out.pop()
+                            removed += 1
+                            i += 1
+                            continue
+                    out.append(lines[i])
+                    i += 1
+                return out, removed
+
+            def _strip_attack_entries(lines, guilds):
+                out = []
+                i = 0
+                removed = 0
+                while i < len(lines):
+                    s = lines[i].strip()
+                    if s.startswith('ATTACK_'):
+                        key_inner = s.split(': ')[0][len('ATTACK_'):]
+                        guild = next((g for g in guilds
+                                      if key_inner.endswith('_' + g)
+                                      or key_inner == g), None)
+                        if guild:
+                            if out and out[-1].strip().startswith('//Last seen on:'):
+                                out.pop()
+                            removed += 1
+                            i += 1
+                            continue
+                    out.append(lines[i])
+                    i += 1
+                return out, removed
+
+            fresh_gauntlet, _g_removed = _strip_guild_entries(fresh_gauntlet, synced_guilds)
+            fresh_attack,   _a_removed = _strip_attack_entries(fresh_attack,   synced_guilds)
+
+            # 2. Append all new GUILD_ entries
+            ga = gn = gu = 0
+            for key, ds in sorted(new_guild.items()):
+                fresh_gauntlet.append(_comment)
+                fresh_gauntlet.append(f"{key}: {ds}\n")
+                ga += 1
+
+            # 3. Append all new ATTACK_ entries
+            aa = an = au = 0
+            for key, ds in sorted(new_attack.items()):
+                fresh_attack.append(_comment)
+                fresh_attack.append(f"{key}: {ds}\n")
+                aa += 1
+
+            # 4. Remove WIN_/LOSS_ entries now covered by a GUILD_ entry
+            fresh_gauntlet, wl_removed2 = _remove_win_loss_shadowed_by_guild(fresh_gauntlet)
+            if wl_removed2:
+                print(f"  🗑  Removed {wl_removed2} WIN_/LOSS_ entries superseded by GUILD_ entries")
+
+            # 5. Atomic write via temp-file + rename (no null-byte corruption)
+            import tempfile as _tf, os as _os
+            _dir = os.path.dirname(gauntlet_file)
+            with _tf.NamedTemporaryFile('w', encoding='utf-8', dir=_dir, delete=False, suffix='.tmp') as _tmp:
+                _tmp.writelines(fresh_gauntlet)
+                _tmp_g = _tmp.name
+            _os.replace(_tmp_g, gauntlet_file)
+            with _tf.NamedTemporaryFile('w', encoding='utf-8', dir=_dir, delete=False, suffix='.tmp') as _tmp:
+                _tmp.writelines(fresh_attack)
+                _tmp_a = _tmp.name
+            _os.replace(_tmp_a, attack_file)
+
+        if no_guild_accounts:
+            print(f"\n  ⚠ Accounts without guild ({len(no_guild_accounts)}): {', '.join(no_guild_accounts)}")
 
         print(f"\n  ✓ Sync complete:")
-        print(f"    arenagauntlet.txt  — Changed: {gu}  Added: {ga}  Unchanged: {gn}")
-        print(f"    attackdecks.txt    — Changed: {au}  Added: {aa}  Unchanged: {an}")
+        print(f"    arenagauntlet.txt  — Added: {ga}  (replaced {_g_removed} old GUILD_ entries)")
+        print(f"    attackdecks.txt    — Added: {aa}  (replaced {_a_removed} old ATTACK_ entries)")
 
     def build_brawl_gauntlet_attack(self, mode='auto', _defense_file=None, _brawl_key=None, _card_data=None):
         """
@@ -6375,8 +6539,13 @@ $(document).ready(function(){
             summary_lines.append(f"// Tie-skipped ranks (expected, tied scores): {', '.join(ts_ranges)}\n")
         new_lines.extend(summary_lines)
 
-        with open(gauntlet_file, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
+        with _GAUNTLET_LOCK:
+            import tempfile as _tf2, os as _os2
+            _dir2 = os.path.dirname(gauntlet_file)
+            with _tf2.NamedTemporaryFile('w', encoding='utf-8', dir=_dir2, delete=False, suffix='.tmp') as _tmp2:
+                _tmp2.writelines(new_lines)
+                _tmp2_name = _tmp2.name
+            _os2.replace(_tmp2_name, gauntlet_file)
 
         print(f"\n{'='*65}")
         print(f"  BRAWL GAUNTLET WRITTEN  ->  export/{brawl_key}.txt")
@@ -6454,8 +6623,23 @@ $(document).ready(function(){
                 total_scanned += 1
                 fname = os.path.relpath(fpath, log_base)
                 for turn in data.get('turns', []):
-                    for side in ['api_card_states', 'own_states', 'enemy_states']:
-                        for uid, flags in (turn.get(side) or {}).items():
+                    # api_card_states: {uid: {flag: val, ...}, ...}
+                    for uid, flags in (turn.get('api_card_states') or {}).items():
+                        if not isinstance(flags, dict):
+                            continue
+                        for flag, val in flags.items():
+                            if flag not in KNOWN and flag not in IGNORED:
+                                if flag not in unknown:
+                                    unknown[flag] = {'values': set(), 'files': []}
+                                unknown[flag]['values'].add(val)
+                                if fname not in unknown[flag]['files']:
+                                    unknown[flag]['files'].append(fname)
+                    # own_states / enemy_states: list of (name, {flag: val, ...})
+                    for side in ['own_states', 'enemy_states']:
+                        for entry in (turn.get(side) or []):
+                            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                                continue
+                            flags = entry[1]
                             if not isinstance(flags, dict):
                                 continue
                             for flag, val in flags.items():
@@ -6467,6 +6651,7 @@ $(document).ready(function(){
                                         unknown[flag]['files'].append(fname)
             except Exception as e:
                 errors += 1
+                print(f"  ⚠ Fehler in {os.path.basename(fpath)}: {e}")
 
         print(f"  Scanned : {total_scanned} files  |  Errors: {errors}")
         print(f"{'='*60}")
@@ -8672,6 +8857,282 @@ $(document).ready(function(){
         print(f"  Saved: {main_file}")
         print(f"{'='*60}")
 
+    def _degrade_guild_entry(self, enemy_name, result):
+        """
+        When a live deck fetch failed (player likely left their guild),
+        downgrade their GUILD_ entry in arenagauntlet.txt to WIN_ or LOSS_
+        so we stop wasting proxy-lookup attempts in future battles.
+        result: 'WIN' or 'LOSS'
+        """
+        gauntlet_file = os.path.join(SCRIPT_DIR, 'arenagauntlet.txt')
+        if not os.path.isfile(gauntlet_file):
+            return
+        new_prefix = f"{result}_"
+        try:
+            with _GAUNTLET_LOCK:
+                with open(gauntlet_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                changed = False
+                new_lines = []
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    s = line.strip()
+                    if s.startswith('GUILD_'):
+                        key = s.split(': ')[0][len('GUILD_'):]
+                        player = key.rsplit('_', 1)[0] if '_' in key else key
+                        if player.lower() == enemy_name.lower():
+                            # Replace GUILD_ prefix with WIN_/LOSS_
+                            new_line = new_prefix + line[len('GUILD_'):]
+                            new_lines.append(new_line)
+                            changed = True
+                            i += 1
+                            continue
+                    new_lines.append(line)
+                    i += 1
+                if changed:
+                    import tempfile as _tf2, os as _os2
+                    _dir = os.path.dirname(gauntlet_file)
+                    with _tf2.NamedTemporaryFile('w', encoding='utf-8',
+                                                 dir=_dir, delete=False, suffix='.tmp') as _tmp:
+                        _tmp.writelines(new_lines)
+                        _tmp_name = _tmp.name
+                    _os2.replace(_tmp_name, gauntlet_file)
+                    print(f"  ℹ Degraded GUILD_ → {new_prefix} for {enemy_name} (left guild?)")
+        except Exception as e:
+            pass  # non-critical
+
+    def _build_guild_account_map(self):
+        """
+        Build a guild_name_lower → settings_file map without any API calls.
+
+        Strategy (in order, first hit wins per guild):
+        1. _guild_cache field in settings JSON (written on first initialize())
+        2. Match account name from settings filename against GUILD_Name_Guild
+           entries in arenagauntlet.txt — completely offline, no API needed.
+        3. Seed own account from already-loaded init_data (no extra API call).
+
+        This means the map is fully populated from the very first run,
+        covering all 150 accounts and 23 guilds instantly.
+        """
+        import glob as _gbld, json as _jbld, re as _rebld
+
+        guild_map = {}   # guild_name_lower -> settings_file path
+
+        _sdirs = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings')]
+        _sfiles = []
+        for _sd in _sdirs:
+            _sfiles += _gbld.glob(os.path.join(_sd, 'settings_*.json'))
+        _sfiles = sorted({os.path.normpath(f): f for f in _sfiles
+                          if not os.path.basename(f).startswith('settings_TEMPLATE')}.values())
+
+        # Pass 1: _guild_cache in settings JSON (fast, no API)
+        account_to_sf = {}  # account_name_lower -> settings_file
+        for sf in _sfiles:
+            try:
+                with open(sf, 'r', encoding='utf-8') as _fh:
+                    cfg = _jbld.load(_fh)
+                nick = os.path.basename(sf).replace('settings_', '').replace('.json', '')
+                account_to_sf[nick.lower()] = sf
+                guild = cfg.get('_guild_cache', '')
+                if guild and guild.lower() not in guild_map:
+                    guild_map[guild.lower()] = sf
+            except Exception:
+                pass
+
+        # Pass 2: match account names against arenagauntlet.txt GUILD_ entries
+        gauntlet_file = os.path.join(SCRIPT_DIR, 'arenagauntlet.txt')
+        if os.path.isfile(gauntlet_file) and account_to_sf:
+            try:
+                with open(gauntlet_file, 'r', encoding='utf-8') as _gf:
+                    for line in _gf:
+                        line = line.strip()
+                        if not line.startswith('GUILD_'):
+                            continue
+                        key = line.split(': ')[0][len('GUILD_'):]
+                        # key format: PlayerName_GuildName
+                        if '_' not in key:
+                            continue
+                        player, guild = key.rsplit('_', 1)
+                        if not guild or guild.lower() in guild_map:
+                            continue
+                        sf = account_to_sf.get(player.lower())
+                        if sf:
+                            guild_map[guild.lower()] = sf
+            except Exception:
+                pass
+
+        # Pass 3: seed own account from already-loaded init_data
+        own_guild = (self.init_data.get('faction') or {}).get('name', '')
+        if own_guild and own_guild.lower() not in guild_map:
+            own_sf = getattr(self.api, 'settings_file', None)
+            if own_sf:
+                guild_map[own_guild.lower()] = own_sf
+
+        return guild_map
+
+    def _fetch_enemy_deck_live(self, enemy_name, enemy_guild='', card_data=None, guild_map=None):
+        """
+        Fetch the enemy's current defense deck live via getProfileData.
+        Returns (deck_str_or_None, status_message).
+
+        IMPORTANT: getProfileData only returns deck data (defense_deck) when
+        called with target_user_id — target_name alone does not reliably
+        return deck fields (confirmed by sync_all_guild_decks, which always
+        uses target_user_id sourced from faction['members']). So we must
+        resolve enemy_name -> user_id via the calling account's guild member
+        list before fetching.
+        """
+        import glob as _glob, json as _json
+
+        card_data = card_data or self._load_card_data_with_rarity()
+
+        def _load_member_cache(guild_name):
+            """Load name->user_id map for a guild from disk cache if fresh (<6h)."""
+            import time as _tm
+            cache_dir = os.path.join(SCRIPT_DIR, 'guild_member_cache')
+            cache_file = os.path.join(cache_dir, f"{guild_name.lower()}.json")
+            try:
+                if os.path.isfile(cache_file):
+                    with open(cache_file, 'r', encoding='utf-8') as _cf:
+                        data = _json.load(_cf)
+                    if _tm.time() - data.get('_ts', 0) < 6 * 3600:
+                        return {k: v for k, v in data.items() if k != '_ts'}
+            except Exception:
+                pass
+            return None
+
+        def _save_member_cache(guild_name, name_map):
+            import time as _tm
+            cache_dir = os.path.join(SCRIPT_DIR, 'guild_member_cache')
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_file = os.path.join(cache_dir, f"{guild_name.lower()}.json")
+                data = dict(name_map)
+                data['_ts'] = _tm.time()
+                import tempfile as _tfc, os as _osc
+                with _tfc.NamedTemporaryFile('w', encoding='utf-8', dir=cache_dir,
+                                             delete=False, suffix='.tmp') as _tmp:
+                    _json.dump(data, _tmp)
+                    _tmp_name = _tmp.name
+                _osc.replace(_tmp_name, cache_file)
+            except Exception:
+                pass
+
+        def _deck_from_profile(commander, name):
+            """commander: a TyrantCommander instance (self or a proxy).
+            Returns (deck_str_or_None, reason_str)."""
+            try:
+                faction = commander.init_data.get('faction') or {}
+                guild_name = faction.get('name', '')
+                members = faction.get('members', [])
+                if not guild_name or not members:
+                    return None, "proxy account has no guild/members"
+
+                # In-memory cache (this process) backed by a persistent disk
+                # cache (shared across sessions / parallel instances).
+                if not hasattr(self, '_guild_member_name_cache'):
+                    self._guild_member_name_cache = {}
+                cache_key = guild_name.lower()
+                if cache_key not in self._guild_member_name_cache:
+                    disk_map = _load_member_cache(guild_name)
+                    if disk_map is not None:
+                        self._guild_member_name_cache[cache_key] = disk_map
+                    else:
+                        name_map = {}
+                        for member_id in members:
+                            try:
+                                mprof = commander.api.call('getProfileData', target_user_id=str(member_id))
+                                mpi = (mprof or {}).get('player_info', {})
+                                mname = mpi.get('name', '')
+                                if mname:
+                                    name_map[mname.lower()] = member_id
+                            except Exception:
+                                continue
+                        self._guild_member_name_cache[cache_key] = name_map
+                        _save_member_cache(guild_name, name_map)
+
+                user_id = self._guild_member_name_cache[cache_key].get(name.lower())
+                if user_id is None:
+                    return None, f"'{name}' not in {guild_name} roster (left guild?)"
+
+                prof = commander.api.call('getProfileData', target_user_id=str(user_id))
+                if not prof or 'player_info' not in prof:
+                    return None, "getProfileData returned no player_info"
+                pi = prof['player_info']
+                dd = pi.get('defense_deck', {})
+                if not dd or 'commander_id' not in dd:
+                    return None, "defense_deck empty/malformed in API response"
+                cmdr_id  = dd.get('commander_id')
+                dom_id   = dd.get('dominion_id')
+                card_ids = dd.get('cards', [])
+                deck = self._build_tuo_deck_string(cmdr_id, dom_id, card_ids, card_data)
+                return (deck, None) if deck else (None, "deck string build failed")
+            except Exception as e:
+                return None, f"exception: {e}"
+
+
+        # ── Attempt 1: direct lookup with current account ────────────────
+        deck_str, _reason1 = _deck_from_profile(self, enemy_name)
+        if deck_str:
+            return deck_str, "direct"
+
+        # ── Resolve guild name ────────────────────────────────────────────
+        if not enemy_guild:
+            gauntlet = self._lookup_enemy_deck_gauntlet(enemy_name, '')
+            enemy_guild = gauntlet[2] if gauntlet else ''
+        if not enemy_guild:
+            return None, "no guild known"
+
+        # ── Attempt 2: proxy from pre-built guild map (fast, no API) ─────
+        proxy_sf = (guild_map or {}).get(enemy_guild.lower())
+        if proxy_sf:
+            proxy_nick = os.path.basename(proxy_sf).replace('settings_','').replace('.json','')
+            try:
+                tmp = TyrantCommander(proxy_sf)
+                if tmp.initialize(verbose=False):
+                    deck_str, _reason2 = _deck_from_profile(tmp, enemy_name)
+                    if deck_str:
+                        return deck_str, f"Proxy {proxy_nick} [{enemy_guild}]"
+                    return None, f"Proxy {proxy_nick} [{enemy_guild}] – {_reason2}"
+            except Exception as e:
+                return None, f"Proxy {proxy_nick} [{enemy_guild}] – init failed: {e}"
+            return None, f"Proxy {proxy_nick} [{enemy_guild}] – fetch failed"
+
+        # ── Attempt 3: scan JSON files for _guild_cache (no API calls) ───
+        _sdirs = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings')]
+        _sfiles = []
+        for _sd in _sdirs:
+            _sfiles += _glob.glob(os.path.join(_sd, 'settings_*.json'))
+        _sfiles = sorted({os.path.normpath(f): f for f in _sfiles
+                          if not os.path.basename(f).startswith('settings_TEMPLATE')}.values())
+
+        proxy_sf = None
+        for sf in _sfiles:
+            try:
+                with open(sf, 'r', encoding='utf-8') as _fj:
+                    _cfg = _json.load(_fj)
+                if _cfg.get('_guild_cache', '').lower() == enemy_guild.lower():
+                    proxy_sf = sf
+                    break
+            except Exception:
+                continue
+
+        if proxy_sf:
+            proxy_nick = os.path.basename(proxy_sf).replace('settings_','').replace('.json','')
+            try:
+                tmp = TyrantCommander(proxy_sf)
+                if tmp.initialize(verbose=False):
+                    deck_str, _reason3 = _deck_from_profile(tmp, enemy_name)
+                    if deck_str:
+                        return deck_str, f"Proxy {proxy_nick} [{enemy_guild}] (JSON-scan)"
+                    return None, f"Proxy {proxy_nick} [{enemy_guild}] – {_reason3}"
+            except Exception as e:
+                return None, f"Proxy {proxy_nick} [{enemy_guild}] – init failed: {e}"
+            return None, f"Proxy [{enemy_guild}] – fetch failed"
+
+        return None, f"no proxy for guild '{enemy_guild}'"
+
     def _lookup_enemy_deck_gauntlet(self, enemy_name, enemy_guild=''):
         """
         Look up an opponent's deck from arenagauntlet.txt.
@@ -8760,14 +9221,25 @@ $(document).ready(function(){
         """Convert an API BGE name to the TUO -e flag value.
 
         Spaces are removed: "Temporal Backlash" -> "TemporalBacklash".
-        Exception: "Oath of Loyalty" -> "Oath-Of-Loyalty".
+        Exceptions:
+          "Oath of Loyalty"  -> "Oath-Of-Loyalty"
+          "EnduringRage 2"   -> "EnduringRage 2"  (space before numeric suffix kept)
         """
         if not api_name:
             return api_name
         _explicit = {
             'Oath of Loyalty': 'Oath-Of-Loyalty',
+            'EnduringRage 2':  'EnduringRage 2',
+            'Enduring Rage':   'EnduringRage 2',
         }
-        return _explicit.get(api_name, api_name.replace(' ', ''))
+        if api_name in _explicit:
+            return _explicit[api_name]
+        # Preserve space before trailing numeric suffix (e.g. "SomeBGE 3" -> "SomeBGE 3")
+        import re as _re
+        m = _re.match(r'^(.*?)\s+(\d+)$', api_name)
+        if m:
+            return m.group(1).replace(' ', '') + ' ' + m.group(2)
+        return api_name.replace(' ', '')
 
     def _run_tuo_sim(self, my_deck, enemy_deck, bge_name=None,
                      sim_count=500, hand_card=None, ordered=False, surge=False, verbose=False, force_ordered=False):
@@ -8783,7 +9255,7 @@ $(document).ready(function(){
         import random as _random
         _om = 'ordered' if force_ordered else getattr(self, 'tuo_order_mode', 'ordered')
         if _om == 'flexible':
-            _oflags = ['flexible', 'flexible-iter', '20']
+            _oflags = ['flexible', 'flexible-iter', '100']
         else:
             _oflags = ['ordered']
         cmd = [self._tuo_path, my_deck, enemy_deck, 'surge' if surge else 'pvp', 'no-db', 'no-ml'] + _oflags
@@ -8876,7 +9348,7 @@ $(document).ready(function(){
         hand_str = ", ".join(hand_cards)
         _om2 = 'ordered' if force_ordered else getattr(self, 'tuo_order_mode', 'ordered')
         if _om2 == 'flexible':
-            _oflags2 = ['flexible', 'flexible-iter', '20']
+            _oflags2 = ['flexible', 'flexible-iter', '100']
         else:
             _oflags2 = ['ordered']
         tuo_mode = mode if mode else ('surge' if surge else 'pvp')
@@ -9072,6 +9544,23 @@ $(document).ready(function(){
                 except (ValueError, TypeError):
                     pass
         return killed
+
+    def _extract_token_card_map(self, battle_data):
+        """
+        Extract summon token card_ids from battle_data['turn'][N]['tokens'].
+        Returns {uid_str: card_id_str} for all tokens seen in this response.
+        The tokens array contains summoned/created cards not listed in card_map.
+        """
+        token_map = {}
+        for tv in (battle_data.get('turn') or {}).values():
+            if not isinstance(tv, dict):
+                continue
+            for tok in tv.get('tokens', []):
+                uid = tok.get('card_uid')
+                cid = tok.get('card_id')
+                if uid is not None and cid is not None:
+                    token_map[str(uid)] = str(cid)
+        return token_map
 
     def _update_field_state(self, card_states, battle_data):
         """
@@ -9395,6 +9884,14 @@ $(document).ready(function(){
         arena_rating     = 0
         arena_lp         = 0
 
+        # ── Build guild→account map once (for live deck proxy lookups) ───
+        print("  ⏳ Building guild→account map...")
+        _guild_account_map = self._build_guild_account_map()
+        if _guild_account_map:
+            print(f"  ✓ Guild map: {len(_guild_account_map)} guild(s) mapped")
+        else:
+            print(f"  ⚠ No guild cache found — live fetch limited to direct lookup only")
+
         # ── Autopilot: disable for session, restore after ─────────────
         _autopilot_was_on = False
         _user_flags = self.init_data.get('user_data', {}).get('flags', {})
@@ -9513,17 +10010,17 @@ $(document).ready(function(){
                             print("sim failed – skip")
                             continue
                         print(f"{win_pre:.1f}%", end='')
-                        if win_pre >= 30.0:
+                        if win_pre >= 50.0:
                             print("  ✓")
                             target = t
                             break
                         else:
-                            print("  ✗ <30%")
+                            print("  ✗ <50%")
 
                     # Priority 2: first unknown deck (all known sims < 30%)
                     if target is None and unknown_targets:
                         target = unknown_targets[0]
-                        print(f"  -> All known decks <30% – using first unknown: {target['name']}")
+                        print(f"  -> All known decks <50% – using first unknown: {target['name']}")
 
                     # Priority 3: first known deck as last resort
                     if target is None and known_targets:
@@ -9546,6 +10043,24 @@ $(document).ready(function(){
             enemy_guild    = target['guild']
             gauntlet       = target['gauntlet']
             enemy_deck_str = gauntlet[1] if gauntlet else None
+            _cached_guild  = gauntlet[2] if gauntlet else enemy_guild
+
+            # ── Live deck fetch ───────────────────────────────────────────
+            # In arena, getProfileData only works for same-guild members.
+            # Only attempt if we have a proxy account in the enemy's guild.
+            _live_deck = None
+            _guild_key = (_cached_guild or enemy_guild or '').lower()
+            if _guild_key and _guild_key in _guild_account_map:
+                _live_deck, _fetch_status = self._fetch_enemy_deck_live(
+                    enemy_name, _cached_guild or enemy_guild, card_data=card_data,
+                    guild_map=_guild_account_map)
+                if _live_deck:
+                    enemy_deck_str = _live_deck
+                    print(f"  ✓ Live deck ({_fetch_status}): {_live_deck}")
+                elif enemy_deck_str:
+                    print(f"  ⚠ Live fetch: {_fetch_status} – using cached deck")
+                else:
+                    print(f"  ⚠ Live fetch: {_fetch_status} – no deck available")
 
             # ── Find fresh UID for target ────────────────────────────
             fresh_uid = None
@@ -9587,6 +10102,7 @@ $(document).ready(function(){
             # ── Combat log + field risk tracking for this battle ────
             _cl_card_states = {}   # cumulative field state (uid -> {flag: val})
             _cl_turns       = []   # per-turn log entries
+            _token_card_map = {}   # cumulative summon uid -> card_id (from tokens[])
 
 
             # Build my deck string from battle_data
@@ -9670,7 +10186,8 @@ $(document).ready(function(){
                             print("="*65)
                             self._export_arena_opponent_deck(
                                 enemy_name=enemy_name, enemy_guild=enemy_guild,
-                                winner=winner, battle_data=battle_data, silent=False)
+                                winner=winner, battle_data=battle_data, silent=False,
+                                live_deck_str=_live_deck or None)
                             self.initialize(verbose=False)
                     break
 
@@ -9713,9 +10230,16 @@ $(document).ready(function(){
                     enemy_played = self._parse_enemy_played_cards(battle_data, card_data, brawl_mode=False)
 
                     # Build hand-state dicts from cumulative card states
-                    _own_range   = range(1, 11)
-                    _enemy_range = range(101, 111)
-                    _card_map    = battle_data.get('card_map', {})
+                    _own_range   = list(range(1, 11))   + list(range(150, 160))
+                    _enemy_range = list(range(101, 111)) + list(range(50, 60))
+                    _token_card_map.update(self._extract_token_card_map(battle_data))
+                    _card_map    = {**battle_data.get('card_map', {}), **_token_card_map}
+                    # Add commander card_ids (API gives them separately, not in card_map)
+                    # Arena: own commander=UID 50, enemy commander=UID 150
+                    if battle_data.get('attack_commander'):
+                        _card_map['50']  = str(battle_data['attack_commander'])
+                    if battle_data.get('defend_commander'):
+                        _card_map['150'] = str(battle_data['defend_commander'])
                     _killed      = self._collect_killed_uids(battle_data, brawl_mode=False)
 
                     # ── Merge current field values into _cl_card_states ──────────
@@ -9909,7 +10433,8 @@ $(document).ready(function(){
                     print("="*65)
                     self._export_arena_opponent_deck(
                         enemy_name=enemy_name, enemy_guild=enemy_guild,
-                        winner=winner, battle_data=battle_data, silent=False)
+                        winner=winner, battle_data=battle_data, silent=False,
+                        live_deck_str=_live_deck or None)
                     # ── Write combat log ─────────────────────────────
                     if combat_log:
                         _cl_acct = self.api.settings.get('request_data', {}).get('kong_name', '')
@@ -10029,6 +10554,14 @@ $(document).ready(function(){
         brawl_points  = 0
         brawl_wasted  = 0   # energy lost to API collision (playCard failed after findOpponent)
 
+        # ── Build guild→account map once (for live deck proxy lookups) ──
+        print("  ⏳ Building guild→account map...")
+        _guild_account_map = self._build_guild_account_map()
+        if _guild_account_map:
+            print(f"  ✓ Guild map: {len(_guild_account_map)} guild(s) mapped")
+        else:
+            print(f"  ⚠ No guild cache found — live fetch limited to direct lookup only")
+
         # ── Autopilot: disable for session, restore after ─────────────
         # Autopilot causes the game client to play cards concurrently with this script,
         # leading to API collisions and wasted energy (server returns result:false on playCard).
@@ -10096,6 +10629,7 @@ $(document).ready(function(){
             # ── Combat log + field risk tracking for this battle ────
             _cl_card_states  = {}
             _cl_turns        = []
+            _token_card_map  = {}   # cumulative summon uid -> card_id (from tokens[])
 
             # ── Build MY deck string (we are defender, UIDs 101-110) ──
             def_cmd          = battle_data.get('defend_commander')
@@ -10111,6 +10645,19 @@ $(document).ready(function(){
             atk_dom_uid51  = battle_data.get('card_map', {}).get('51')
             gauntlet       = self._lookup_enemy_deck_gauntlet(enemy_name, enemy_guild)
             enemy_deck_str = gauntlet[1] if gauntlet else None
+            _cached_guild  = gauntlet[2] if gauntlet else ''
+            _had_guild_entry = gauntlet is not None and gauntlet[0] == 'GUILD'
+
+            # ── Live deck fetch (always try before falling back to cache) ─
+            _live_deck, _fetch_status = self._fetch_enemy_deck_live(
+                enemy_name, _cached_guild, card_data=card_data, guild_map=_guild_account_map)
+            if _live_deck:
+                enemy_deck_str = _live_deck
+                print(f"  ✓ Live deck ({_fetch_status}): {_live_deck}")
+            elif enemy_deck_str:
+                print(f"  ⚠ Live fetch: {_fetch_status} – using cached deck")
+            else:
+                print(f"  ⚠ Live fetch: {_fetch_status} – no deck available")
 
             # ── Enemy's first played card (turn 1) ────────────────────
             turn_data      = battle_data.get('turn', {})
@@ -10214,9 +10761,15 @@ $(document).ready(function(){
                     enemy_played = self._parse_enemy_played_cards(battle_data, card_data, brawl_mode=True)
 
                     # Build hand-state dicts (Brawl: own=101-110, enemy=1-10)
-                    _own_range   = range(101, 111)
-                    _enemy_range = range(1, 11)
-                    _card_map    = battle_data.get('card_map', {})
+                    _own_range   = list(range(101, 111)) + list(range(50, 60))
+                    _enemy_range = list(range(1, 11))   + list(range(150, 160))
+                    _token_card_map.update(self._extract_token_card_map(battle_data))
+                    _card_map    = {**battle_data.get('card_map', {}), **_token_card_map}
+                    # Brawl: own commander=UID 150, enemy commander=UID 50
+                    if battle_data.get('defend_commander'):
+                        _card_map['150'] = str(battle_data['defend_commander'])
+                    if battle_data.get('attack_commander'):
+                        _card_map['50']  = str(battle_data['attack_commander'])
                     _killed      = self._collect_killed_uids(battle_data, brawl_mode=True)
 
                     # ── Merge current field values into _cl_card_states ──────────
@@ -10424,6 +10977,9 @@ $(document).ready(function(){
                             'turns': _cl_turns,
                         }, account_name=_cl_acct)
                         _cl_turns = []
+                    if _had_guild_entry and not _live_deck and _fail_win is not None:
+                        self._degrade_guild_entry(
+                            enemy_name, 'WIN' if _fail_win == 1 else 'LOSS')
                     break
 
                 # Track played cards for freeze and hand tracking
@@ -10465,12 +11021,18 @@ $(document).ready(function(){
                         }, account_name=_cl_acct)
                         _cl_turns = []
                     # ── Gauntlet export ──────────────────────────────
-                    # Always export from battle_data (actual observed deck),
-                    # not from the pre-battle lookup – decks may have changed.
-                    self._export_arena_opponent_deck(
-                        enemy_name=enemy_name, enemy_guild=enemy_guild,
-                        winner=winner, battle_data=battle_data,
-                        silent=False, brawl_mode=True)
+                    # Skip if live deck was fetched: the GUILD_ entry in
+                    # arenagauntlet.txt is already authoritative and complete.
+                    # Writing back from battle_data would overwrite it with a
+                    # partial deck and lose the guild name from the key.
+                    if not _live_deck:
+                        self._export_arena_opponent_deck(
+                            enemy_name=enemy_name, enemy_guild=enemy_guild,
+                            winner=winner, battle_data=battle_data,
+                            silent=False, brawl_mode=True)
+                        if _had_guild_entry:
+                            self._degrade_guild_entry(
+                                enemy_name, 'WIN' if winner == 1 else 'LOSS')
                     self.initialize(verbose=False)
                     break
 
@@ -10657,6 +11219,7 @@ $(document).ready(function(){
 
             _gw_card_states = {}   # cumulative field state for GW
             _gw_turns       = []    # combat log entries for GW
+            _gw_token_map   = {}   # cumulative summon uid -> card_id (from tokens[])
 
             def _bge_name(key):
                 section = battle_data.get('battleground_effects', {}).get(key, {})
@@ -10780,10 +11343,11 @@ $(document).ready(function(){
                     print(f"\n  ⏳ {_mode_lbl} ({', '.join(unique_names)}{freeze_info}{enemy_info}{fort_info})...")
 
                     # Build hand-state dicts for GW
-                    _gw_own_range   = range(101, 111) if brawl_mode_uids else range(1, 11)
-                    _gw_enemy_range = range(1, 11) if brawl_mode_uids else range(101, 111)
+                    _gw_own_range   = (list(range(101, 111)) + list(range(50, 60))) if brawl_mode_uids else (list(range(1, 11)) + list(range(150, 160)))
+                    _gw_enemy_range = (list(range(1, 11)) + list(range(150, 160))) if brawl_mode_uids else (list(range(101, 111)) + list(range(50, 60)))
                     _gw_killed      = self._collect_killed_uids(battle_data, brawl_mode=brawl_mode_uids)
-                    _gw_card_map    = battle_data.get('card_map', {})
+                    _gw_token_map.update(self._extract_token_card_map(battle_data))
+                    _gw_card_map    = {**battle_data.get('card_map', {}), **_gw_token_map}
 
                     # Merge absolute HP from field into _gw_card_states
                     _gw_field_json = battle_data.get('field', {})
@@ -10998,10 +11562,6 @@ $(document).ready(function(){
                             'turns':       _gw_turns,
                         }, account_name=_cl_acct)
                         _gw_turns = []
-                    self._export_arena_opponent_deck(
-                        enemy_name=enemy_name, enemy_guild='',
-                        winner=winner, battle_data=battle_data,
-                        silent=False, brawl_mode=brawl_mode_uids)
                     self.initialize(verbose=False)
                     break
 
@@ -12232,7 +12792,7 @@ $(document).ready(function(){
                 break
         print("="*65)
 
-    def _export_arena_opponent_deck(self, enemy_name, winner, battle_data, enemy_guild='', silent=False, brawl_mode=False):
+    def _export_arena_opponent_deck(self, enemy_name, winner, battle_data, enemy_guild='', silent=False, brawl_mode=False, live_deck_str=None):
         """
         Exports opponent deck to arenagauntlet.txt
         Format: WIN_Name_Guild or LOSS_Name_Guild: Commander, Card1, Card2, ...
@@ -12267,6 +12827,52 @@ $(document).ready(function(){
             
             # Extract opponent deck from battle_data and card_map
             card_map = battle_data.get('card_map', {})
+
+            # If a complete live deck string was fetched before battle, write it
+            # as GUILD_ (authoritative full deck, equivalent to guild sync).
+            if live_deck_str:
+                # Use GUILD_ prefix — live fetch = full defense deck
+                _live_guild_key = f"GUILD_{entry_key}"
+                if not silent:
+                    n_cards = len(live_deck_str.split(','))
+                    print(f"  ✓ {_live_guild_key}: live deck written ({n_cards} cards)")
+                from datetime import datetime as _dts
+                _comment = f"//Last seen on: {_dts.now().strftime('%Y-%m-%d %H:%M')}\n"
+                _new_line = f"{_live_guild_key}: {live_deck_str}\n"
+                with _GAUNTLET_LOCK:
+                    try:
+                        with open(output_file, 'r', encoding='utf-8') as _gf:
+                            _lines = _gf.readlines()
+                    except FileNotFoundError:
+                        _lines = []
+                    # Replace existing GUILD_/WIN_/LOSS_ entry for this player,
+                    # then append the new GUILD_ entry
+                    _new_lines = []
+                    _i = 0
+                    while _i < len(_lines):
+                        _s = _lines[_i].strip()
+                        if _s.startswith(('GUILD_', 'WIN_', 'LOSS_')):
+                            _key = _s.split(': ')[0]
+                            # Match any prefix for this player+guild key
+                            _inner = _key.split('_', 1)[1] if '_' in _key else ''
+                            if _inner == entry_key:
+                                # Remove preceding comment line too
+                                if _new_lines and _new_lines[-1].strip().startswith('//Last seen on:'):
+                                    _new_lines.pop()
+                                _i += 1
+                                continue
+                        _new_lines.append(_lines[_i])
+                        _i += 1
+                    _new_lines.append(_comment)
+                    _new_lines.append(_new_line)
+                    import tempfile as _tfe2, os as _ose2
+                    _dir2 = os.path.dirname(output_file)
+                    with _tfe2.NamedTemporaryFile('w', encoding='utf-8', dir=_dir2,
+                                                  delete=False, suffix='.tmp') as _tmp2:
+                        _tmp2.writelines(_new_lines)
+                        _tmp2_name = _tmp2.name
+                    _ose2.replace(_tmp2_name, output_file)
+                return
 
             # In Arena:  enemy = DEFENDER -> defend_commander, UID 151 (dom), UIDs 101-110 (cards)
             # In Brawl:  enemy = ATTACKER -> attack_commander, UID  51 (dom), UIDs   1-10  (cards)
@@ -12407,7 +13013,8 @@ $(document).ready(function(){
                 # Skip export if a GUILD_ entry already exists for this player
                 # (GUILD entries come from sync and are more reliable than battle observations)
                 _has_guild = any(
-                    l.startswith(f"GUILD_{enemy_name}_") or l.startswith(f"GUILD_{enemy_name}:")
+                    l.lower().startswith(f"guild_{enemy_name.lower()}_") or
+                    l.lower().startswith(f"guild_{enemy_name.lower()}:")
                     for l in lines
                 )
                 if _has_guild:
@@ -12466,8 +13073,12 @@ $(document).ready(function(){
                 if _trimmed and not silent:
                     print(f"  🗑  Trimmed {_trimmed} oldest WIN_/LOSS_ entries (guild cap 50)")
 
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    f.writelines(lines)
+                import tempfile as _tf4, os as _os4
+                _dir4 = os.path.dirname(output_file)
+                with _tf4.NamedTemporaryFile('w', encoding='utf-8', dir=_dir4, delete=False, suffix='.tmp') as _tmp4:
+                    _tmp4.writelines(lines)
+                    _tmp4_name = _tmp4.name
+                _os4.replace(_tmp4_name, output_file)
             
         except Exception as e:
             if not silent:
@@ -12574,8 +13185,13 @@ $(document).ready(function(){
             print(f"  ✓ No entries older than {days} days found")
             return
 
-        with open(gauntlet_file, 'w', encoding='utf-8') as f:
-            f.writelines(kept)
+        with _GAUNTLET_LOCK:
+            import tempfile as _tf3, os as _os3
+            _dir3 = os.path.dirname(gauntlet_file)
+            with _tf3.NamedTemporaryFile('w', encoding='utf-8', dir=_dir3, delete=False, suffix='.tmp') as _tmp3:
+                _tmp3.writelines(kept)
+                _tmp3_name = _tmp3.name
+            _os3.replace(_tmp3_name, gauntlet_file)
         print(f"  ✓ Removed {removed} entries older than {days} days from arenagauntlet.txt")
 
     # ==================== DECK OPTIMIZATION ====================
@@ -21715,6 +22331,17 @@ def _select_account_range(playable, mode_label):
 
 def interactive_menu():
     """Interactive main menu"""
+
+    # ── Clean up stale .tmp files from previous crashed atomic writes ────
+    try:
+        import glob as _gc
+        for _tmp in _gc.glob(os.path.join(SCRIPT_DIR, '*.tmp')):
+            try:
+                os.remove(_tmp)
+            except Exception:
+                pass
+    except Exception:
+        pass
     
     # Try to set console window size
     try:
@@ -21876,6 +22503,8 @@ def interactive_menu():
                 _sfiles += _g.glob(os.path.join(_sd7, 'settings_*.json'))
             _sfiles = sorted({os.path.normpath(f): f for f in _sfiles
                               if not os.path.basename(f).startswith('settings_TEMPLATE')}.values())
+            _sfiles = [f for f in _sfiles
+                       if json.load(open(f, encoding='utf-8')).get('play_enabled', True) is not False]
             _export_inventory_all_accounts(_sfiles)
         elif choice == "8":
             message = input("Enter message: ").strip()
