@@ -2043,6 +2043,24 @@ $(document).ready(function(){
         # Explicit additional exclusions
         _skip_base_names.update(['neocyte core', 'vindicator reactor'])
 
+        # Also skip T1 fusion products that were made FROM base fusion cards.
+        # These have multiple fusion paths to T2 which can conflict — find them
+        # dynamically: any recipe result whose ingredients include a base fusion card.
+        _base_fusion_ids = set()
+        for cid, info in card_data.items():
+            if isinstance(info, dict):
+                nm = info.get('name', '')
+                if nm.lower().rsplit('-', 1)[0].strip() in _skip_base_names:
+                    _base_fusion_ids.add(int(cid))
+
+        _skip_t1_product_ids = set()
+        for res_id, ingrs in recipes.items():
+            if any(ingr_id in _base_fusion_ids for ingr_id in ingrs):
+                _skip_t1_product_ids.add(res_id)
+                res_info = card_data.get(res_id, {})
+                if isinstance(res_info, dict):
+                    _skip_base_names.add(res_info.get('name', '').lower())
+
         print(f"\n{'='*60}")
         print(f"  FUSE ALL MAXED CARDS")
         print(f"{'='*60}")
