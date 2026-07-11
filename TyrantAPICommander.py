@@ -2033,6 +2033,16 @@ $(document).ready(function(){
             for ingr_id in ingrs:
                 ingr_to_result[ingr_id] = res_id
 
+        # ── Build exclusion set from FUSION_GROUPS + explicit exceptions ────
+        # These cards should never be auto-fused: they are base fusion ingredients
+        # (needed for manual faction fusions) or special craft cards.
+        _skip_base_names = set()
+        for _group_name, _names in FUSION_GROUPS:
+            for _n in _names:
+                _skip_base_names.add(_n.lower())
+        # Explicit additional exclusions
+        _skip_base_names.update(['neocyte core', 'vindicator reactor'])
+
         print(f"\n{'='*60}")
         print(f"  FUSE ALL MAXED CARDS")
         print(f"{'='*60}")
@@ -2066,6 +2076,12 @@ $(document).ready(function(){
                 if rarity < 4 or level != 6 or tier > 1:
                     continue
 
+                # Skip base fusion ingredients and explicit exceptions
+                card_name = info.get('name', f'ID {cid}')
+                _base_name = card_name.lower().rsplit('-', 1)[0].strip()
+                if _base_name in _skip_base_names:
+                    continue
+
                 # Find fusion result
                 result_id = ingr_to_result.get(cid)
                 if not result_id:
@@ -2073,7 +2089,6 @@ $(document).ready(function(){
 
                 result_info = card_data.get(result_id, {})
                 result_name = result_info.get('name', f'ID {result_id}') if isinstance(result_info, dict) else f'ID {result_id}'
-                card_name   = info.get('name', f'ID {cid}')
 
                 print(f"\n  🔨 Fusing {card_name} (level {level}, tier {tier}, rarity {rarity})")
                 print(f"     Owned: {owned} (free: {free})  →  {result_name}")
@@ -4613,7 +4628,7 @@ $(document).ready(function(){
                                           f"  (have {_cur_sp:,}, need {_need_sp:,})")
                                     print("  -> Running Gold->SP workflow automatically...")
                                     _max_packs, _ = self.calculate_max_packs()
-                                    _keep  = 15
+                                    _keep  = 10
                                     _run   = 0
                                     _wf_no_progress = False
                                     while True:
@@ -18386,6 +18401,8 @@ $(document).ready(function(){
                             info = card_data.get(card_id, {})
                             cname = info.get('name', f'ID {card_id}') if isinstance(info, dict) else f'ID {card_id}'
                             cards_equipped_skipped.append(f"{cname} (in deck)")
+                            # Auto-remove from outdatedIDs.txt — card is still in use
+                            outdated_ids.discard(card_id)
                             continue
                         
                         # Get card details
@@ -18420,9 +18437,22 @@ $(document).ready(function(){
             if not cards_to_salvage:
                 print("\n✓ No outdated cards in inventory")
                 if cards_equipped_skipped:
-                    print(f"   ⚠ {len(cards_equipped_skipped)} card type(s) skipped (equipped in deck):")
+                    print(f"   ⚠ {len(cards_equipped_skipped)} card type(s) skipped (equipped in deck) and removed from outdatedIDs.txt:")
                     for _s in cards_equipped_skipped:
                         print(f"      • {_s}")
+                    # Rewrite file without the removed IDs
+                    _orig_ids = set()
+                    with open(outdated_file, 'r') as _f:
+                        for _l in _f:
+                            _l = _l.strip()
+                            if _l and _l.isdigit():
+                                _orig_ids.add(int(_l))
+                    _cleaned = _orig_ids & outdated_ids
+                    if len(_cleaned) < len(_orig_ids):
+                        with open(outdated_file, 'w') as _f:
+                            for _id in sorted(_cleaned):
+                                _f.write(f"{_id}\n")
+                        print(f"   ✓ Removed {len(_orig_ids) - len(_cleaned)} ID(s) from outdatedIDs.txt")
                 return
             
             # Sort by rarity (lowest first) for safety
@@ -18432,9 +18462,22 @@ $(document).ready(function(){
             total_cards = sum(c['count'] for c in cards_to_salvage)
             print(f"   Total cards: {total_cards}")
             if cards_equipped_skipped:
-                print(f"   ⚠ Skipped (equipped): {len(cards_equipped_skipped)} card type(s)")
+                print(f"   ⚠ Skipped (equipped in deck) and removed from outdatedIDs.txt: {len(cards_equipped_skipped)} card type(s)")
                 for _s in cards_equipped_skipped:
                     print(f"      • {_s}")
+                # Rewrite file without the removed IDs
+                _orig_ids2 = set()
+                with open(outdated_file, 'r') as _f2:
+                    for _l2 in _f2:
+                        _l2 = _l2.strip()
+                        if _l2 and _l2.isdigit():
+                            _orig_ids2.add(int(_l2))
+                _cleaned2 = _orig_ids2 & outdated_ids
+                if len(_cleaned2) < len(_orig_ids2):
+                    with open(outdated_file, 'w') as _f2:
+                        for _id2 in sorted(_cleaned2):
+                            _f2.write(f"{_id2}\n")
+                    print(f"   ✓ Removed {len(_orig_ids2) - len(_cleaned2)} ID(s) from outdatedIDs.txt")
             
             # Show expected SP
             print(f"\n💰 Expected SP Gain:")
@@ -19968,7 +20011,7 @@ $(document).ready(function(){
                             print(f"  ⚠ Not enough SP for buyback of {_qty}x {_mname}: have {_cur_sp:,}, need {_bb_cost:,}")
                             print(f"  -> Running Gold->SP workflow automatically...")
                             _max_packs, _ = self.calculate_max_packs()
-                            _keep  = 15
+                            _keep  = 10
                             _wf_loop = 0
                             while self.get_salvage() < _bb_cost:
                                 _wf_loop += 1
@@ -22816,9 +22859,9 @@ def interactive_menu():
             commander.salvage_all_rares(); input("\n[ENTER] to continue...")
         elif choice == "22":
             try:
-                ki = input_with_esc("Base Epics to keep per card (default=15, ESC=Cancel): ", allow_empty=True)
+                ki = input_with_esc("Base Epics to keep per card (default=10, ESC=Cancel): ", allow_empty=True)
                 if ki is None: return
-                keep = int(ki.strip()) if ki.strip() else 15
+                keep = int(ki.strip()) if ki.strip() else 10
                 commander.salvage_base_epics_keep_x(keep); input("\n[ENTER] to continue...")
             except ValueError:
                 print("✗ Invalid number"); input("\n[ENTER] to continue...")
@@ -23088,9 +23131,9 @@ def interactive_menu():
             input("\n[ENTER] to continue...")
         elif choice == "95":
             try:
-                ki = input_with_esc("Base Epics to keep per card (default=15, ESC=Cancel): ", allow_empty=True)
+                ki = input_with_esc("Base Epics to keep per card (default=10, ESC=Cancel): ", allow_empty=True)
                 if ki is None: return
-                _keep_ma = int(ki.strip()) if ki.strip() else 15
+                _keep_ma = int(ki.strip()) if ki.strip() else 10
                 import glob as _glob
                 _sdirs = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings'),
                           os.path.join(SCRIPT_DIR, 'data', 'settings')]
