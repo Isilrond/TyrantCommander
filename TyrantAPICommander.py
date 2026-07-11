@@ -1260,6 +1260,52 @@ $(document).ready(function(){
 
     # ==================== QUESTS & ACHIEVEMENTS ====================
 
+    def fuse_all_maxed_cards_all_accounts(self):
+        """Runs fuse_all_maxed_cards for all play_enabled accounts."""
+        import glob as _glob, json as _json
+
+        settings_dirs  = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings')]
+        settings_files = []
+        for sd in settings_dirs:
+            settings_files += _glob.glob(os.path.join(sd, 'settings_*.json'))
+        settings_files = [f for f in settings_files
+                          if not os.path.basename(f).startswith('settings_TEMPLATE')]
+        settings_files = sorted({os.path.normpath(f): f for f in settings_files}.values())
+
+        print(f"\n{'='*65}")
+        print(f"  FUSE ALL MAXED CARDS – ALL ACCOUNTS")
+        print(f"{'='*65}")
+
+        ok = 0; skipped = 0; failed = 0
+        for sf in settings_files:
+            nick = os.path.basename(sf).replace('settings_', '').replace('.json', '')
+            try:
+                with open(sf, 'r', encoding='utf-8') as fh:
+                    cfg = _json.load(fh)
+                if not cfg.get('play_enabled', True):
+                    skipped += 1
+                    continue
+            except Exception:
+                skipped += 1
+                continue
+
+            print(f"\n{'─'*65}")
+            print(f"  [{nick}]")
+            try:
+                tmp = TyrantCommander(sf)
+                if not tmp.initialize(verbose=False):
+                    print(f"  ✗ Login failed")
+                    failed += 1
+                    continue
+                tmp.fuse_all_maxed_cards()
+                ok += 1
+            except Exception as e:
+                print(f"  ✗ {e}")
+                failed += 1
+
+        print(f"\n{'='*65}")
+        print(f"  Done — {ok} ✓  {failed} ✗  {skipped} skipped")
+
     def use_shards_all_accounts(self):
         """Runs use_shards for all play_enabled accounts with auto_confirm=True."""
         import glob as _glob, json as _json
@@ -1950,6 +1996,107 @@ $(document).ready(function(){
         print(f"\n{'='*65}")
         print(f"  ALL ACCOUNTS DONE  |  {total_w}W {total_l}L  |  Gold +{total_g:,}")
         print(f"{'='*65}")
+
+    def fuse_all_maxed_cards(self):
+        """
+        Fuse all Epic+ (rarity>=4) Tier-0 or Tier-1 cards that are at level 6
+        and owned at least 2×. After each fusion re-checks the result card
+        immediately (handles 4+ copies correctly). Costs no SP.
+        """
+        self.initialize(verbose=False)
+        card_data = self._load_card_data_with_rarity()
+
+        # Build result_id -> [ingredient_id, ...] from fusion recipes
+        import xml.etree.ElementTree as _ET
+        fusion_file = os.path.join(SCRIPT_DIR, 'fusion_recipes_cj2.xml')
+        recipes = {}   # result_card_id -> list of ingredient card_ids (usually 2× same)
+        if os.path.isfile(fusion_file):
+            try:
+                tree = _ET.parse(fusion_file)
+                for recipe in tree.getroot().findall('fusion_recipe'):
+                    cid_el = recipe.find('card_id')
+                    if cid_el is None or not cid_el.text:
+                        continue
+                    res_id = int(cid_el.text)
+                    ingr   = [int(r.get('card_id'))
+                              for r in recipe.findall('resource')
+                              if r.get('card_id')]
+                    if ingr:
+                        recipes[res_id] = ingr
+            except Exception as e:
+                print(f"  ✗ Could not load fusion recipes: {e}")
+                return
+
+        # Build ingredient_id -> result_id lookup
+        ingr_to_result = {}
+        for res_id, ingrs in recipes.items():
+            for ingr_id in ingrs:
+                ingr_to_result[ingr_id] = res_id
+
+        print(f"\n{'='*60}")
+        print(f"  FUSE ALL MAXED CARDS")
+        print(f"{'='*60}")
+
+        total_fused = 0
+        # Work through all owned cards; after a fusion re-check immediately
+        # by looping until no more fusions are possible.
+        changed = True
+        while changed:
+            changed = False
+            user_cards = self.init_data.get('user_cards', {})
+
+            for cid_str, entry in sorted(user_cards.items()):
+                cid      = int(cid_str)
+                owned    = int(entry.get('num_owned', 0))
+                in_decks = int(entry.get('num_used', 0))
+                free     = owned - in_decks
+
+                if free < 2:
+                    continue
+
+                info = card_data.get(cid, {})
+                if not isinstance(info, dict):
+                    continue
+
+                rarity = info.get('rarity', 1)
+                level  = info.get('level', 1)
+                tier   = info.get('tier', 0)
+
+                # Only Epic+ (rarity>=4), Level 6, Tier 0 or 1
+                if rarity < 4 or level != 6 or tier > 1:
+                    continue
+
+                # Find fusion result
+                result_id = ingr_to_result.get(cid)
+                if not result_id:
+                    continue
+
+                result_info = card_data.get(result_id, {})
+                result_name = result_info.get('name', f'ID {result_id}') if isinstance(result_info, dict) else f'ID {result_id}'
+                card_name   = info.get('name', f'ID {cid}')
+
+                print(f"\n  🔨 Fusing {card_name} (level {level}, tier {tier}, rarity {rarity})")
+                print(f"     Owned: {owned} (free: {free})  →  {result_name}")
+
+                result = self.api.call('fuseCard', card_id=result_id)
+                if not result or result.get('result') not in (True, 1, '1', 'true'):
+                    print(f"  ✗ Fusion failed: {result}")
+                    continue
+
+                print(f"  ✓ Fused → {result_name}")
+                total_fused += 1
+                changed = True
+
+                # Refresh inventory and re-check this card immediately
+                self.initialize(verbose=False)
+                break   # restart the loop with fresh inventory
+
+        print(f"\n{'='*60}")
+        if total_fused:
+            print(f"  ✓ Done — {total_fused} fusion(s) performed")
+        else:
+            print(f"  ℹ No eligible cards to fuse")
+        print(f"{'='*60}")
 
     def pity_the_fool_runner(self):
         """
@@ -22853,6 +23000,10 @@ def interactive_menu():
             commander.salvage_outdated_all_accounts(); input("\n[ENTER] to continue...")
         elif choice == "shards_all":
             commander.use_shards_all_accounts(); input("\n[ENTER] to continue...")
+        elif choice == "fuse_maxed":
+            commander.fuse_all_maxed_cards(); input("\n[ENTER] to continue...")
+        elif choice == "fuse_maxed_all":
+            commander.fuse_all_maxed_cards_all_accounts(); input("\n[ENTER] to continue...")
         elif choice == "raid_m":
             commander.multi_account_raid_mission_arena(); input("\n[ENTER] to continue...")
         elif choice == "enlog":
@@ -23055,8 +23206,10 @@ def interactive_menu():
             '18': 'deck_import',
             '19': 'salvage_outdated_all',
             '20': 'shards_all',
+            '21': 'fuse_maxed',
+            '22': 'fuse_maxed_all',
         }
-        _multi_opts = {'95', 'set_ad_all', 'opt_mission_all', 'salvage_outdated_all', 'shards_all'}
+        _multi_opts = {'95', 'set_ad_all', 'opt_mission_all', 'salvage_outdated_all', 'shards_all', 'fuse_maxed_all'}
         while True:
             print("\n" + "="*52)
             print("  INVENTORY & CARD MANAGEMENT")
@@ -23082,6 +23235,8 @@ def interactive_menu():
                 print("  18.   Update Deck from Import File (TUO result → all accounts)")
                 print("  19.   Salvage Outdated – All Accounts")
                 print("  20.   Use Shards – All Accounts")
+                print("  21.   Fuse All Maxed Cards (Epic+, Tier 0/1, Level 6)")
+                print("  22.   Fuse All Maxed Cards – All Accounts")
             print("─"*52)
             print("  0.   ← Back to Main Menu")
             print("="*52)
