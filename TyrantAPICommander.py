@@ -2568,11 +2568,11 @@ $(document).ready(function(){
                     })
 
         if not missions:
-            print(f"  ✗ No active quest missions found")
-            # ── Restore deck slot even on early exit ─────────────────
+            print(f"  ✗ No active quest missions found – falling back to highest mission")
+            # ── Restore deck slot before fallback ────────────────────
             if _slot6_exists and _prev_slot_m != MISSION_SLOT:
                 self.api.call('setActiveDeck', deck_id=_prev_slot_m)
-            return 0, 0, 0
+            return self.play_highest_mission_loop()
 
         selected   = missions[0]
         mission_id = selected['mission_id']
@@ -3338,6 +3338,9 @@ $(document).ready(function(){
             ("achievements.xml",       base_url + "achievements.xml"),
             ("items.xml",              base_url + "items.xml"),
             ("levels.xml",             base_url + "levels.xml"),
+            ("events.xml",             base_url + "events.xml"),
+            ("battleground_effects.xml", base_url + "battleground_effects.xml"),
+            ("updates.xml",             base_url + "updates.xml"),
         ]
         for i in range(1, 22):
             files_to_download.append((f"cards_section_{i}.xml", base_url + f"cards_section_{i}.xml"))
@@ -5940,6 +5943,15 @@ $(document).ready(function(){
                 import time as _time
                 _end_time     = int(abd.get('end_time', 0))
                 _brawl_active = _end_time > 0 and _end_time > int(_time.time())
+
+                # Fallback: API sometimes delays setting end_time in the first
+                # hours after brawl start. If brawl energy > 0, a brawl IS active.
+                if not _brawl_active:
+                    _brawl_energy = (self.init_data.get('player_brawl_data') or {}).get('energy') or {}
+                    _battle_energy = int(_brawl_energy.get('battle_energy', 0))
+                    if _battle_energy > 0:
+                        _brawl_active = True
+                        print(f"  ℹ  Brawl detected via energy ({_battle_energy}) — end_time not yet set by server")
 
                 # ── Mode: previous – always use last brawl leaderboard ──
                 if mode == 'previous':
@@ -9246,6 +9258,31 @@ $(document).ready(function(){
                 cmdr_id  = dd.get('commander_id')
                 dom_id   = dd.get('dominion_id')
                 card_ids = dd.get('cards', [])
+
+                # Resolve base card_ids to their highest upgrade (level-6) variant.
+                # defense_deck.cards sometimes returns base (level-1) card_ids
+                # instead of the upgraded variant, causing names without level
+                # suffix in deck strings (e.g. "Alpha Dynamo" vs "Alpha Dynamo-6").
+                def _resolve_to_max_level(cid):
+                    cid = int(cid)
+                    info = card_data.get(cid, {})
+                    if not isinstance(info, dict):
+                        return cid
+                    upg = info.get('upgrade_id')
+                    while upg and int(upg) != cid:
+                        cid = int(upg)
+                        info = card_data.get(cid, {})
+                        if not isinstance(info, dict):
+                            break
+                        upg = info.get('upgrade_id')
+                    return cid
+
+                if cmdr_id:
+                    cmdr_id = _resolve_to_max_level(cmdr_id)
+                if dom_id:
+                    dom_id  = _resolve_to_max_level(dom_id)
+                card_ids = [_resolve_to_max_level(c) for c in card_ids]
+
                 deck = self._build_tuo_deck_string(cmdr_id, dom_id, card_ids, card_data)
                 return (deck, None) if deck else (None, "deck string build failed")
             except Exception as e:
@@ -9398,28 +9435,43 @@ $(document).ready(function(){
     # All other multi-word names (spaces only) resolve correctly via simplify_name on both sides.
     @classmethod
     def _api_bge_to_tuo(cls, api_name):
-        """Convert an API BGE name to the TUO -e flag value.
+        """Convert an API BGE name to the TUO effect flag value.
 
-        Spaces are removed: "Temporal Backlash" -> "TemporalBacklash".
-        Exceptions:
-          "Oath of Loyalty"  -> "Oath-Of-Loyalty"
-          "EnduringRage 2"   -> "EnduringRage 2"  (space before numeric suffix kept)
+        Sources:
+          - tyrant_optimize.cpp: canonical hyphenated passive BGE names
+          - data/bges.txt: aliases (some with apostrophes/spaces, passed through as-is)
+
+        Default rule: spaces -> hyphens ("Critical Reach" -> "Critical-Reach").
+        Pass-through for bges.txt aliases that include apostrophes or spaces
+        (TUO receives them as a single subprocess argument).
         """
         if not api_name:
             return api_name
+
         _explicit = {
-            'Oath of Loyalty': 'Oath-Of-Loyalty',
-            'EnduringRage 2':  'EnduringRage 2',
-            'Enduring Rage':   'EnduringRage 2',
+            # Passive BGE canonical names (tyrant_optimize.cpp)
+            'Oath of Loyalty':          'Oath-Of-Loyalty',
+            'Enduring Rage':            'EnduringRage 2',
+            'Enduring-Rage 2':          'EnduringRage 2',
+            'EnduringRage 2':           'EnduringRage 2',
+            "Zealot's Preservation":    'Zealots-Preservation',
+            'Superheroism':             'SuperHeroism',
+            # bges.txt aliases with apostrophes — pass through as-is
+            "Jotun's Presence":         "Jotun's Presence",
         }
+
         if api_name in _explicit:
             return _explicit[api_name]
-        # Preserve space before trailing numeric suffix (e.g. "SomeBGE 3" -> "SomeBGE 3")
+
+        # Numeric suffix: hyphenate name part, keep space before number
+        # e.g. "Bloodlust 3" -> "Bloodlust 3", "Some BGE 3" -> "Some-BGE 3"
         import re as _re
         m = _re.match(r'^(.*?)\s+(\d+)$', api_name)
         if m:
-            return m.group(1).replace(' ', '') + ' ' + m.group(2)
-        return api_name.replace(' ', '')
+            return m.group(1).replace(' ', '-') + ' ' + m.group(2)
+
+        # Default: spaces -> hyphens
+        return api_name.replace(' ', '-')
 
     def _run_tuo_sim(self, my_deck, enemy_deck, bge_name=None,
                      sim_count=500, hand_card=None, ordered=False, surge=False, verbose=False, force_ordered=False):
@@ -10367,7 +10419,7 @@ $(document).ready(function(){
                             self._export_arena_opponent_deck(
                                 enemy_name=enemy_name, enemy_guild=enemy_guild,
                                 winner=winner, battle_data=battle_data, silent=False,
-                                live_deck_str=_live_deck or None)
+                                live_deck_str=_live_deck or None) if not (_cached_guild or enemy_guild or '').lower() in _guild_account_map else None
                             self.initialize(verbose=False)
                     break
 
@@ -10614,7 +10666,7 @@ $(document).ready(function(){
                     self._export_arena_opponent_deck(
                         enemy_name=enemy_name, enemy_guild=enemy_guild,
                         winner=winner, battle_data=battle_data, silent=False,
-                        live_deck_str=_live_deck or None)
+                        live_deck_str=_live_deck or None) if not (_cached_guild or enemy_guild or '').lower() in _guild_account_map else None
                     # ── Write combat log ─────────────────────────────
                     if combat_log:
                         _cl_acct = self.api.settings.get('request_data', {}).get('kong_name', '')
