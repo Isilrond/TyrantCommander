@@ -2088,10 +2088,14 @@ $(document).ready(function(){
 
                 rarity = info.get('rarity', 1)
                 level  = info.get('level', 1)
-                tier   = info.get('tier', 0)
+                # fusion_tier is only set on Level-1 base cards; for upgrade cards
+                # look it up via base_id → base card's fusion_tier
+                base_id = info.get('base_id', cid)
+                base_info = card_data.get(base_id, {})
+                tier = base_info.get('fusion_tier', info.get('tier', 0)) if isinstance(base_info, dict) else info.get('tier', 0)
 
-                # Only Epic+ (rarity>=4), Level 6, Tier 0 or 1
-                if rarity < 4 or level != 6 or tier > 1:
+                # Only Epic+ (rarity>=3), Level 6, Tier 0 or 1
+                if rarity < 3 or level != 6 or tier > 1:
                     continue
 
                 # Skip base fusion ingredients and explicit exceptions
