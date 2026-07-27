@@ -3141,9 +3141,22 @@ $(document).ready(function(){
         raid_info = self.init_data.get('raid_info', {})
         
         event_shown = False
-        
-        # Show Brawl information
-        if active_brawl and player_brawl:
+
+        # Show Guild War energy if a war is active
+        fw = self.init_data.get('faction_war', {})
+        awe = self.init_data.get('active_war_event', {})
+        if fw and awe:
+            gw_energy     = int(fw.get('battle_energy', 0))
+            gw_max_energy = int(fw.get('max_battle_energy', 20))
+            gw_name       = awe.get('name', 'Guild War')
+            print(f"\n{gw_name}:")
+            print(f"  Energy:       {gw_energy}/{gw_max_energy}")
+            event_shown = True
+
+        # Show Brawl information — only if brawl is still active
+        import time as _time
+        brawl_end = int((active_brawl or {}).get('end_time', 0))
+        if active_brawl and player_brawl and brawl_end > int(_time.time()):
             event_name = active_brawl.get('name', 'Event')
             brawl_energy = player_brawl.get('energy', {})
             current_energy = int(brawl_energy.get('battle_energy', 0))
@@ -9443,11 +9456,11 @@ $(document).ready(function(){
 
         Sources:
           - tyrant_optimize.cpp: canonical hyphenated passive BGE names
-          - data/bges.txt: aliases (some with apostrophes/spaces, passed through as-is)
+          - data/bges.txt: GW/zone BGE aliases — passed through as-is with spaces
+            (TUO receives them as a single subprocess argument and looks them up)
 
         Default rule: spaces -> hyphens ("Critical Reach" -> "Critical-Reach").
-        Pass-through for bges.txt aliases that include apostrophes or spaces
-        (TUO receives them as a single subprocess argument).
+        bges.txt aliases are passed through unchanged.
         """
         if not api_name:
             return api_name
@@ -9460,15 +9473,35 @@ $(document).ready(function(){
             'EnduringRage 2':           'EnduringRage 2',
             "Zealot's Preservation":    'Zealots-Preservation',
             'Superheroism':             'SuperHeroism',
-            # bges.txt aliases with apostrophes — pass through as-is
-            "Jotun's Presence":         "Jotun's Presence",
         }
 
         if api_name in _explicit:
             return _explicit[api_name]
 
+        # bges.txt pass-through check: try loading from disk once per process
+        if not hasattr(cls, '_bges_txt_keys'):
+            import glob as _gl
+            cls._bges_txt_keys = set()
+            for _p in _gl.glob(os.path.join(SCRIPT_DIR, 'bges.txt')) + \
+                      _gl.glob(os.path.join(SCRIPT_DIR, 'data', 'bges.txt')) + \
+                      _gl.glob(os.path.join(os.path.dirname(SCRIPT_DIR), 'bges.txt')):
+                try:
+                    with open(_p, 'r', encoding='utf-8') as _f:
+                        for _line in _f:
+                            _line = _line.strip()
+                            if _line and not _line.startswith('//') and ':' in _line:
+                                _key = _line.split(':')[0].strip()
+                                if _key:
+                                    cls._bges_txt_keys.add(_key)
+                    break
+                except Exception:
+                    pass
+
+        # If the name is a bges.txt alias, pass it through as-is (spaces allowed)
+        if api_name in cls._bges_txt_keys:
+            return api_name
+
         # Numeric suffix: hyphenate name part, keep space before number
-        # e.g. "Bloodlust 3" -> "Bloodlust 3", "Some BGE 3" -> "Some-BGE 3"
         import re as _re
         m = _re.match(r'^(.*?)\s+(\d+)$', api_name)
         if m:
@@ -9557,26 +9590,33 @@ $(document).ready(function(){
         # Build deck string with played cards inserted after commander/dom
         # so TUO freezes them and only reorders the remaining cards
         if played_cards:
-            # Parse my_deck: first token = commander, second (if dominion) = dom
             deck_parts = [p.strip() for p in my_deck.split(',')]
             commander  = deck_parts[0]
             rest       = deck_parts[1:]
-            # Detect dominion: check if second card is in the deck as dominion
-            # (dominion name typically ends with a pattern – just use dom_uid51 approach)
-            # Simpler: keep commander + played_cards frozen, then remaining unplayed cards
-            played_set = list(played_cards)  # preserve order
-            remaining  = list(rest)          # all non-commander cards
-            # Remove played cards from remaining (one occurrence each)
+
+            # Dominion detection: dominions are never played from hand,
+            # so if rest[0] is not in played_cards it must be the dominion.
+            played_set   = list(played_cards)
+            played_names = set(played_cards)
+            dominion     = None
+            assault_rest = list(rest)
+            if rest and rest[0] not in played_names:
+                dominion     = rest[0]
+                assault_rest = list(rest[1:])
+
+            remaining = list(assault_rest)
             for pc in played_set:
                 for i, rc in enumerate(remaining):
                     if rc == pc:
                         remaining.pop(i)
                         break
-            # Rebuild: commander, played (frozen), remaining (reorderable), hand constraint
-            new_deck_parts = [commander] + played_set + remaining
+
+            new_deck_parts = [commander]
+            if dominion:
+                new_deck_parts.append(dominion)
+            new_deck_parts += played_set + remaining
             effective_deck = ', '.join(new_deck_parts)
-            # freeze = 1 (commander) + len(played_cards)
-            freeze_n = 1 + len(played_set)
+            freeze_n = 1 + (1 if dominion else 0) + len(played_set)
         else:
             effective_deck = my_deck
             freeze_n = 1
@@ -10466,8 +10506,11 @@ $(document).ready(function(){
                     enemy_played = self._parse_enemy_played_cards(battle_data, card_data, brawl_mode=False)
 
                     # Build hand-state dicts from cumulative card states
-                    _own_range   = list(range(1, 11))   + list(range(150, 160))
-                    _enemy_range = list(range(101, 111)) + list(range(50, 60))
+                    # UID schema (empirically verified):
+                    # own assault=1-10, own dominion=51, own summons=52+
+                    # enemy assault=101-110, enemy dominion=151, enemy summons=152+
+                    _own_range   = list(range(1, 11))   + [51] + list(range(52, 100))
+                    _enemy_range = list(range(101, 111)) + [151] + list(range(152, 200))
                     _token_card_map.update(self._extract_token_card_map(battle_data))
                     _card_map    = {**battle_data.get('card_map', {}), **_token_card_map}
                     # Add commander card_ids (API gives them separately, not in card_map)
@@ -10518,6 +10561,8 @@ $(document).ready(function(){
                         # precedence over the historical _killed set.
                         result = []
                         for uid_i in uid_range:
+                            if uid_i < 0:
+                                continue
                             uid = str(uid_i)
                             cid = _card_map.get(uid)
                             if not cid:
@@ -10538,6 +10583,8 @@ $(document).ready(function(){
                                 if ev_h is not None and int(ev_h) <= 0:
                                     continue
                             s = _cl_card_states.get(uid, {})
+                            # Skip dict-valued flags (e.g. mimic_skill)
+                            s = {k: v for k, v in s.items() if not isinstance(v, dict)}
                             name = self._card_id_to_tuo_name(cid, card_data)
                             # Include even if s is empty (card on field with full HP, no effects)
                             if name and cid:
@@ -10996,9 +11043,11 @@ $(document).ready(function(){
                     print(f"\n  ⏳ {_mode_lbl} ({', '.join(unique_names)}{freeze_info}{enemy_info})...")
                     enemy_played = self._parse_enemy_played_cards(battle_data, card_data, brawl_mode=True)
 
-                    # Build hand-state dicts (Brawl: own=101-110, enemy=1-10)
-                    _own_range   = list(range(101, 111)) + list(range(50, 60))
-                    _enemy_range = list(range(1, 11))   + list(range(150, 160))
+                    # Brawl: own=101-110, own dominion=51, enemy dominion=151
+                    # Own forts=152-153 (2 forts), own summons=154+
+                    # Enemy forts=52-53 (2 forts), enemy summons=54+
+                    _own_range   = list(range(101, 111)) + [51] + list(range(54, 100)) + [152, 153]
+                    _enemy_range = list(range(1, 11))   + [151] + [52, 53] + list(range(154, 200))
                     _token_card_map.update(self._extract_token_card_map(battle_data))
                     _card_map    = {**battle_data.get('card_map', {}), **_token_card_map}
                     # Brawl: own commander=UID 150, enemy commander=UID 50
@@ -11041,6 +11090,8 @@ $(document).ready(function(){
                         # (handles UID reuse within a battle).
                         result = []
                         for uid_i in uid_range:
+                            if uid_i < 0:
+                                continue
                             uid = str(uid_i)
                             cid = _card_map.get(uid)
                             if not cid:
@@ -11057,6 +11108,8 @@ $(document).ready(function(){
                                 if ev_h is not None and int(ev_h) <= 0:
                                     continue
                             s = _cl_card_states.get(uid, {})
+                            # Skip dict-valued flags (e.g. mimic_skill)
+                            s = {k: v for k, v in s.items() if not isinstance(v, dict)}
                             name = self._card_id_to_tuo_name(cid, card_data)
                             if name and cid:
                                 result.append((name, s))
@@ -11433,6 +11486,22 @@ $(document).ready(function(){
 
             gauntlet       = self._lookup_enemy_deck_gauntlet(enemy_name, '')
             enemy_deck_str = gauntlet[1] if gauntlet else None
+            enemy_guild    = gauntlet[2] if gauntlet else ''
+
+            # Derive enemy guild from faction_war data if not known from gauntlet.
+            # Compare attacker/defender guild names against own guild name.
+            if not enemy_guild:
+                my_guild_name = (self.init_data.get('faction') or {}).get('name', '').strip()
+                att_name = fw.get('attacker_faction_name', '').strip()
+                def_name = fw.get('defender_faction_name', '').strip()
+                if att_name and def_name:
+                    if my_guild_name and my_guild_name.lower() == att_name.lower():
+                        enemy_guild = def_name   # we are attacker → enemy is defender
+                    elif my_guild_name and my_guild_name.lower() == def_name.lower():
+                        enemy_guild = att_name   # we are defender → enemy is attacker
+                    else:
+                        # Fallback via host_is_attacker perspective
+                        enemy_guild = def_name if host_is_attacker else att_name
 
             def _fort_str(uid_pair):
                 names = []
@@ -11550,10 +11619,20 @@ $(document).ready(function(){
                     print(f"    [{i}]  UID {hc['uid']}  card_id={hc['card_id']}  name={cname}")
 
                 if not enemy_deck_str and en_cmd_id:
+                    # Update cumulative card map first so partial deck grows each turn
+                    _gw_token_map.update(self._extract_token_card_map(battle_data))
+                    _gw_card_map = {**battle_data.get('card_map', {}), **_gw_token_map}
+                    # Exclude commander (50/150) and dominion (51/151) UIDs from
+                    # rev_uids — they are passed separately to _build_tuo_deck_string
+                    # and would otherwise appear twice (and out of order) in the string.
+                    _en_cmd_uid = 150 if brawl_mode_uids else 50
+                    _en_dom_uid = 151 if brawl_mode_uids else 51
                     rev_uids = sorted(
-                        [k for k in card_map.keys()
-                         if k.isdigit() and int(k) in en_uid_range], key=int)
-                    rev_ids  = [card_map[u] for u in rev_uids if card_map.get(u)]
+                        [k for k in _gw_card_map.keys()
+                         if k.isdigit()
+                         and int(k) in en_uid_range
+                         and int(k) not in (_en_cmd_uid, _en_dom_uid)], key=int)
+                    rev_ids  = [_gw_card_map[u] for u in rev_uids if _gw_card_map.get(u)]
                     sim_deck  = self._build_tuo_deck_string(en_cmd_id, en_dom_id, rev_ids, card_data)
                     sim_label = f"⚠ Partial deck ({len(rev_ids)} cards known)"
                 else:
@@ -11579,11 +11658,31 @@ $(document).ready(function(){
                     print(f"\n  ⏳ {_mode_lbl} ({', '.join(unique_names)}{freeze_info}{enemy_info}{fort_info})...")
 
                     # Build hand-state dicts for GW
-                    _gw_own_range   = (list(range(101, 111)) + list(range(50, 60))) if brawl_mode_uids else (list(range(1, 11)) + list(range(150, 160)))
-                    _gw_enemy_range = (list(range(1, 11)) + list(range(150, 160))) if brawl_mode_uids else (list(range(101, 111)) + list(range(50, 60)))
+                    # GW UID schema (own dominion=always 51, enemy dominion=always 151)
+                    # Own forts occupy 152..152+n_own_forts-1
+                    # Enemy forts occupy 52..52+n_enemy_forts-1
+                    # Own summons occupy 52+n_enemy_forts..100
+                    # Enemy summons occupy 152+n_own_forts..200
+                    _n_own_forts   = sum(1 for u in my_fort_uids if card_map.get(u))
+                    _n_enemy_forts = sum(1 for u in en_fort_uids if card_map.get(u))
+                    if brawl_mode_uids:  # own=101-110
+                        _gw_own_range   = (list(range(101, 111)) + [51] +
+                                           list(range(52 + _n_enemy_forts, 100)) +
+                                           list(range(152, 152 + _n_own_forts)))
+                        _gw_enemy_range = (list(range(1, 11)) + [151] +
+                                           list(range(52, 52 + _n_enemy_forts)) +
+                                           list(range(152 + _n_own_forts, 200)))
+                    else:  # own=1-10
+                        _gw_own_range   = (list(range(1, 11)) + [51] +
+                                           list(range(152 + _n_enemy_forts, 200)) +
+                                           list(range(52, 52 + _n_own_forts)))
+                        _gw_enemy_range = (list(range(101, 111)) + [151] +
+                                           list(range(152, 152 + _n_enemy_forts)) +
+                                           list(range(52 + _n_own_forts, 100)))
                     _gw_killed      = self._collect_killed_uids(battle_data, brawl_mode=brawl_mode_uids)
-                    _gw_token_map.update(self._extract_token_card_map(battle_data))
-                    _gw_card_map    = {**battle_data.get('card_map', {}), **_gw_token_map}
+                    if '_gw_card_map' not in vars():  # only if not already built above
+                        _gw_token_map.update(self._extract_token_card_map(battle_data))
+                        _gw_card_map = {**battle_data.get('card_map', {}), **_gw_token_map}
 
                     # Merge absolute HP from field into _gw_card_states
                     _gw_field_json = battle_data.get('field', {})
@@ -11614,6 +11713,8 @@ $(document).ready(function(){
                         # (handles UID reuse within a battle).
                         result = []
                         for uid_i in uid_range:
+                            if uid_i < 0:   # skip UID -1 (commander mimic state)
+                                continue
                             uid = str(uid_i)
                             cid = _gw_card_map.get(uid)
                             if not cid:
@@ -11630,6 +11731,8 @@ $(document).ready(function(){
                                 if ev_h is not None and int(ev_h) <= 0:
                                     continue
                             s = _gw_card_states.get(uid, {})
+                            # Skip dict-valued flags (e.g. mimic_skill) — not serializable
+                            s = {k: v for k, v in s.items() if not isinstance(v, dict)}
                             name = self._card_id_to_tuo_name(cid, card_data)
                             if name and cid:
                                 result.append((name, s))
@@ -11748,6 +11851,12 @@ $(document).ready(function(){
                                 'turns': _gw_turns,
                             }, account_name=_cl_acct)
                             _gw_turns = []
+                    # ── Gauntlet export ───────────────────────────────────
+                    if _fail_win is not None:
+                        self._export_arena_opponent_deck(
+                            enemy_name=enemy_name, enemy_guild=enemy_guild,
+                            winner=_fail_win, battle_data=_fail_bd or battle_data,
+                            silent=False, brawl_mode=brawl_mode_uids)
                     else:
                         print("  ✗ playCard failed")
                         self._print_api_error(battle_result, "playCard")
@@ -11798,6 +11907,11 @@ $(document).ready(function(){
                             'turns':       _gw_turns,
                         }, account_name=_cl_acct)
                         _gw_turns = []
+                    # ── Gauntlet export ───────────────────────────────────
+                    self._export_arena_opponent_deck(
+                        enemy_name=enemy_name, enemy_guild=enemy_guild,
+                        winner=winner, battle_data=battle_data,
+                        silent=False, brawl_mode=brawl_mode_uids)
                     self.initialize(verbose=False)
                     break
 
@@ -13355,8 +13469,9 @@ $(document).ready(function(){
                 pfx = 'WIN_' if s.startswith('WIN_') else 'LOSS_'
                 inner = s.split(': ')[0][len(pfx):]
                 # Extract guild: last underscore-delimited segment if present
+                # Guildless entries use the full inner key as bucket (not shared '')
                 parts = inner.split('_')
-                guild = parts[-1] if len(parts) > 1 else ''
+                guild = parts[-1] if len(parts) > 1 else inner  # own bucket per guildless player
                 wl_entries.append((i, comment_idx, guild, ts))
             i += 1
 
@@ -13813,33 +13928,49 @@ $(document).ready(function(){
                             if _rstop > _now:
                                 _raid_active = True
                                 break
-                        # Brawl active?
+                        # Guild War active?
+                        _fw = tmp.init_data.get('faction_war', {}) or {}
+                        _awe = tmp.init_data.get('active_war_event', {}) or {}
+                        _gw_energy = int(_fw.get('battle_energy', 0)) if isinstance(_fw, dict) else 0
+                        _gw_active = bool(_awe and isinstance(_fw, dict) and _fw.get('battle_energy') is not None)
+                        # Brawl active (end_time in future, not a guild brawl)?
                         _brawl = tmp.init_data.get('active_brawl_data', {}) or {}
                         if not isinstance(_brawl, dict): _brawl = {}
                         _brawl_end  = int(_brawl.get('end_time', 0))
                         _brawl_name = _brawl.get('name', '')
                         _is_guild_brawl = any(w in _brawl_name.lower() for w in ('guild', 'guildbrawl'))
+                        _brawl_live = _brawl_end > _now and not _is_guild_brawl
                         if _raid_active:
                             event_label = 'Raid'
                             event_detected = True
-                        elif _brawl_end > _now and not _is_guild_brawl:
+                        elif _gw_active:
+                            event_label = (_awe.get('name', 'Guild War') if isinstance(_awe, dict) else 'Guild War')
+                            event_detected = True
+                        elif _brawl_live:
                             event_label = _brawl_name or 'Brawl'
                             event_detected = True
-                        else:
-                            event_label = 'Event'
-                            event_detected = True
+                        # else: no active event — don't set event_detected
 
-                    # ── Event energy (Brawl or Raid battle_energy) ──
+                    # ── Event energy ──
+                    _fw2 = tmp.init_data.get('faction_war', {}) or {}
+                    _awe2 = tmp.init_data.get('active_war_event', {}) or {}
+                    _gw_active2 = bool(_awe2 and isinstance(_fw2, dict) and _fw2.get('battle_energy') is not None)
                     pbd = tmp.init_data.get('player_brawl_data', {})
                     if not isinstance(pbd, dict): pbd = {}
                     _pbd_energy = pbd.get('energy', {})
                     if not isinstance(_pbd_energy, dict): _pbd_energy = {}
-                    be_raw = _pbd_energy.get('battle_energy')
-                    if be_raw is None:
-                        be_raw = ud.get('battle_energy', 0)
+                    if _gw_active2:
+                        # GW: read energy from faction_war
+                        be_raw = int(_fw2.get('battle_energy', 0))
+                        max_event = int(_fw2.get('max_battle_energy', 20))
+                    else:
+                        be_raw = _pbd_energy.get('battle_energy')
+                        if be_raw is None:
+                            be_raw = ud.get('battle_energy', 0)
 
                     # If Raid is active, read raid energy from raid_info in init_data
-                    max_event = 25
+                    if not _gw_active2:
+                        max_event = 25
                     if event_label == 'Raid':
                         try:
                             _ri_map = tmp.init_data.get('raid_info') or {}
@@ -13886,7 +14017,8 @@ $(document).ready(function(){
             return 0
 
         def _write_log(ts_label, prev, curr, event_label):
-            ev_hdr = f"{event_label} /25"
+            _max_ev = next((v['max_event'] for v in curr.values() if v and 'max_event' in v), 25)
+            ev_hdr = f"{event_label} /{_max_ev}"
             # Header
             lines = [
                 f"\n{'='*90}",
@@ -13913,16 +14045,16 @@ $(document).ready(function(){
                 mission_pct = _pct(c['mission'],  c['max_mission'])
                 arena_pct   = _pct(c['arena'],    c['max_arena'])
 
-                # Cap warnings
+                # Cap warnings (GW energy doesn't regenerate — skip event cap warning)
                 caps_hit = []
-                if event_pct   >= 100: caps_hit.append(event_label)
+                if event_pct   >= 100 and _max_ev != 20: caps_hit.append(event_label)
                 if mission_pct >= 100: caps_hit.append('Mission')
                 if arena_pct   >= 100: caps_hit.append('Arena')
                 warn_flag = '!!' if caps_hit else ''
                 if caps_hit:
                     warnings.append(f"  !! {nick}: {', '.join(caps_hit)} at 100% cap")
 
-                event_str   = f"{c['event']}/25 ({event_pct}%)"
+                event_str   = f"{c['event']}/{c['max_event']} ({event_pct}%)"
                 mission_str = f"{c['mission']}/{c['max_mission']} ({mission_pct}%)"
                 arena_str   = f"{c['arena']}/{c['max_arena']} ({arena_pct}%)"
 
