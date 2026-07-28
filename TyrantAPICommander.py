@@ -9911,7 +9911,7 @@ $(document).ready(function(){
             # Enhance values (all sim.cpp-supported enhance_* flags)
             'enhance_subdue', 'enhance_scavenge', 'enhance_allegiance',
             'enhance_armor', 'enhance_armored', 'enhance_avenge', 'enhance_barrier',
-            'enhance_berserk', 'enhance_coalition', 'enhance_corrosive',
+            'enhance_berserk', 'enhance_besiege', 'enhance_coalition', 'enhance_corrosive',
             'enhance_counter', 'enhance_disease', 'enhance_drain', 'enhance_evade',
             'enhance_fortify', 'enhance_hunt', 'enhance_inhibit', 'enhance_leech',
             'enhance_legion', 'enhance_mark', 'enhance_poison', 'enhance_stasis',
@@ -13899,7 +13899,7 @@ $(document).ready(function(){
         def _fetch_snapshot():
             """Returns (snap_dict, event_label) where event_label is 'Brawl', 'Raid', etc."""
             snap = {}
-            event_label = 'Brawl'   # default; updated from first successful account
+            event_label = None   # set from first successful account; None = no active event
             event_detected = False
             total = len(playable)
             for idx, (nick, sf) in enumerate(playable, 1):
@@ -14018,21 +14018,28 @@ $(document).ready(function(){
 
         def _write_log(ts_label, prev, curr, event_label):
             _max_ev = next((v['max_event'] for v in curr.values() if v and 'max_event' in v), 25)
-            ev_hdr = f"{event_label} /{_max_ev}"
+            ev_hdr = f"{event_label} /{_max_ev}" if event_label else None
             # Header
             lines = [
                 f"\n{'='*90}",
-                f"  ENERGY SNAPSHOT  {ts_label}  [{event_label}]",
+                f"  ENERGY SNAPSHOT  {ts_label}  [{event_label or 'No Event'}]",
                 f"{'='*90}",
-                f"  {'Account':<20}  {ev_hdr:>14}  {'Δ':>5}  {'Mission':>14}  {'Δ':>5}  {'Arena':>12}  {'Δ':>5}  {'!':>2}",
-                f"  {'─'*20}  {'─'*14}  {'─'*5}  {'─'*14}  {'─'*5}  {'─'*12}  {'─'*5}  {'─'*2}",
             ]
+            if ev_hdr:
+                lines.append(f"  {'Account':<20}  {ev_hdr:>14}  {'Δ':>5}  {'Mission':>14}  {'Δ':>5}  {'Arena':>12}  {'Δ':>5}  {'!':>2}")
+                lines.append(f"  {'─'*20}  {'─'*14}  {'─'*5}  {'─'*14}  {'─'*5}  {'─'*12}  {'─'*5}  {'─'*2}")
+            else:
+                lines.append(f"  {'Account':<20}  {'Mission':>14}  {'Δ':>5}  {'Arena':>12}  {'Δ':>5}  {'!':>2}")
+                lines.append(f"  {'─'*20}  {'─'*14}  {'─'*5}  {'─'*12}  {'─'*5}  {'─'*2}")
             warnings = []
             for nick, _ in playable:
                 c = curr.get(nick)
                 p = prev.get(nick) if prev else None
                 if c is None:
-                    lines.append(f"  {nick:<20}  {'–':>14}  {'–':>5}  {'–':>14}  {'–':>5}  {'–':>12}  {'–':>5}  {'–':>2}")
+                    if ev_hdr:
+                        lines.append(f"  {nick:<20}  {'–':>14}  {'–':>5}  {'–':>14}  {'–':>5}  {'–':>12}  {'–':>5}  {'–':>2}")
+                    else:
+                        lines.append(f"  {nick:<20}  {'–':>14}  {'–':>5}  {'–':>12}  {'–':>5}  {'–':>2}")
                     continue
 
                 def _delta(key):
@@ -14047,7 +14054,7 @@ $(document).ready(function(){
 
                 # Cap warnings (GW energy doesn't regenerate — skip event cap warning)
                 caps_hit = []
-                if event_pct   >= 100 and _max_ev != 20: caps_hit.append(event_label)
+                if event_pct   >= 100 and _max_ev != 20 and event_label: caps_hit.append(event_label)
                 if mission_pct >= 100: caps_hit.append('Mission')
                 if arena_pct   >= 100: caps_hit.append('Arena')
                 warn_flag = '!!' if caps_hit else ''
@@ -14060,9 +14067,9 @@ $(document).ready(function(){
 
                 lines.append(
                     f"  {nick:<20}"
-                    f"  {event_str:>14}  {_delta('event'):>5}"
-                    f"  {mission_str:>14}  {_delta('mission'):>5}"
-                    f"  {arena_str:>12}  {_delta('arena'):>5}"
+                    + (f"  {event_str:>14}  {_delta('event'):>5}" if ev_hdr else "")
+                    + f"  {mission_str:>14}  {_delta('mission'):>5}"
+                    + f"  {arena_str:>12}  {_delta('arena'):>5}"
                     f"  {warn_flag:>2}"
                 )
 
