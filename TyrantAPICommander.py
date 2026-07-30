@@ -14411,9 +14411,15 @@ $(document).ready(function(){
                                 except Exception:
                                     pass
                         elif mode == 'brawl':
-                            stats = tmp_cmd.live_sim_brawl(skip_deck_select=True, combat_log=_ma_combat_log)
+                            if tmp_cmd.api.settings.get('skip_brawl'):
+                                print(f"  ⏭  {nick}: skip_brawl=true — skipping")
+                            else:
+                                stats = tmp_cmd.live_sim_brawl(skip_deck_select=True, combat_log=_ma_combat_log)
                         else:  # gwar
-                            stats = tmp_cmd.live_sim_guildwar(skip_deck_select=True, combat_log=_ma_combat_log)
+                            if tmp_cmd.api.settings.get('skip_guildwar'):
+                                print(f"  ⏭  {nick}: skip_guildwar=true — skipping")
+                            else:
+                                stats = tmp_cmd.live_sim_guildwar(skip_deck_select=True, combat_log=_ma_combat_log)
                         if stats:
                             all_stats.append((nick, stats))
                         break  # success -> next account
@@ -14603,12 +14609,15 @@ $(document).ready(function(){
                         _active_deck_before = str(tmp.init_data.get('user_data', {}).get('active_deck', '1'))
 
                         # ── 1. BRAWL ─────────────────────────────────
-                        be = int(tmp.init_data.get('user_data', {}).get('battle_energy', 0))
-                        if be > 0:
-                            print(f"\n  [BRAWL]")
-                            tmp.live_sim_brawl(skip_deck_select=True, combat_log=_ma_combat_log_brawl)
+                        if tmp.api.settings.get('skip_brawl'):
+                            print(f"  [BRAWL]  skipped (skip_brawl=true)")
                         else:
-                            print(f"  [BRAWL]  skipped (battle_energy=0)")
+                            be = int(tmp.init_data.get('user_data', {}).get('battle_energy', 0))
+                            if be > 0:
+                                print(f"\n  [BRAWL]")
+                                tmp.live_sim_brawl(skip_deck_select=True, combat_log=_ma_combat_log_brawl)
+                            else:
+                                print(f"  [BRAWL]  skipped (battle_energy=0)")
 
                         # ── 2. QUEST MISSION ─────────────────────────
                         tmp.initialize(verbose=False)
