@@ -13204,7 +13204,7 @@ $(document).ready(function(){
          'required': ['Devoted Adept'],
          'pool': ['Primal Yeren', 'Experiment Gasher', 'The Mass',
                   'Impurity Arrester', 'Restore Sequencer'],
-         'pool_min': 2},
+         'pool_min': 4},
         # step 11
         {'name': 'Loyal Eagle',
          'commander': 'Octane Optimized',
@@ -13244,13 +13244,22 @@ $(document).ready(function(){
         """Returns (step_number 1-16, meta_achievement) or (None, None)
         if Forever Loyal challenge is not active or already complete."""
         achievements = self.init_data.get('user_achievements', {})
+        import time as _time2
+        _now2 = int(_time2.time())
         meta = None
+        meta_fallback = None
         for aid, a in achievements.items():
             if int(a.get('type', 0)) == 12:
                 nm = a.get('name', '').lower()
                 if 'loyal' in nm or 'forever' in nm:
-                    meta = a
-                    break
+                    end_t = int(a.get('end_time', 0))
+                    if end_t > _now2:
+                        meta = a
+                        break
+                    elif meta_fallback is None:
+                        meta_fallback = a
+        if not meta:
+            meta = meta_fallback
         if not meta:
             return None, None
         prog = int(meta.get('progress', 0))
@@ -13339,32 +13348,24 @@ $(document).ready(function(){
             return int(max_id)   # already at max level
 
         if owned_id:
-            # Upgrade from owned_xml to max_xml via upgradeCard + xml_level navigation
-            print(f"  ⚙  Upgrading {name} from L{owned_xml} to L{max_xml}...")
-            current_id  = owned_id
-            current_xml = owned_xml
-            while current_xml < max_xml:
-                result = self.api.call('upgradeCard', card_id=str(current_id))
-                if not result or result.get('result') not in (True, 1, '1', 'true'):
-                    print(f"  ✗ upgradeCard failed at L{current_xml}: {result}")
+            # Card owned at lower level — call build_card with explicit L6 target
+            # so the Gold→SP workflow triggers automatically if SP is insufficient
+            print(f"  ⚙  Upgrading {name} from L{owned_xml} to L{max_xml} via build_card...")
+            try:
+                result = self.build_card(f"{name}-{max_xml}")
+                if result is False:
+                    print(f"  ✗ build_card upgrade failed for {name}")
                     return None
-                # Navigate to next level via base_id + xml_level
-                next_xml = current_xml + 1
-                next_id  = None
-                for cid2, cinfo2 in card_data.items():
-                    if (isinstance(cinfo2, dict)
-                            and cinfo2.get('base_id') == base_id_ref
-                            and (cinfo2.get('xml_level') or cinfo2.get('level', 1)) == next_xml):
-                        next_id = cid2
-                        break
-                if next_id is None:
-                    print(f"  ✗ Could not find L{next_xml} in card_data for {name}")
-                    return None
-                current_id  = int(next_id)
-                current_xml = next_xml
-                import time as _t2; _t2.sleep(0.3)
-            print(f"  ✓ {name} upgraded to L{max_xml} (id={current_id})")
-            return int(current_id)
+            except Exception as ex:
+                print(f"  ✗ build_card upgrade exception for {name}: {ex}")
+                return None
+            self.initialize(verbose=False)
+            user_cards = self.init_data.get('user_cards', {})
+            if str(max_id) in user_cards:
+                print(f"  ✓ {name} at L{max_xml} (id={max_id})")
+                return int(max_id)
+            print(f"  ✗ {name} still not at L{max_xml} after upgrade")
+            return None
 
         # Not in inventory at all — use build_card
         print(f"  ⚙  Building {name} from scratch via build_card...")
@@ -13602,6 +13603,100 @@ $(document).ready(function(){
                 print(f"  ✗ Restore setDeckCards failed: {result}")
         except Exception as ex:
             print(f"  ✗ Restore exception: {ex}")
+
+    def loyal_challenge_overview(self):
+        """Lists all active accounts with their current PvP Challenge step
+        and the progress of the current sub-challenge. Works for any active type-12 challenge."""
+        import glob as _glob
+
+        settings_dirs  = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings')]
+        settings_files = []
+        for sd in settings_dirs:
+            settings_files += _glob.glob(os.path.join(sd, 'settings_*.json'))
+        settings_files = [f for f in settings_files
+                          if not os.path.basename(f).startswith('settings_TEMPLATE')]
+        settings_files = sorted({os.path.normpath(f): f for f in settings_files}.values())
+
+        if not settings_files:
+            print("  ✗ No settings files found.")
+            return
+
+        print("\n" + "="*85)
+        print("  PVP CHALLENGE OVERVIEW – ALL ACCOUNTS")
+        print("="*85)
+        print(f"  {'Account':<22}  {'Step':>4}  {'Challenge':<28}  {'Sub-Challenge':<22}  {'Progress':>10}")
+        print(f"  {'─'*22}  {'─'*4}  {'─'*28}  {'─'*22}  {'─'*10}")
+
+        for sf in settings_files:
+            tmp = TyrantCommander(sf)
+            if not tmp.initialize(verbose=False):
+                nick = tmp.api.settings.get('kong_name', sf)
+                print(f"  {nick:<22}  {'–':>4}  {'Login failed':<28}  {'–':<22}  {'–':>10}")
+                continue
+            if not tmp.api.settings.get('play_enabled', True):
+                continue
+
+            nick = (tmp.api.settings.get('request_data', {}).get('kong_name', '')
+                    or tmp.api.settings.get('kong_name', sf))
+
+            achievements = tmp.init_data.get('user_achievements', {})
+
+            # Find active type-12 challenge — prefer time-limited (end_time in future)
+            import time as _time
+            _now = int(_time.time())
+            meta = None
+            meta_fallback = None
+            for a in achievements.values():
+                if int(a.get('type', 0)) == 12:
+                    end_t = int(a.get('end_time', 0))
+                    if end_t > _now:
+                        meta = a
+                        break
+                    elif meta_fallback is None:
+                        meta_fallback = a
+            if not meta:
+                meta = meta_fallback
+
+            if not meta:
+                print(f"  {nick:<22}  {'–':>4}  {'No challenge active':<28}  {'–':<22}  {'–':>10}")
+                continue
+
+            meta_name = meta.get('name', 'PvP Challenge')
+            meta_prog = int(meta.get('progress', 0))
+            meta_max  = int(meta.get('max_progress', 1))
+
+            if meta_prog >= meta_max:
+                print(f"  {nick:<22}  {'✓':>4}  {meta_name[:28]:<28}  {'All complete!':<22}  {f'{meta_prog}/{meta_max}':>10}")
+                continue
+
+            step = meta_prog + 1
+
+            # Find current sub-challenge (type 9) — same end_time as meta, not yet complete
+            meta_end  = int(meta.get('end_time', 0))
+            sub_name = sub_prog = sub_max = None
+            for a in achievements.values():
+                if int(a.get('type', 0)) == 9:
+                    if meta_end and int(a.get('end_time', 0)) != meta_end:
+                        continue
+                    sp = int(a.get('progress', 0))
+                    sm = int(a.get('max_progress', 1))
+                    if sp < sm:
+                        sub_name = a.get('name', '')
+                        sub_prog = sp
+                        sub_max  = sm
+                        break
+
+            if sub_prog is not None:
+                pct      = int(sub_prog * 100 / sub_max) if sub_max else 0
+                prog_str = f"{sub_prog}/{sub_max} ({pct}%)"
+                sub_disp = sub_name[:22] if sub_name else '–'
+            else:
+                prog_str = '–'
+                sub_disp = '–'
+
+            print(f"  {nick:<22}  {step:>4}  {meta_name[:28]:<28}  {sub_disp:<22}  {prog_str:>10}")
+
+        print("="*85)
 
     def pvp_challenge_loyal(self):
         """Automates the 'Forever Loyal' PvP Challenge.
@@ -23806,6 +23901,8 @@ def interactive_menu():
             commander.pvp_challenge_fool(); input("\n[ENTER] to continue...")
         elif choice == "loyal":
             commander.pvp_challenge_loyal(); input("\n[ENTER] to continue...")
+        elif choice == "loyal_overview":
+            commander.loyal_challenge_overview(); input("\n[ENTER] to continue...")
         elif choice == "arena_m":
             commander.multi_account_arena_mission(); input("\n[ENTER] to continue...")
         elif choice == "comb":
@@ -23978,6 +24075,7 @@ def interactive_menu():
             '4': '11',
             '5': 'enlog',
             '6': '30',
+            '7': 'loyal_overview',
         }
         while True:
             print("\n" + "="*52)
@@ -23990,6 +24088,7 @@ def interactive_menu():
                 print("  4.   Energy Overview – All Accounts")
             print("  5.   Energy Tracker (hourly log – Brawl/Mission/Arena)")
             print("  6.   Quests & Achievements")
+            print("  7.   PvP Challenge Overview (All Accounts)")
             print("─"*52)
             print("  0.   ← Back to Main Menu")
             print("="*52)
