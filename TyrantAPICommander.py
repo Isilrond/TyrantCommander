@@ -13142,6 +13142,514 @@ $(document).ready(function(){
                 break
         print("="*65)
 
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # FOREVER LOYAL PVP CHALLENGE AUTOMATION
+    # ─────────────────────────────────────────────────────────────────────────
+
+    LOYAL_CHALLENGES = [
+        # step 1
+        {'name': 'Loyal Persecutor',
+         'commander': 'Gaia the Purifier',
+         'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 2
+        {'name': 'Loyal Electrosizer',
+         'commander': 'Octane Optimized',
+         'required': ['Scythe Persecutor'],
+         'pool': [], 'pool_min': 0},
+        # step 3 - no special requirements
+        {'name': 'Loyal Dominion (3)',
+         'commander': None,
+         'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 4
+        {'name': 'Loyal Axis',
+         'commander': 'Gaia the Purifier',
+         'required': ['Electrosizer'],
+         'pool': [], 'pool_min': 0},
+        # step 5 - no special requirements
+        {'name': 'Loyal Hunter',
+         'commander': None,
+         'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 6 - 3x Xeno Ikadri Rex
+        {'name': 'Loyal Invader',
+         'commander': None,
+         'required': [],
+         'pool': ['Ikadri Rex', 'Ikadri Rex', 'Ikadri Rex'],
+         'pool_min': 3},
+        # step 7 - 2 swipe cards from pool
+        {'name': 'Loyal Deadline',
+         'commander': None,
+         'required': [],
+         'pool': ['Rebel Ranger', 'Mezarkos of Thule', "Halcyon's Regiment",
+                  'Igniting Cargo', 'Skydrop Pyxis'],
+         'pool_min': 2},
+        # step 8
+        {'name': 'Loyal Adept',
+         'commander': 'Jotun the Avalanche',
+         'required': ['Collapser Deadline'],
+         'pool': [], 'pool_min': 0},
+        # step 9 - 2 berserk cards from pool
+        {'name': 'Loyal Berserker',
+         'commander': None,
+         'required': [],
+         'pool': ['Tongues of Tirlok', 'Razorsharp Hydroblade',
+                  'Yobedyssseus', 'Primal Yeren'],
+         'pool_min': 2},
+        # step 10
+        {'name': 'Loyal Core',
+         'commander': None,
+         'required': ['Devoted Adept'],
+         'pool': ['Primal Yeren', 'Experiment Gasher', 'The Mass',
+                  'Impurity Arrester', 'Restore Sequencer'],
+         'pool_min': 2},
+        # step 11
+        {'name': 'Loyal Eagle',
+         'commander': 'Octane Optimized',
+         'required': ['Radiated Core'],
+         'pool': [], 'pool_min': 0},
+        # step 12 - no special requirements
+        {'name': 'Loyal Eliminator',
+         'commander': None,
+         'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 13
+        {'name': 'Loyal Cheetah',
+         'commander': 'Daedalus Charged',
+         'required': ['Boreal Eagle'],
+         'pool': [], 'pool_min': 0},
+        # step 14
+        {'name': 'Loyal Revered',
+         'commander': 'Malort Blightfather',
+         'required': ["Constantine's Cheetah"],
+         'pool': [], 'pool_min': 0},
+        # step 15
+        {'name': 'Loyal Vindicator',
+         'commander': 'Octane Optimized',
+         'required': [],
+         'pool': ['Gate Pulser', 'Malediction', 'Anchorage Defender'],
+         'pool_min': 2},
+        # step 16
+        {'name': 'Loyal Dominion (16)',
+         'commander': None,
+         'required': ['The Revered'],
+         'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Metro Monitor',
+                  'Veles Shapeshifter', "Yurich's Toeslasher", 'Tengri Godhammer'],
+         'pool_min': 2},
+    ]
+
+    def _detect_loyal_challenge_step(self):
+        """Returns (step_number 1-16, meta_achievement) or (None, None)
+        if Forever Loyal challenge is not active or already complete."""
+        achievements = self.init_data.get('user_achievements', {})
+        meta = None
+        for aid, a in achievements.items():
+            if int(a.get('type', 0)) == 12:
+                nm = a.get('name', '').lower()
+                if 'loyal' in nm or 'forever' in nm:
+                    meta = a
+                    break
+        if not meta:
+            return None, None
+        prog = int(meta.get('progress', 0))
+        mx   = int(meta.get('max_progress', 16))
+        if prog >= mx:
+            return None, None   # all complete
+        step = prog + 1         # 1-indexed
+        if step > len(self.LOYAL_CHALLENGES):
+            return None, None
+        return step, meta
+
+    def _find_card_id_by_name(self, name, card_data):
+        """Return base card_id (lowest level) for a card name, or None."""
+        name_lower = name.lower()
+        for cid, info in card_data.items():
+            if not isinstance(info, dict):
+                continue
+            if info.get('name', '').lower() == name_lower and info.get('level', 1) == 1:
+                return int(cid)
+        return None
+
+    def _resolve_to_max_level_id(self, base_cid, card_data):
+        """Find the max-level card_id for a given card by searching all cards
+        with the same base_id and returning the one with the highest xml_level."""
+        base_cid = int(base_cid)
+        info = card_data.get(base_cid, {})
+        if not isinstance(info, dict):
+            return base_cid
+        # Get the base_id to search by (all levels share the same base_id)
+        base_id_ref = info.get('base_id', base_cid)
+        best_id  = base_cid
+        best_lvl = info.get('xml_level') or info.get('level', 1) or 1
+        for cid, cinfo in card_data.items():
+            if not isinstance(cinfo, dict):
+                continue
+            if cinfo.get('base_id') != base_id_ref:
+                continue
+            lvl = cinfo.get('xml_level') or cinfo.get('level', 1) or 1
+            if lvl > best_lvl:
+                best_lvl = lvl
+                best_id  = cid
+        return int(best_id)
+
+    def _upgrade_card_to_max(self, base_cid, card_data):
+        """Delegate to build_card which handles buyback, restore, fusion chain."""
+        info = card_data.get(int(base_cid), {})
+        name = info.get('name', '') if isinstance(info, dict) else ''
+        if not name:
+            return None
+        return self._ensure_card_at_max_level(name, card_data)
+
+    def _ensure_card_at_max_level(self, name, card_data):
+        """Ensure card is at max level. Upgrades if owned at any level, builds from scratch if not owned.
+        Returns max-level card_id or None on failure."""
+        base_id = self._find_card_id_by_name(name, card_data)
+        if not base_id:
+            print(f"  ✗ Card not found in card_data: {name}")
+            return None
+        max_id  = self._resolve_to_max_level_id(base_id, card_data)
+        max_info = card_data.get(max_id, {})
+        max_xml  = (max_info.get('xml_level') or max_info.get('level', 6)
+                    if isinstance(max_info, dict) else 6)
+        base_id_ref = (card_data.get(base_id, {}).get('base_id', base_id)
+                       if isinstance(card_data.get(base_id, {}), dict) else base_id)
+
+        # ── Find highest level we own ─────────────────────────────────────
+        user_cards  = self.init_data.get('user_cards', {})
+        owned_id    = None
+        owned_xml   = 0
+        for cid, cinfo in card_data.items():
+            if not isinstance(cinfo, dict):
+                continue
+            if cinfo.get('base_id') != base_id_ref:
+                continue
+            if str(cid) not in user_cards:
+                continue
+            cnt = int((user_cards[str(cid)] or {}).get('num_owned', 0))
+            if cnt <= 0:
+                continue
+            lvl = cinfo.get('xml_level') or cinfo.get('level', 1) or 1
+            if lvl > owned_xml:
+                owned_xml = lvl
+                owned_id  = cid
+
+        if owned_id and owned_xml >= max_xml:
+            return int(max_id)   # already at max level
+
+        if owned_id:
+            # Upgrade from owned_xml to max_xml via upgradeCard + xml_level navigation
+            print(f"  ⚙  Upgrading {name} from L{owned_xml} to L{max_xml}...")
+            current_id  = owned_id
+            current_xml = owned_xml
+            while current_xml < max_xml:
+                result = self.api.call('upgradeCard', card_id=str(current_id))
+                if not result or result.get('result') not in (True, 1, '1', 'true'):
+                    print(f"  ✗ upgradeCard failed at L{current_xml}: {result}")
+                    return None
+                # Navigate to next level via base_id + xml_level
+                next_xml = current_xml + 1
+                next_id  = None
+                for cid2, cinfo2 in card_data.items():
+                    if (isinstance(cinfo2, dict)
+                            and cinfo2.get('base_id') == base_id_ref
+                            and (cinfo2.get('xml_level') or cinfo2.get('level', 1)) == next_xml):
+                        next_id = cid2
+                        break
+                if next_id is None:
+                    print(f"  ✗ Could not find L{next_xml} in card_data for {name}")
+                    return None
+                current_id  = int(next_id)
+                current_xml = next_xml
+                import time as _t2; _t2.sleep(0.3)
+            print(f"  ✓ {name} upgraded to L{max_xml} (id={current_id})")
+            return int(current_id)
+
+        # Not in inventory at all — use build_card
+        print(f"  ⚙  Building {name} from scratch via build_card...")
+        try:
+            result = self.build_card(name)
+            if result is False:
+                print(f"  ✗ build_card failed for {name}")
+                return None
+        except Exception as ex:
+            print(f"  ✗ build_card exception for {name}: {ex}")
+            return None
+
+        self.initialize(verbose=False)
+        user_cards = self.init_data.get('user_cards', {})
+        if str(max_id) in user_cards:
+            print(f"  ✓ {name} built to L{max_xml} (id={max_id})")
+            return int(max_id)
+        print(f"  ✗ {name} still not at L{max_xml} after build_card")
+        return None
+
+    def _loyal_log_issue(self, account_nick, step, reason):
+        """Append an issue entry to export/loyal_challenge_issues.txt."""
+        import datetime as _dt
+        log_path = os.path.join(SCRIPT_DIR, 'export', 'loyal_challenge_issues.txt')
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        ts = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open(log_path, 'a', encoding='utf-8') as _f:
+            _f.write(f"[{ts}]  Account: {account_nick}  Step {step}: {reason}\n")
+        print(f"  ⚠  Logged issue to {log_path}")
+
+    def _apply_loyal_deck_adjustments(self, step, card_data, deck_slot=1):
+        """Adjust slot-1 deck for the current Loyal challenge step.
+        Returns (original_deck_cards, original_commander_id) for restore, or (None, None) on error."""
+        if step < 1 or step > len(self.LOYAL_CHALLENGES):
+            return None, None
+
+        ch = self.LOYAL_CHALLENGES[step - 1]
+        print(f"  ♟  Challenge step {step}: {ch['name']}")
+
+        nick = (self.api.settings.get('request_data', {}).get('kong_name', '')
+                or self.api.settings.get('kong_name', ''))
+
+        needs_change = bool(ch['commander'] or ch['required'] or ch['pool_min'] > 0)
+        if not needs_change:
+            print(f"     No deck changes needed for this step.")
+            return None, None
+
+        # ── PHASE 1: Pre-check Slot 1 for already-equipped cards ─────────
+        user_decks = self.init_data.get('user_decks', {})
+        deck_info  = user_decks.get(str(deck_slot), {})
+        deck_cards = deck_info.get('cards', {}) if isinstance(deck_info, dict) else {}
+        # Build name→(card_id, level) map for cards currently in the deck
+        deck_card_names = {}
+        for cid in (deck_cards.keys() if isinstance(deck_cards, dict) else deck_cards):
+            info = card_data.get(int(cid), {})
+            if isinstance(info, dict):
+                base_name = info.get('name', '').lower()
+                # strip level suffix
+                import re as _re
+                base_name = _re.sub(r'-\d+$', '', base_name).strip()
+                lvl = info.get('xml_level') or info.get('level', 1)
+                max_info  = card_data.get(self._resolve_to_max_level_id(int(cid), card_data), {})
+                max_level = (max_info.get('xml_level') or max_info.get('level', 6)
+                             if isinstance(max_info, dict) else 6)
+                deck_card_names[base_name] = {
+                    'card_id': int(cid), 'level': lvl, 'max_level': max_level}
+
+        # ── PHASE 2: Build/upgrade required & pool cards ──────────────────
+        required_ids = []
+        for card_name in ch['required']:
+            name_key = card_name.lower()
+            in_deck  = deck_card_names.get(name_key)
+            if in_deck:
+                lvl = in_deck['level']
+                max_lvl = in_deck['max_level']
+                if lvl >= max_lvl:
+                    print(f"     Required: {card_name} already at L{lvl} in deck")
+                    required_ids.append(str(in_deck['card_id']))
+                    continue
+                else:
+                    print(f"     Required: {card_name} in deck at L{lvl}, upgrading to L{max_lvl}...")
+            cid = self._ensure_card_at_max_level(card_name, card_data)
+            if cid:
+                required_ids.append(str(cid))
+                print(f"     Required: {card_name} ready (id={cid})")
+            else:
+                reason = f"Required card not available: {card_name}"
+                print(f"  ✗ {reason}")
+                self._loyal_log_issue(nick, step, reason)
+
+        pool_ids = []
+        seen_names = {}
+        for card_name in ch['pool']:
+            if len(pool_ids) >= ch['pool_min']:
+                break
+            seen_names[card_name] = seen_names.get(card_name, 0) + 1
+            name_key = card_name.lower()
+            in_deck  = deck_card_names.get(name_key)
+            if seen_names[card_name] == 1 and in_deck and in_deck['level'] >= in_deck['max_level']:
+                pool_ids.append(str(in_deck['card_id']))
+                print(f"     Pool [{len(pool_ids)}]: {card_name} already at max in deck")
+                continue
+            if seen_names[card_name] > 1:
+                base = self._find_card_id_by_name(card_name, card_data)
+                if not base:
+                    continue
+                max_id = self._resolve_to_max_level_id(base, card_data)
+                self.initialize(verbose=False)
+                uc = self.init_data.get('user_cards', {})
+                owned = int((uc.get(str(max_id)) or {}).get('num_owned', 0))
+                if owned >= seen_names[card_name]:
+                    pool_ids.append(str(max_id))
+                    print(f"     Pool [{len(pool_ids)}]: {card_name} (id={max_id})")
+            else:
+                max_id = self._ensure_card_at_max_level(card_name, card_data)
+                if max_id:
+                    pool_ids.append(str(max_id))
+                    print(f"     Pool [{len(pool_ids)}]: {card_name} (id={max_id})")
+
+        if len(pool_ids) < ch['pool_min']:
+            reason = (f"Only {len(pool_ids)}/{ch['pool_min']} pool cards available "
+                      f"(needed: {', '.join(set(ch['pool']))})")
+            print(f"  ✗ {reason} — proceeding with what we have")
+            self._loyal_log_issue(nick, step, reason)
+
+        # ── PHASE 3: Re-read deck AFTER all builds ────────────────────────
+        self.initialize(verbose=False)
+        user_decks = self.init_data.get('user_decks', {})
+        deck_info  = user_decks.get(str(deck_slot), {})
+        if not isinstance(deck_info, dict):
+            reason = f"Could not read deck slot {deck_slot} after build"
+            print(f"  ✗ {reason}")
+            self._loyal_log_issue(nick, step, reason)
+            return None, None
+
+        orig_cmdr = deck_info.get('commander_id', '')
+        orig_card_ids = []
+        if isinstance(deck_info.get('cards'), dict):
+            for cid, cnt in deck_info['cards'].items():
+                orig_card_ids.extend([str(cid)] * int(cnt))
+        elif isinstance(deck_info.get('cards'), list):
+            for cid in deck_info['cards']:
+                orig_card_ids.append(str(cid))
+        dom_id = str(deck_info.get('dominion_id') or '')
+
+        # ── PHASE 4: Commander swap ───────────────────────────────────────
+        new_cmdr_id = orig_cmdr
+        if ch['commander']:
+            cmdr_id = self._find_card_id_by_name(ch['commander'], card_data)
+            if cmdr_id:
+                new_cmdr_id = cmdr_id
+                print(f"     Commander → {ch['commander']} (id={cmdr_id})")
+            else:
+                reason = f"Commander not found in card data: {ch['commander']}"
+                print(f"  ✗ {reason}")
+                self._loyal_log_issue(nick, step, reason)
+
+        # ── PHASE 5: Replace last N cards if needed ───────────────────────
+        new_card_ids = list(orig_card_ids)
+        # Only swap cards that aren't already in the deck at max level
+        swap_ids = []
+        for cid in (required_ids + pool_ids):
+            if str(cid) not in [str(c) for c in orig_card_ids]:
+                swap_ids.append(str(cid))
+        if swap_ids:
+            n = len(swap_ids)
+            if n > len(new_card_ids):
+                new_card_ids = swap_ids
+            else:
+                new_card_ids[-n:] = swap_ids
+            print(f"     Swapped last {n} deck slot(s) with challenge cards")
+
+        # Skip setDeckCards if only commander changed or nothing changed
+        cmdr_changed = str(new_cmdr_id) != str(orig_cmdr)
+        cards_changed = new_card_ids != orig_card_ids
+        if not cmdr_changed and not cards_changed:
+            print(f"  ✓ Deck already correct for step {step}")
+            return (orig_card_ids, str(orig_cmdr))
+
+        # ── PHASE 6: setDeckCards ─────────────────────────────────────────
+        try:
+            from collections import Counter as _Counter
+            import json as _json2
+            cards_json = _json2.dumps(
+                {str(c): str(cnt) for c, cnt in _Counter(str(c) for c in new_card_ids).items()}
+            )
+            result = self.api.call(
+                'setDeckCards',
+                deck_id=str(deck_slot),
+                commander_id=str(new_cmdr_id),
+                dominion_id=dom_id,
+                cards=cards_json,
+                activeYN='1',
+            )
+            ok = result and result.get('result') in (True, 1, '1', 'true')
+            if ok:
+                print(f"  ✓ Deck slot {deck_slot} updated for step {step}")
+            else:
+                reason = f"setDeckCards failed: {result}"
+                print(f"  ✗ {reason}")
+                self._loyal_log_issue(nick, step, reason)
+                return None, None
+        except Exception as ex:
+            reason = f"setDeckCards exception: {ex}"
+            print(f"  ✗ {reason}")
+            self._loyal_log_issue(nick, step, reason)
+            return None, None
+
+        return (orig_card_ids, str(orig_cmdr))
+
+    def _restore_loyal_deck(self, orig_card_ids, orig_cmdr_id, deck_slot=1):
+        """Restore original deck after Loyal challenge battles."""
+        if not orig_card_ids:
+            return
+        try:
+            from collections import Counter as _Counter
+            import json as _json2
+            cards_json = _json2.dumps(
+                {str(c): str(cnt) for c, cnt in _Counter(str(c) for c in orig_card_ids).items()}
+            )
+            # Retrieve dominion from current init_data
+            dom_id = str((self.init_data.get('user_decks', {}).get(str(deck_slot), {}) or {}).get('dominion_id') or '')
+            result = self.api.call(
+                'setDeckCards',
+                deck_id=str(deck_slot),
+                commander_id=str(orig_cmdr_id),
+                dominion_id=dom_id,
+                cards=cards_json,
+                activeYN='1',
+            )
+            ok = result and result.get('result') in (True, 1, '1', 'true')
+            if ok:
+                print(f"  ✓ Deck slot {deck_slot} restored to original")
+            else:
+                print(f"  ✗ Restore setDeckCards failed: {result}")
+        except Exception as ex:
+            print(f"  ✗ Restore exception: {ex}")
+
+    def pvp_challenge_loyal(self):
+        """Automates the 'Forever Loyal' PvP Challenge.
+        Detects current step via user_achievements (type-12 meta, progress counter),
+        adjusts deck slot 1 accordingly, and integrates with multi-account arena pipeline."""
+        print("\n" + "="*65)
+        print("  FOREVER LOYAL – PVP CHALLENGE STATUS")
+        print("="*65)
+
+        self.initialize(verbose=False)
+        card_data = self._load_card_data_with_rarity() or {}
+
+        step, meta = self._detect_loyal_challenge_step()
+        if not step:
+            ach = self.init_data.get('user_achievements', {})
+            has_loyal = any(
+                'loyal' in a.get('name', '').lower() or 'forever' in a.get('name', '').lower()
+                for a in ach.values()
+                if int(a.get('type', 0)) == 12
+            )
+            if has_loyal:
+                print("  ✓ Forever Loyal challenge already complete!")
+            else:
+                print("  ✗ Forever Loyal challenge not found in active achievements.")
+            return
+
+        prog = int(meta.get('progress', 0))
+        mx   = int(meta.get('max_progress', 16))
+        ch   = self.LOYAL_CHALLENGES[step - 1]
+
+        print(f"\n  Meta:     {meta.get('name')}  [{prog}/{mx}]")
+        print(f"  Current:  Step {step} — {ch['name']}")
+        if ch['commander']:
+            print(f"  Commander: {ch['commander']}")
+        if ch['required']:
+            print(f"  Required:  {', '.join(ch['required'])}")
+        if ch['pool_min'] > 0:
+            print(f"  Pool ({ch['pool_min']}x): {', '.join(set(ch['pool']))}")
+
+        print()
+        orig_ids, orig_cmdr = self._apply_loyal_deck_adjustments(step, card_data)
+        if orig_ids:
+            input("\n  Deck updated. Press ENTER to start arena battles, Ctrl+C to abort.")
+            try:
+                self.multi_account_live_sim(mode='arena')
+            finally:
+                self._restore_loyal_deck(orig_ids, orig_cmdr)
+
     def _export_arena_opponent_deck(self, enemy_name, winner, battle_data, enemy_guild='', silent=False, brawl_mode=False, live_deck_str=None):
         """
         Exports opponent deck to arenagauntlet.txt
@@ -14003,6 +14511,10 @@ $(document).ready(function(){
                         'max_event':   max_event,
                         'max_mission': max_mission,
                         'max_arena':   max_arena,
+                        'skip_event':  bool(
+                            (_gw_active2 and tmp.api.settings.get('skip_guildwar')) or
+                            (not _gw_active2 and _brawl_live and tmp.api.settings.get('skip_brawl'))
+                        ),
                     }
                 except Exception as _e:
                     snap[nick] = None
@@ -14054,12 +14566,24 @@ $(document).ready(function(){
 
                 # Cap warnings (GW energy doesn't regenerate — skip event cap warning)
                 caps_hit = []
-                if event_pct   >= 100 and _max_ev != 20 and event_label: caps_hit.append(event_label)
+                if not c.get('skip_event'):
+                    if event_pct >= 100 and _max_ev != 20 and event_label: caps_hit.append(event_label)
                 if mission_pct >= 100: caps_hit.append('Mission')
                 if arena_pct   >= 100: caps_hit.append('Arena')
                 warn_flag = '!!' if caps_hit else ''
                 if caps_hit:
                     warnings.append(f"  !! {nick}: {', '.join(caps_hit)} at 100% cap")
+
+                # Skipped accounts: show 'skipped' in event column, no energy details
+                if c.get('skip_event') and ev_hdr:
+                    lines.append(
+                        f"  {nick:<20}"
+                        + f"  {'skipped':>14}  {'':>5}"
+                        + f"  {'–':>14}  {'–':>5}"
+                        + f"  {'–':>12}  {'–':>5}"
+                        + f"  {'':>2}"
+                    )
+                    continue
 
                 event_str   = f"{c['event']}/{c['max_event']} ({event_pct}%)"
                 mission_str = f"{c['mission']}/{c['max_mission']} ({mission_pct}%)"
@@ -14399,7 +14923,17 @@ $(document).ready(function(){
                         else:
                             print("  ⚠ Could not determine active deck slot")
                         if mode == 'arena':
+                            # ── Loyal Challenge deck adjustment ───────────────
+                            _loyal_step, _ = tmp_cmd._detect_loyal_challenge_step()
+                            _loyal_orig_ids = _loyal_orig_cmdr = None
+                            if _loyal_step:
+                                _loyal_cd = tmp_cmd._load_card_data_with_rarity() or {}
+                                _loyal_orig_ids, _loyal_orig_cmdr = tmp_cmd._apply_loyal_deck_adjustments(_loyal_step, _loyal_cd)
+                                if _loyal_orig_ids:
+                                    tmp_cmd.initialize(verbose=False)
                             stats = tmp_cmd.live_sim_battle(skip_deck_select=True, combat_log=_ma_combat_log, focus_unknown=_ma_focus_unknown)
+                            if _loyal_orig_ids:
+                                tmp_cmd._restore_loyal_deck(_loyal_orig_ids, _loyal_orig_cmdr)
                             # Restore original active deck if changed
                             if active_slot:
                                 try:
@@ -14608,6 +15142,10 @@ $(document).ready(function(){
                         # Save active deck BEFORE any phase modifies it
                         _active_deck_before = str(tmp.init_data.get('user_data', {}).get('active_deck', '1'))
 
+                        # ── 0. DAILY REWARD ──────────────────────────
+                        print(f"  [DAILY]")
+                        tmp.auto_claim_daily_bonus()
+
                         # ── 1. BRAWL ─────────────────────────────────
                         if tmp.api.settings.get('skip_brawl'):
                             print(f"  [BRAWL]  skipped (skip_brawl=true)")
@@ -14766,6 +15304,10 @@ $(document).ready(function(){
                         # Save active deck BEFORE any phase modifies it
                         _active_deck_before = str(tmp.init_data.get('user_data', {}).get('active_deck', '1'))
 
+                        # ── 0. DAILY REWARD ──────────────────────────
+                        print(f"  [DAILY]")
+                        tmp.auto_claim_daily_bonus()
+
                         # ── 1. RAID ───────────────────────────────────
                         ud = tmp.init_data.get('user_data', {})
                         raid_energy = int(ud.get('raid_energy', ud.get('energy', 0)))
@@ -14921,6 +15463,19 @@ $(document).ready(function(){
 
                         # Save active deck BEFORE any phase modifies it
                         _active_deck_before = str(tmp.init_data.get('user_data', {}).get('active_deck', '1'))
+
+                        # ── 0. DAILY REWARD ──────────────────────────
+                        print(f"  [DAILY]")
+                        tmp.auto_claim_daily_bonus()
+
+                        # ── 0.5 LOYAL CHALLENGE DECK ────────────────
+                        _loyal_step2, _ = tmp._detect_loyal_challenge_step()
+                        _loyal_orig2 = _loyal_cmdr2 = None
+                        if _loyal_step2:
+                            _lcd2 = tmp._load_card_data_with_rarity() or {}
+                            _loyal_orig2, _loyal_cmdr2 = tmp._apply_loyal_deck_adjustments(_loyal_step2, _lcd2)
+                            if _loyal_orig2:
+                                tmp.initialize(verbose=False)
 
                         # ── 1. QUEST MISSION ─────────────────────────
                         energy = int(tmp.init_data.get('user_data', {}).get('energy', 0))
@@ -23249,6 +23804,8 @@ def interactive_menu():
             commander.play_first_quest_mission_all_accounts(); input("\n[ENTER] to continue...")
         elif choice == "fool":
             commander.pvp_challenge_fool(); input("\n[ENTER] to continue...")
+        elif choice == "loyal":
+            commander.pvp_challenge_loyal(); input("\n[ENTER] to continue...")
         elif choice == "arena_m":
             commander.multi_account_arena_mission(); input("\n[ENTER] to continue...")
         elif choice == "comb":
