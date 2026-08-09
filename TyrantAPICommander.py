@@ -4540,12 +4540,12 @@ $(document).ready(function(){
                 print("Canceled")
                 return False
             n_packs = int(pi.strip()) if pi.strip() else max_packs
-            ki = input_with_esc("  Base Epics keep per card (default=20, ESC=Cancel): ",
+            ki = input_with_esc("  Base Epics keep per card (default=10, ESC=Cancel): ",
                                 allow_empty=True)
             if ki is None:
                 print("Canceled")
                 return False
-            keep = int(ki.strip()) if ki.strip() else 20
+            keep = int(ki.strip()) if ki.strip() else 10
             li = input_with_esc("  Number of workflow loops (default=1, ESC=Cancel): ",
                                 allow_empty=True)
             if li is None:
@@ -13691,14 +13691,19 @@ $(document).ready(function(){
                     max_info2 = card_data.get(max_id, {})
                     max_lvl2  = (max_info2.get('xml_level') or max_info2.get('level', 6)
                                  if isinstance(max_info2, dict) else 6)
-                    # Temporarily suppress interactive confirm prompts in build_card
+                    # Suppress interactive prompts in build_card (confirm_action + input)
                     import builtins as _bi
                     _orig_input = _bi.input
                     _bi.input = lambda _p='': (print(f"  [auto] {_p}YES"), 'yes')[1]
+                    import sys as _sys
+                    _orig_confirm = _sys.modules[__name__].__dict__.get('confirm_action')
+                    _sys.modules[__name__].__dict__['confirm_action'] = lambda _p='': True
                     try:
                         result = self.build_card(f"{card_name}-{max_lvl2}")
                     finally:
                         _bi.input = _orig_input
+                        if _orig_confirm is not None:
+                            _sys.modules[__name__].__dict__['confirm_action'] = _orig_confirm
                     if result is False:
                         print(f"  ✗ build_card failed for additional {card_name}")
                         break
@@ -24021,9 +24026,9 @@ def interactive_menu():
                 pi = input_with_esc(f"Packages per run (default={max_packs}, ESC=Cancel): ", allow_empty=True)
                 if pi is None: return
                 n = int(pi.strip()) if pi.strip() else max_packs
-                ki = input_with_esc("Base Epics keep per card (default=20, ESC=Cancel): ", allow_empty=True)
+                ki = input_with_esc("Base Epics keep per card (default=10, ESC=Cancel): ", allow_empty=True)
                 if ki is None: return
-                keep = int(ki.strip()) if ki.strip() else 20
+                keep = int(ki.strip()) if ki.strip() else 10
                 li = input_with_esc("How many times to run? (default=1, ESC=Cancel): ", allow_empty=True)
                 if li is None: return
                 loop_count = int(li.strip()) if li.strip() else 1
