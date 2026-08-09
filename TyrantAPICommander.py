@@ -10615,6 +10615,22 @@ $(document).ready(function(){
                                     recommended_idx = idx2
                                     break
 
+                        # play_first override: play specific card ASAP if in hand
+                        _pf_card = None
+                        try:
+                            _pf_step, _, _pf_table = self._detect_loyal_challenge_step()
+                            if _pf_step and _pf_table:
+                                _pf_card = _pf_table[_pf_step - 1].get('play_first')
+                        except Exception:
+                            pass
+                        if _pf_card:
+                            _pf_base = _pf_card.lower().rsplit('-', 1)[0].strip()
+                            for idx2, (_, hc, cname) in enumerate(hand_display):
+                                if cname.lower().rsplit('-', 1)[0].strip() == _pf_base:
+                                    recommended_idx = idx2
+                                    print(f"  \u265f  play_first override: {cname}")
+                                    break
+
                 if recommended_idx is not None and sim_deck:
                     _, play_hc, play_name = hand_display[recommended_idx]
                     print(f"\n  ▶  Playing: {play_name}  ({win_pct:.1f}%)")
@@ -10867,6 +10883,8 @@ $(document).ready(function(){
             self.initialize(verbose=False)
             abd   = self.init_data.get('active_brawl_data', {})
             pbd   = self.init_data.get('player_brawl_data', {})
+            if not isinstance(pbd, dict):
+                pbd = {}
             energy_data  = pbd.get('energy', {})
             battle_energy = int(energy_data.get('battle_energy', 0))
 
@@ -13049,7 +13067,11 @@ $(document).ready(function(){
                 params[f'card_id[{i}]'] = cid
 
             result = self.api.call('setDeck', **params)
-            ok = result and result.get('result') in (True, 1, '1', 'true')
+            ok = result and (
+                result.get('result') in (True, 1, '1', 'true')
+                or 'user_decks' in result
+                or 'user_data' in result
+            )
             if ok:
                 # Ensure slot 1 is active
                 self.api.call('setActiveDeck', deck_id='1')
@@ -13173,36 +13195,41 @@ $(document).ready(function(){
          'commander': None,
          'required': [],
          'pool': [], 'pool_min': 0},
-        # step 6 - 3x Xeno Ikadri Rex
+        # step 6 - 5x from pool: Ikadri Rex, Vengeful Spectre, Vatborn Tynosquid, Tunneler Drillmaster, Gate Pulser
         {'name': 'Loyal Invader',
          'commander': None,
          'required': [],
-         'pool': ['Ikadri Rex', 'Ikadri Rex', 'Ikadri Rex'],
-         'pool_min': 3},
+         'pool': ['Ikadri Rex', 'Ikadri Rex', 'Ikadri Rex', 'Ikadri Rex', 'Ikadri Rex',
+                  'Vengeful Spectre', 'Vengeful Spectre', 'Vengeful Spectre', 'Vengeful Spectre', 'Vengeful Spectre',
+                  'Vatborn Tynosquid', 'Vatborn Tynosquid', 'Vatborn Tynosquid', 'Vatborn Tynosquid', 'Vatborn Tynosquid',
+                  'Tunneler Drillmaster', 'Tunneler Drillmaster', 'Tunneler Drillmaster', 'Tunneler Drillmaster', 'Tunneler Drillmaster',
+                  'Gate Pulser', 'Gate Pulser', 'Gate Pulser', 'Gate Pulser', 'Gate Pulser'],
+         'pool_min': 5},
         # step 7 - 2 swipe cards from pool
         {'name': 'Loyal Deadline',
          'commander': None,
          'required': [],
          'pool': ['Rebel Ranger', 'Mezarkos of Thule', "Halcyon's Regiment",
                   'Igniting Cargo', 'Skydrop Pyxis'],
-         'pool_min': 2},
+         'pool_min': 3},
         # step 8
         {'name': 'Loyal Adept',
-         'commander': 'Jotun the Avalanche',
+         'commander': 'Malort Blightfather',
          'required': ['Collapser Deadline'],
-         'pool': [], 'pool_min': 0},
+         'pool': [], 'pool_min': 0,
+         'play_first': 'Collapser Deadline'},
         # step 9 - 2 berserk cards from pool
         {'name': 'Loyal Berserker',
          'commander': None,
          'required': [],
          'pool': ['Tongues of Tirlok', 'Razorsharp Hydroblade',
                   'Yobedyssseus', 'Primal Yeren'],
-         'pool_min': 2},
+         'pool_min': 3},
         # step 10
         {'name': 'Loyal Core',
          'commander': None,
          'required': ['Devoted Adept'],
-         'pool': ['Primal Yeren', 'Experiment Gasher', 'The Mass',
+         'pool': ['Primal Yeren', 'Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
                   'Impurity Arrester', 'Restore Sequencer'],
          'pool_min': 4},
         # step 11
@@ -13224,13 +13251,14 @@ $(document).ready(function(){
         {'name': 'Loyal Revered',
          'commander': 'Malort Blightfather',
          'required': ["Constantine's Cheetah"],
-         'pool': [], 'pool_min': 0},
+         'pool': [], 'pool_min': 0,
+         'play_first': "Constantine's Cheetah"},
         # step 15
         {'name': 'Loyal Vindicator',
          'commander': 'Octane Optimized',
          'required': [],
          'pool': ['Gate Pulser', 'Malediction', 'Anchorage Defender'],
-         'pool_min': 2},
+         'pool_min': 3},
         # step 16
         {'name': 'Loyal Dominion (16)',
          'commander': None,
@@ -13240,36 +13268,187 @@ $(document).ready(function(){
          'pool_min': 2},
     ]
 
+
+    EXTREME_CHALLENGES = [
+        # step 1 — Win 10 times
+        {'name': 'Not Extreme - Destroyer', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 2 — Defeat 20 Progenitor Commanders
+        {'name': 'Not Extreme - Dominion', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 3 — Win 20 times
+        {'name': 'Slightly Extreme - Destroyer', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 4 — Destroy 100 Progenitor Assault cards
+        {'name': 'Slightly Extreme - Salvager', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 5 — Win 30 times
+        {'name': 'Extreme - Destroyer', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 6 — Destroy 75 Progenitor Structure cards
+        {'name': 'Extreme - Vindicated', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 7 — Win 40 times
+        {'name': 'Mega Extreme - Destroyer', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 8 — Win 40 battles playing 5 Structure cards each
+        {'name': 'Mega Extreme - Vindicated',
+         'commander': None,
+         'required': [],
+         'pool': ['Flourish Turbine', 'Mount Pristine Synod', 'SkyCom Perfect',
+                  "Yurich's Observatory", 'Armada Xonar', 'Regen Station'],
+         'pool_min': 5},
+        # step 9 — Protect Stormreaver-6 in 10 battles and win
+        {'name': 'Not Extreme - Imperial',
+         'commander': 'Gaia the Purifier',
+         'required': ['Stormreaver'],
+         'pool': [], 'pool_min': 0},
+        # step 10 — Rally Blackrock Driller-6 2x in 20 battles and win
+        {'name': 'Slightly Extreme - Imperial',
+         'commander': 'Octane Optimized',
+         'required': ['Blackrock Driller'],
+         'pool': [], 'pool_min': 0},
+        # step 11 — Fortify Tiamat the Destroyer-6 3x in 30 battles and win
+        {'name': 'Extreme - Imperial',
+         'commander': None,
+         'required': ['Tiamat the Destroyer'],
+         'pool': ['Primal Yeren', 'Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+                  'Impurity Arrester', 'Restore Sequencer'],
+         'pool_min': 4},
+        # step 12 — Rally Masterwork Aegis-6 4x in 40 battles and win
+        {'name': 'Mega Extreme - Imperial',
+         'commander': 'Octane Optimized',
+         'required': ['Masterwork Aegis'],
+         'pool': [], 'pool_min': 0},
+        # step 13 — Entrap Razor Maiden-6 in 10 battles and win
+        {'name': 'Not Extreme - Raider',
+         'commander': 'Octane Optimized',
+         'required': ['Razor Maiden'],
+         'pool': [], 'pool_min': 0},
+        # step 14 — Enrage Demon of Flame-6 2x in 20 battles and win
+        {'name': 'Slightly Extreme - Raider',
+         'commander': 'Daedalus Charged',
+         'required': ['Demon of Flame'],
+         'pool': [], 'pool_min': 0},
+        # step 15 — Overload Lead Dozer-6 3x in 30 battles and win
+        {'name': 'Extreme - Raider',
+         'commander': None,
+         'required': ['Lead Dozer'],
+         'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Metro Monitor',
+                  'Veles Shapeshifter', "Yurich's Toeslasher", 'Tengri Godhammer'],
+         'pool_min': 2},
+        # step 16 — Enrage Havoc Alpha-6 4x in 40 battles and win
+        {'name': 'Mega Extreme - Raider',
+         'commander': 'Daedalus Charged',
+         'required': ['Havoc Alpha'],
+         'pool': [], 'pool_min': 0},
+        # step 17 — Fortify Blight Demolisher-6 in 10 battles and win
+        {'name': 'Not Extreme - Bloodthirsty',
+         'commander': None,
+         'required': ['Blight Demolisher'],
+         'pool': ['Primal Yeren', 'Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+                  'Impurity Arrester', 'Restore Sequencer'],
+         'pool_min': 4},
+        # step 18 — Heal Draconian Matriarch-6 2x in 20 battles and win
+        {'name': 'Slightly Extreme - Bloodthirsty',
+         'commander': 'Malort Blightfather',
+         'required': ['Draconian Matriarch'],
+         'pool': [], 'pool_min': 0,
+         'play_first': 'Draconian Matriarch'},
+        # step 19 — Entrap Toxic Tank-6 3x in 30 battles and win
+        {'name': 'Extreme - Bloodthirsty',
+         'commander': 'Octane Optimized',
+         'required': ['Toxic Tank'],
+         'pool': [], 'pool_min': 0},
+        # step 20 — Heal Sinew Sticher-6 4x in 40 battles and win
+        {'name': 'Mega Extreme - Bloodthirsty',
+         'commander': 'Malort Blightfather',
+         'required': ['Sinew Sticher'],
+         'pool': [], 'pool_min': 0,
+         'play_first': 'Sinew Sticher'},
+        # step 21 — Protect Unholy Daemon-6 in 10 battles and win
+        {'name': 'Not Extreme - Xeno',
+         'commander': 'Gaia the Purifier',
+         'required': ['Unholy Daemon'],
+         'pool': [], 'pool_min': 0},
+        # step 22 — Heal Fleet Mothership-6 2x in 20 battles and win
+        {'name': 'Slightly Extreme - Xeno',
+         'commander': 'Malort Blightfather',
+         'required': ['Fleet Mothership'],
+         'pool': [], 'pool_min': 0,
+         'play_first': 'Fleet Mothership'},
+        # step 23 — Enrage Lurker Horror-6 3x in 30 battles and win
+        {'name': 'Extreme - Xeno',
+         'commander': 'Daedalus Charged',
+         'required': ['Lurker Horror'],
+         'pool': [], 'pool_min': 0},
+        # step 24 — Heal Stealth Dreadship-6 4x in 40 battles and win
+        {'name': 'Mega Extreme - Xeno',
+         'commander': 'Malort Blightfather',
+         'required': ['Stealth Dreadship'],
+         'pool': [], 'pool_min': 0,
+         'play_first': 'Stealth Dreadship'},
+        # step 25 — Fortify Divine Equalizer-6 in 10 battles and win
+        {'name': 'Not Extreme - Righteous',
+         'commander': None,
+         'required': ['Divine Equalizer'],
+         'pool': ['Primal Yeren', 'Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+                  'Impurity Arrester', 'Restore Sequencer'],
+         'pool_min': 4},
+        # step 26 — Rally Glorious Vigil-6 2x in 20 battles and win
+        {'name': 'Slightly Extreme - Righteous',
+         'commander': 'Octane Optimized',
+         'required': ['Glorious Vigil'],
+         'pool': [], 'pool_min': 0},
+        # step 27 — Heal Virulent Falcion-6 3x in 30 battles and win
+        {'name': 'Extreme - Righteous',
+         'commander': 'Malort Blightfather',
+         'required': ['Virulent Falcion'],
+         'pool': [], 'pool_min': 0,
+         'play_first': 'Virulent Falcion'},
+        # step 28 — Rally Contaminant Purge-6 4x in 40 battles and win
+        {'name': 'Mega Extreme - Righteous',
+         'commander': 'Octane Optimized',
+         'required': ['Contaminant Purge'],
+         'pool': [], 'pool_min': 0},
+    ]
+
     def _detect_loyal_challenge_step(self):
-        """Returns (step_number 1-16, meta_achievement) or (None, None)
-        if Forever Loyal challenge is not active or already complete."""
+        """Returns (step_number, meta_achievement, challenge_table) or (None, None, None).
+        Prefers time-limited challenges (Forever Loyal); falls back to Extreme PVP Challenge."""
         achievements = self.init_data.get('user_achievements', {})
         import time as _time2
         _now2 = int(_time2.time())
-        meta = None
-        meta_fallback = None
+
+        # 1st priority: time-limited type-12 with 'loyal'/'forever' in name
+        meta_loyal = meta_loyal_expired = None
+        # 2nd priority: Extreme PVP Challenge (no end_time)
+        meta_extreme = None
+
         for aid, a in achievements.items():
-            if int(a.get('type', 0)) == 12:
-                nm = a.get('name', '').lower()
-                if 'loyal' in nm or 'forever' in nm:
-                    end_t = int(a.get('end_time', 0))
-                    if end_t > _now2:
-                        meta = a
-                        break
-                    elif meta_fallback is None:
-                        meta_fallback = a
+            if int(a.get('type', 0)) != 12:
+                continue
+            nm    = a.get('name', '').lower()
+            end_t = int(a.get('end_time', 0))
+            if 'loyal' in nm or 'forever' in nm:
+                if end_t > _now2:
+                    meta_loyal = a
+                elif meta_loyal_expired is None:
+                    meta_loyal_expired = a
+            elif 'extreme' in nm:
+                if meta_extreme is None:
+                    meta_extreme = a
+
+        # Pick best candidate
+        meta  = meta_loyal or meta_loyal_expired
+        table = self.LOYAL_CHALLENGES
+        if not meta and meta_extreme:
+            meta  = meta_extreme
+            table = self.EXTREME_CHALLENGES
+
         if not meta:
-            meta = meta_fallback
-        if not meta:
-            return None, None
+            return None, None, None
         prog = int(meta.get('progress', 0))
-        mx   = int(meta.get('max_progress', 16))
+        mx   = int(meta.get('max_progress', len(table)))
         if prog >= mx:
-            return None, None   # all complete
-        step = prog + 1         # 1-indexed
-        if step > len(self.LOYAL_CHALLENGES):
-            return None, None
-        return step, meta
+            return None, None, None
+        step = prog + 1
+        if step > len(table):
+            return None, None, None
+        return step, meta, table
 
     def _find_card_id_by_name(self, name, card_data):
         """Return base card_id (lowest level) for a card name, or None."""
@@ -13396,13 +13575,14 @@ $(document).ready(function(){
             _f.write(f"[{ts}]  Account: {account_nick}  Step {step}: {reason}\n")
         print(f"  ⚠  Logged issue to {log_path}")
 
-    def _apply_loyal_deck_adjustments(self, step, card_data, deck_slot=1):
-        """Adjust slot-1 deck for the current Loyal challenge step.
+    def _apply_loyal_deck_adjustments(self, step, card_data, deck_slot=1, challenge_table=None):
+        """Adjust slot-1 deck for the current challenge step.
         Returns (original_deck_cards, original_commander_id) for restore, or (None, None) on error."""
-        if step < 1 or step > len(self.LOYAL_CHALLENGES):
+        table = challenge_table if challenge_table is not None else self.LOYAL_CHALLENGES
+        if step < 1 or step > len(table):
             return None, None
 
-        ch = self.LOYAL_CHALLENGES[step - 1]
+        ch = table[step - 1]
         print(f"  ♟  Challenge step {step}: {ch['name']}")
 
         nick = (self.api.settings.get('request_data', {}).get('kong_name', '')
@@ -13412,6 +13592,18 @@ $(document).ready(function(){
         if not needs_change:
             print(f"     No deck changes needed for this step.")
             return None, None
+
+        # ── PHASE 0: Snapshot original deck BEFORE any builds ────────────
+        user_decks_snap = self.init_data.get('user_decks', {})
+        deck_info_snap  = user_decks_snap.get(str(deck_slot), {})
+        orig_cmdr_snap  = deck_info_snap.get('commander_id', '') if isinstance(deck_info_snap, dict) else ''
+        orig_card_ids   = []
+        if isinstance(deck_info_snap.get('cards'), dict):
+            for cid, cnt in deck_info_snap['cards'].items():
+                orig_card_ids.extend([str(cid)] * int(cnt))
+        elif isinstance(deck_info_snap.get('cards'), list):
+            for cid in deck_info_snap['cards']:
+                orig_card_ids.append(str(cid))
 
         # ── PHASE 1: Pre-check Slot 1 for already-equipped cards ─────────
         user_decks = self.init_data.get('user_decks', {})
@@ -13457,41 +13649,81 @@ $(document).ready(function(){
                 self._loyal_log_issue(nick, step, reason)
 
         pool_ids = []
-        seen_names = {}
+        remaining = ch['pool_min']
+
+        # Build ordered list of (card_name, count_needed) preserving pool order
+        seen_pool = {}
+        pool_order = []
         for card_name in ch['pool']:
-            if len(pool_ids) >= ch['pool_min']:
+            if card_name not in seen_pool:
+                seen_pool[card_name] = 0
+                pool_order.append(card_name)
+            seen_pool[card_name] += 1
+
+        for card_name in pool_order:
+            if remaining <= 0:
                 break
-            seen_names[card_name] = seen_names.get(card_name, 0) + 1
-            name_key = card_name.lower()
-            in_deck  = deck_card_names.get(name_key)
-            if seen_names[card_name] == 1 and in_deck and in_deck['level'] >= in_deck['max_level']:
-                pool_ids.append(str(in_deck['card_id']))
-                print(f"     Pool [{len(pool_ids)}]: {card_name} already at max in deck")
+            want = remaining  # use as many copies of this card as needed
+
+            base   = self._find_card_id_by_name(card_name, card_data)
+            if not base:
+                print(f"  ✗ Pool card not in card_data: {card_name}")
                 continue
-            if seen_names[card_name] > 1:
-                base = self._find_card_id_by_name(card_name, card_data)
-                if not base:
-                    continue
-                max_id = self._resolve_to_max_level_id(base, card_data)
+            max_id = self._resolve_to_max_level_id(base, card_data)
+
+            # Step A: equip from existing inventory
+            self.initialize(verbose=False)
+            uc    = self.init_data.get('user_cards', {})
+            owned = int((uc.get(str(max_id)) or {}).get('num_owned', 0))
+            equip_now = min(owned, want)
+            for _ in range(equip_now):
+                pool_ids.append(str(max_id))
+                print(f"     Pool [{len(pool_ids)}]: {card_name} (from inventory, id={max_id})")
+            remaining -= equip_now
+            still_need = want - equip_now
+
+            # Step B: build missing copies one by one via build_card directly
+            for i in range(still_need):
+                if remaining <= 0:
+                    break
+                print(f"     Pool: building {card_name} copy {i+1}/{still_need}...")
+                try:
+                    max_info2 = card_data.get(max_id, {})
+                    max_lvl2  = (max_info2.get('xml_level') or max_info2.get('level', 6)
+                                 if isinstance(max_info2, dict) else 6)
+                    # Temporarily suppress interactive confirm prompts in build_card
+                    import builtins as _bi
+                    _orig_input = _bi.input
+                    _bi.input = lambda _p='': (print(f"  [auto] {_p}YES"), 'yes')[1]
+                    try:
+                        result = self.build_card(f"{card_name}-{max_lvl2}")
+                    finally:
+                        _bi.input = _orig_input
+                    if result is False:
+                        print(f"  ✗ build_card failed for additional {card_name}")
+                        break
+                except Exception as ex:
+                    print(f"  ✗ build_card exception for {card_name}: {ex}")
+                    break
+                # Re-read inventory fresh after each build
                 self.initialize(verbose=False)
-                uc = self.init_data.get('user_cards', {})
-                owned = int((uc.get(str(max_id)) or {}).get('num_owned', 0))
-                if owned >= seen_names[card_name]:
+                uc2    = self.init_data.get('user_cards', {})
+                owned2 = int((uc2.get(str(max_id)) or {}).get('num_owned', 0))
+                if owned2 > owned + len([p for p in pool_ids if p == str(max_id)]) - equip_now:
                     pool_ids.append(str(max_id))
-                    print(f"     Pool [{len(pool_ids)}]: {card_name} (id={max_id})")
-            else:
-                max_id = self._ensure_card_at_max_level(card_name, card_data)
-                if max_id:
-                    pool_ids.append(str(max_id))
-                    print(f"     Pool [{len(pool_ids)}]: {card_name} (id={max_id})")
+                    remaining -= 1
+                    print(f"     Pool [{len(pool_ids)}]: {card_name} built (id={max_id})")
+                else:
+                    print(f"  ✗ No new copy detected for {card_name} — moving to next card")
+                    break
 
         if len(pool_ids) < ch['pool_min']:
             reason = (f"Only {len(pool_ids)}/{ch['pool_min']} pool cards available "
-                      f"(needed: {', '.join(set(ch['pool']))})")
+                      f"(needed from: {', '.join(pool_order)})")
             print(f"  ✗ {reason} — proceeding with what we have")
             self._loyal_log_issue(nick, step, reason)
 
-        # ── PHASE 3: Re-read deck AFTER all builds ────────────────────────
+        # ── PHASE 3: Re-read deck AFTER all builds for new configuration ──
         self.initialize(verbose=False)
         user_decks = self.init_data.get('user_decks', {})
         deck_info  = user_decks.get(str(deck_slot), {})
@@ -13501,14 +13733,14 @@ $(document).ready(function(){
             self._loyal_log_issue(nick, step, reason)
             return None, None
 
-        orig_cmdr = deck_info.get('commander_id', '')
-        orig_card_ids = []
+        orig_cmdr = orig_cmdr_snap  # use pre-build snapshot for restore
+        new_card_ids = []
         if isinstance(deck_info.get('cards'), dict):
             for cid, cnt in deck_info['cards'].items():
-                orig_card_ids.extend([str(cid)] * int(cnt))
+                new_card_ids.extend([str(cid)] * int(cnt))
         elif isinstance(deck_info.get('cards'), list):
             for cid in deck_info['cards']:
-                orig_card_ids.append(str(cid))
+                new_card_ids.append(str(cid))
         dom_id = str(deck_info.get('dominion_id') or '')
 
         # ── PHASE 4: Commander swap ───────────────────────────────────────
@@ -13523,23 +13755,18 @@ $(document).ready(function(){
                 print(f"  ✗ {reason}")
                 self._loyal_log_issue(nick, step, reason)
 
-        # ── PHASE 5: Replace last N cards if needed ───────────────────────
-        new_card_ids = list(orig_card_ids)
-        # Only swap cards that aren't already in the deck at max level
-        swap_ids = []
-        for cid in (required_ids + pool_ids):
-            if str(cid) not in [str(c) for c in orig_card_ids]:
-                swap_ids.append(str(cid))
-        if swap_ids:
-            n = len(swap_ids)
+        # ── PHASE 5: Replace last N cards ────────────────────────────────
+        all_new = required_ids + pool_ids
+        if all_new:
+            n = len(all_new)
             if n > len(new_card_ids):
-                new_card_ids = swap_ids
+                new_card_ids = all_new
             else:
-                new_card_ids[-n:] = swap_ids
-            print(f"     Swapped last {n} deck slot(s) with challenge cards")
+                new_card_ids[-n:] = all_new
+            print(f"     Replaced last {n} deck slot(s) with challenge cards")
 
-        # Skip setDeckCards if only commander changed or nothing changed
-        cmdr_changed = str(new_cmdr_id) != str(orig_cmdr)
+        # Skip setDeckCards if nothing changed at all
+        cmdr_changed  = str(new_cmdr_id) != str(orig_cmdr)
         cards_changed = new_card_ids != orig_card_ids
         if not cmdr_changed and not cards_changed:
             print(f"  ✓ Deck already correct for step {step}")
@@ -13560,7 +13787,11 @@ $(document).ready(function(){
                 cards=cards_json,
                 activeYN='1',
             )
-            ok = result and result.get('result') in (True, 1, '1', 'true')
+            ok = result and (
+                result.get('result') in (True, 1, '1', 'true')
+                or 'user_decks' in result
+                or 'user_data' in result
+            )
             if ok:
                 print(f"  ✓ Deck slot {deck_slot} updated for step {step}")
             else:
@@ -13574,7 +13805,7 @@ $(document).ready(function(){
             self._loyal_log_issue(nick, step, reason)
             return None, None
 
-        return (orig_card_ids, str(orig_cmdr))
+        return (orig_card_ids, str(orig_cmdr_snap))
 
     def _restore_loyal_deck(self, orig_card_ids, orig_cmdr_id, deck_slot=1):
         """Restore original deck after Loyal challenge battles."""
@@ -13596,7 +13827,11 @@ $(document).ready(function(){
                 cards=cards_json,
                 activeYN='1',
             )
-            ok = result and result.get('result') in (True, 1, '1', 'true')
+            ok = result and (
+                result.get('result') in (True, 1, '1', 'true')
+                or 'user_decks' in result
+                or 'user_data' in result
+            )
             if ok:
                 print(f"  ✓ Deck slot {deck_slot} restored to original")
             else:
@@ -13606,8 +13841,11 @@ $(document).ready(function(){
 
     def loyal_challenge_overview(self):
         """Lists all active accounts with their current PvP Challenge step
-        and the progress of the current sub-challenge. Works for any active type-12 challenge."""
+        and the progress of the current sub-challenge. Works for any active type-12 challenge.
+        Press Enter to refresh, ESC to exit."""
         import glob as _glob
+        import datetime as _dt
+        import time as _time
 
         settings_dirs  = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings')]
         settings_files = []
@@ -13618,85 +13856,104 @@ $(document).ready(function(){
         settings_files = sorted({os.path.normpath(f): f for f in settings_files}.values())
 
         if not settings_files:
-            print("  ✗ No settings files found.")
+            print("  \u2717 No settings files found.")
             return
 
-        print("\n" + "="*85)
-        print("  PVP CHALLENGE OVERVIEW – ALL ACCOUNTS")
-        print("="*85)
-        print(f"  {'Account':<22}  {'Step':>4}  {'Challenge':<28}  {'Sub-Challenge':<22}  {'Progress':>10}")
-        print(f"  {'─'*22}  {'─'*4}  {'─'*28}  {'─'*22}  {'─'*10}")
+        prev_state = {}   # nick \u2192 {'step': int, 'prog': int}
 
-        for sf in settings_files:
-            tmp = TyrantCommander(sf)
-            if not tmp.initialize(verbose=False):
-                nick = tmp.api.settings.get('kong_name', sf)
-                print(f"  {nick:<22}  {'–':>4}  {'Login failed':<28}  {'–':<22}  {'–':>10}")
-                continue
-            if not tmp.api.settings.get('play_enabled', True):
-                continue
+        while True:
+            print("\n" + "="*100)
+            print("  PVP CHALLENGE OVERVIEW \u2013 ALL ACCOUNTS")
+            print("="*100)
+            print(f"  {'Account':<22}  {'Step':>8}  {'Challenge':<22}  {'Sub-Challenge':<22}  {'Progress':>14}  {'Ends':>10}")
+            print(f"  {'\u2500'*22}  {'\u2500'*8}  {'\u2500'*22}  {'\u2500'*22}  {'\u2500'*14}  {'\u2500'*10}")
 
-            nick = (tmp.api.settings.get('request_data', {}).get('kong_name', '')
-                    or tmp.api.settings.get('kong_name', sf))
+            for sf in settings_files:
+                tmp = TyrantCommander(sf)
+                if not tmp.initialize(verbose=False):
+                    nick = tmp.api.settings.get('kong_name', sf)
+                    print(f"  {nick:<22}  {'\u2013':>8}  {'Login failed':<22}  {'\u2013':<22}  {'\u2013':>14}  {'\u2013':>10}")
+                    continue
+                if not tmp.api.settings.get('play_enabled', True):
+                    continue
 
-            achievements = tmp.init_data.get('user_achievements', {})
+                nick = (tmp.api.settings.get('request_data', {}).get('kong_name', '')
+                        or tmp.api.settings.get('kong_name', sf))
 
-            # Find active type-12 challenge — prefer time-limited (end_time in future)
-            import time as _time
-            _now = int(_time.time())
-            meta = None
-            meta_fallback = None
-            for a in achievements.values():
-                if int(a.get('type', 0)) == 12:
-                    end_t = int(a.get('end_time', 0))
-                    if end_t > _now:
-                        meta = a
-                        break
-                    elif meta_fallback is None:
-                        meta_fallback = a
-            if not meta:
-                meta = meta_fallback
+                achievements = tmp.init_data.get('user_achievements', {})
 
-            if not meta:
-                print(f"  {nick:<22}  {'–':>4}  {'No challenge active':<28}  {'–':<22}  {'–':>10}")
-                continue
+                _now = int(_time.time())
+                meta = None
+                meta_fallback = None
+                for a in achievements.values():
+                    if int(a.get('type', 0)) == 12:
+                        end_t = int(a.get('end_time', 0))
+                        if end_t > _now:
+                            meta = a
+                            break
+                        elif meta_fallback is None:
+                            meta_fallback = a
+                if not meta:
+                    meta = meta_fallback
 
-            meta_name = meta.get('name', 'PvP Challenge')
-            meta_prog = int(meta.get('progress', 0))
-            meta_max  = int(meta.get('max_progress', 1))
+                if not meta:
+                    print(f"  {nick:<22}  {'\u2013':>8}  {'No challenge active':<22}  {'\u2013':<22}  {'\u2013':>14}  {'\u2013':>10}")
+                    continue
 
-            if meta_prog >= meta_max:
-                print(f"  {nick:<22}  {'✓':>4}  {meta_name[:28]:<28}  {'All complete!':<22}  {f'{meta_prog}/{meta_max}':>10}")
-                continue
+                meta_name = meta.get('name', 'PvP Challenge')
+                meta_prog = int(meta.get('progress', 0))
+                meta_max  = int(meta.get('max_progress', 1))
+                meta_end  = int(meta.get('end_time', 0))
+                end_str   = _dt.datetime.fromtimestamp(meta_end).strftime('%d.%m.%y') if meta_end else '\u2013'
 
-            step = meta_prog + 1
+                if meta_prog >= meta_max:
+                    print(f"  {nick:<22}  {'\u2713':>8}  {meta_name[:22]:<22}  {'All complete!':<22}  {'\u2013':>14}  {end_str:>10}")
+                    prev_state[nick] = {'step': meta_prog, 'prog': meta_prog}
+                    continue
 
-            # Find current sub-challenge (type 9) — same end_time as meta, not yet complete
-            meta_end  = int(meta.get('end_time', 0))
-            sub_name = sub_prog = sub_max = None
-            for a in achievements.values():
-                if int(a.get('type', 0)) == 9:
-                    if meta_end and int(a.get('end_time', 0)) != meta_end:
-                        continue
-                    sp = int(a.get('progress', 0))
-                    sm = int(a.get('max_progress', 1))
-                    if sp < sm:
-                        sub_name = a.get('name', '')
-                        sub_prog = sp
-                        sub_max  = sm
-                        break
+                step = meta_prog + 1
 
-            if sub_prog is not None:
-                pct      = int(sub_prog * 100 / sub_max) if sub_max else 0
-                prog_str = f"{sub_prog}/{sub_max} ({pct}%)"
-                sub_disp = sub_name[:22] if sub_name else '–'
-            else:
-                prog_str = '–'
-                sub_disp = '–'
+                sub_name = sub_prog = sub_max = None
+                for a in achievements.values():
+                    if int(a.get('type', 0)) == 9:
+                        if meta_end and int(a.get('end_time', 0)) != meta_end:
+                            continue
+                        sp = int(a.get('progress', 0))
+                        sm = int(a.get('max_progress', 1))
+                        if sp < sm:
+                            sub_name = a.get('name', '')
+                            sub_prog = sp
+                            sub_max  = sm
+                            break
 
-            print(f"  {nick:<22}  {step:>4}  {meta_name[:28]:<28}  {sub_disp:<22}  {prog_str:>10}")
+                prev      = prev_state.get(nick, {})
+                prev_step = prev.get('step')
+                prev_prog = prev.get('prog')
 
-        print("="*85)
+                if prev_step is not None and step > prev_step:
+                    step_str = f"{step} (+{step - prev_step})"
+                    prog_delta = ''
+                else:
+                    step_str = str(step)
+                    if prev_prog is not None and sub_prog is not None and sub_prog > prev_prog:
+                        prog_delta = f" (+{sub_prog - prev_prog})"
+                    else:
+                        prog_delta = ''
+
+                if sub_prog is not None:
+                    prog_str = f"{sub_prog}/{sub_max}{prog_delta}"
+                    sub_disp = sub_name[:22] if sub_name else '\u2013'
+                else:
+                    prog_str = '\u2013'
+                    sub_disp = '\u2013'
+
+                print(f"  {nick:<22}  {step_str:>8}  {meta_name[:22]:<22}  {sub_disp:<22}  {prog_str:>14}  {end_str:>10}")
+                prev_state[nick] = {'step': step, 'prog': sub_prog if sub_prog is not None else 0}
+
+            print("="*100)
+            key = input_with_esc("\n  [ENTER] Refresh  |  [ESC] Exit: ", allow_empty=True)
+            if key is None:
+                break
 
     def pvp_challenge_loyal(self):
         """Automates the 'Forever Loyal' PvP Challenge.
@@ -13709,23 +13966,23 @@ $(document).ready(function(){
         self.initialize(verbose=False)
         card_data = self._load_card_data_with_rarity() or {}
 
-        step, meta = self._detect_loyal_challenge_step()
+        step, meta, _ch_table = self._detect_loyal_challenge_step()
         if not step:
             ach = self.init_data.get('user_achievements', {})
-            has_loyal = any(
-                'loyal' in a.get('name', '').lower() or 'forever' in a.get('name', '').lower()
+            has_any = any(
+                any(kw in a.get('name', '').lower() for kw in ('loyal', 'forever', 'extreme'))
                 for a in ach.values()
                 if int(a.get('type', 0)) == 12
             )
-            if has_loyal:
-                print("  ✓ Forever Loyal challenge already complete!")
+            if has_any:
+                print("  ✓ Active challenge already complete!")
             else:
-                print("  ✗ Forever Loyal challenge not found in active achievements.")
+                print("  ✗ No active PvP challenge found in achievements.")
             return
 
         prog = int(meta.get('progress', 0))
-        mx   = int(meta.get('max_progress', 16))
-        ch   = self.LOYAL_CHALLENGES[step - 1]
+        mx   = int(meta.get('max_progress', len(_ch_table)))
+        ch   = _ch_table[step - 1]
 
         print(f"\n  Meta:     {meta.get('name')}  [{prog}/{mx}]")
         print(f"  Current:  Step {step} — {ch['name']}")
@@ -13737,7 +13994,7 @@ $(document).ready(function(){
             print(f"  Pool ({ch['pool_min']}x): {', '.join(set(ch['pool']))}")
 
         print()
-        orig_ids, orig_cmdr = self._apply_loyal_deck_adjustments(step, card_data)
+        orig_ids, orig_cmdr = self._apply_loyal_deck_adjustments(step, card_data, challenge_table=_ch_table)
         if orig_ids:
             input("\n  Deck updated. Press ENTER to start arena battles, Ctrl+C to abort.")
             try:
@@ -14669,18 +14926,11 @@ $(document).ready(function(){
                 if caps_hit:
                     warnings.append(f"  !! {nick}: {', '.join(caps_hit)} at 100% cap")
 
-                # Skipped accounts: show 'skipped' in event column, no energy details
+                # Skipped accounts: show 'skipped' in event column, but still show mission/arena
                 if c.get('skip_event') and ev_hdr:
-                    lines.append(
-                        f"  {nick:<20}"
-                        + f"  {'skipped':>14}  {'':>5}"
-                        + f"  {'–':>14}  {'–':>5}"
-                        + f"  {'–':>12}  {'–':>5}"
-                        + f"  {'':>2}"
-                    )
-                    continue
-
-                event_str   = f"{c['event']}/{c['max_event']} ({event_pct}%)"
+                    event_str = 'skipped'
+                else:
+                    event_str = f"{c['event']}/{c['max_event']} ({event_pct}%)"
                 mission_str = f"{c['mission']}/{c['max_mission']} ({mission_pct}%)"
                 arena_str   = f"{c['arena']}/{c['max_arena']} ({arena_pct}%)"
 
@@ -15019,16 +15269,18 @@ $(document).ready(function(){
                             print("  ⚠ Could not determine active deck slot")
                         if mode == 'arena':
                             # ── Loyal Challenge deck adjustment ───────────────
-                            _loyal_step, _ = tmp_cmd._detect_loyal_challenge_step()
+                            _loyal_step, _, _loyal_table = tmp_cmd._detect_loyal_challenge_step()
                             _loyal_orig_ids = _loyal_orig_cmdr = None
                             if _loyal_step:
                                 _loyal_cd = tmp_cmd._load_card_data_with_rarity() or {}
-                                _loyal_orig_ids, _loyal_orig_cmdr = tmp_cmd._apply_loyal_deck_adjustments(_loyal_step, _loyal_cd)
+                                _loyal_orig_ids, _loyal_orig_cmdr = tmp_cmd._apply_loyal_deck_adjustments(_loyal_step, _loyal_cd, challenge_table=_loyal_table)
                                 if _loyal_orig_ids:
                                     tmp_cmd.initialize(verbose=False)
-                            stats = tmp_cmd.live_sim_battle(skip_deck_select=True, combat_log=_ma_combat_log, focus_unknown=_ma_focus_unknown)
-                            if _loyal_orig_ids:
-                                tmp_cmd._restore_loyal_deck(_loyal_orig_ids, _loyal_orig_cmdr)
+                            try:
+                                stats = tmp_cmd.live_sim_battle(skip_deck_select=True, combat_log=_ma_combat_log, focus_unknown=_ma_focus_unknown)
+                            finally:
+                                if _loyal_orig_ids:
+                                    tmp_cmd._restore_loyal_deck(_loyal_orig_ids, _loyal_orig_cmdr)
                             # Restore original active deck if changed
                             if active_slot:
                                 try:
@@ -15266,9 +15518,21 @@ $(document).ready(function(){
                         stamina = int(tmp.init_data.get('user_data', {}).get('stamina', 0))
                         if stamina > 0:
                             print(f"\n  [ARENA]")
-                            tmp.live_sim_battle(skip_deck_select=True,
+                            # Loyal Challenge deck adjustment
+                            _loyal_step_x, _, _loyal_table_x = tmp._detect_loyal_challenge_step()
+                            _loyal_orig_x = _loyal_cmdr_x = None
+                            if _loyal_step_x:
+                                _lcd_x = tmp._load_card_data_with_rarity() or {}
+                                _loyal_orig_x, _loyal_cmdr_x = tmp._apply_loyal_deck_adjustments(_loyal_step_x, _lcd_x, challenge_table=_loyal_table_x)
+                                if _loyal_orig_x:
+                                    tmp.initialize(verbose=False)
+                            try:
+                                tmp.live_sim_battle(skip_deck_select=True,
                                                 combat_log=_ma_combat_log_arena,
                                                 focus_unknown=True)
+                            finally:
+                                if _loyal_orig_x:
+                                    tmp._restore_loyal_deck(_loyal_orig_x, _loyal_cmdr_x)
                             # Restore original active deck if changed
                             tmp.initialize(verbose=False)
                             _active_deck_after = str(tmp.init_data.get('user_data', {}).get('active_deck', '1'))
@@ -15426,9 +15690,21 @@ $(document).ready(function(){
                         stamina = int(tmp.init_data.get('user_data', {}).get('stamina', 0))
                         if stamina > 0:
                             print(f"\n  [ARENA]")
-                            tmp.live_sim_battle(skip_deck_select=True,
+                            # Loyal Challenge deck adjustment
+                            _loyal_step_x, _, _loyal_table_x = tmp._detect_loyal_challenge_step()
+                            _loyal_orig_x = _loyal_cmdr_x = None
+                            if _loyal_step_x:
+                                _lcd_x = tmp._load_card_data_with_rarity() or {}
+                                _loyal_orig_x, _loyal_cmdr_x = tmp._apply_loyal_deck_adjustments(_loyal_step_x, _lcd_x, challenge_table=_loyal_table_x)
+                                if _loyal_orig_x:
+                                    tmp.initialize(verbose=False)
+                            try:
+                                tmp.live_sim_battle(skip_deck_select=True,
                                                 combat_log=_ma_combat_log_arena,
                                                 focus_unknown=True)
+                            finally:
+                                if _loyal_orig_x:
+                                    tmp._restore_loyal_deck(_loyal_orig_x, _loyal_cmdr_x)
                             # Restore original active deck if changed
                             tmp.initialize(verbose=False)
                             _active_deck_after = str(tmp.init_data.get('user_data', {}).get('active_deck', '1'))
@@ -15564,11 +15840,11 @@ $(document).ready(function(){
                         tmp.auto_claim_daily_bonus()
 
                         # ── 0.5 LOYAL CHALLENGE DECK ────────────────
-                        _loyal_step2, _ = tmp._detect_loyal_challenge_step()
+                        _loyal_step2, _, _loyal_table2 = tmp._detect_loyal_challenge_step()
                         _loyal_orig2 = _loyal_cmdr2 = None
                         if _loyal_step2:
                             _lcd2 = tmp._load_card_data_with_rarity() or {}
-                            _loyal_orig2, _loyal_cmdr2 = tmp._apply_loyal_deck_adjustments(_loyal_step2, _lcd2)
+                            _loyal_orig2, _loyal_cmdr2 = tmp._apply_loyal_deck_adjustments(_loyal_step2, _lcd2, challenge_table=_loyal_table2)
                             if _loyal_orig2:
                                 tmp.initialize(verbose=False)
 
