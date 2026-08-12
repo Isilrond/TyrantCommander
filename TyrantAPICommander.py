@@ -9811,14 +9811,26 @@ $(document).ready(function(){
         """
         kill_key = 'attack_kill' if brawl_mode else 'defend_kill'
         killed = set()
-        for turn_data in battle_data.get('turn', {}).values():
+        turns_with_kills = {}
+        for turn_key, turn_data in battle_data.get('turn', {}).items():
             if not isinstance(turn_data, dict):
                 continue
-            for uid in turn_data.get(kill_key, []):
+            turn_kills = turn_data.get(kill_key, [])
+            for uid in turn_kills:
                 try:
                     killed.add(int(uid))
                 except (ValueError, TypeError):
                     pass
+            if turn_kills:
+                turns_with_kills[turn_key] = [int(u) for u in turn_kills if str(u).lstrip('-').isdigit()]
+        if turns_with_kills or not killed:
+            _dbg_parts = []
+            if turns_with_kills:
+                for tk, uids in sorted(turns_with_kills.items(), key=lambda x: int(x[0])):
+                    _dbg_parts.append(f"Turn {tk}: UIDs {uids}")
+                print(f"    [kill-dbg] {kill_key} found: {'; '.join(_dbg_parts)} → killed={sorted(killed)}")
+            else:
+                print(f"    [kill-dbg] {kill_key} = empty in all turns → no kills tracked")
         return killed
 
     def _extract_token_card_map(self, battle_data):
@@ -10071,13 +10083,20 @@ $(document).ready(function(){
         )
 
         names = []
+        excluded = []
+        included = []
         for uid_i in played_uids:
             if uid_i in killed_uids:
+                excluded.append(uid_i)
                 continue  # already destroyed – exclude from TUO hand
             card_id = card_map.get(str(uid_i))
             if card_id:
                 cname = self._card_id_to_tuo_name(card_id, card_data)
                 names.append(cname)
+                included.append((uid_i, cname))
+        print(f"    [hand-dbg] enemy:hand → included UIDs: {[u for u,_ in included]} = {[n for _,n in included]}")
+        if excluded:
+            print(f"    [hand-dbg] excluded (killed): {excluded}")
         return names
 
     def _print_sim_bar(self, win, stall=0.0):
@@ -13229,7 +13248,7 @@ $(document).ready(function(){
         {'name': 'Loyal Core',
          'commander': None,
          'required': ['Devoted Adept'],
-         'pool': ['Primal Yeren', 'Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+         'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
                   'Impurity Arrester', 'Restore Sequencer'],
          'pool_min': 4},
         # step 11
@@ -13647,6 +13666,7 @@ $(document).ready(function(){
                 reason = f"Required card not available: {card_name}"
                 print(f"  ✗ {reason}")
                 self._loyal_log_issue(nick, step, reason)
+                return None, None  # abort before modifying deck
 
         pool_ids = []
         remaining = ch['pool_min']
@@ -13691,16 +13711,21 @@ $(document).ready(function(){
                     max_info2 = card_data.get(max_id, {})
                     max_lvl2  = (max_info2.get('xml_level') or max_info2.get('level', 6)
                                  if isinstance(max_info2, dict) else 6)
-                    # Suppress interactive prompts in build_card (confirm_action + input)
-                    import builtins as _bi
+                    # Capture output to detect SP vs material failure; suppress prompts
+                    import builtins as _bi, sys as _sys, io as _io
                     _orig_input = _bi.input
                     _bi.input = lambda _p='': (print(f"  [auto] {_p}YES"), 'yes')[1]
-                    import sys as _sys
                     _orig_confirm = _sys.modules[__name__].__dict__.get('confirm_action')
                     _sys.modules[__name__].__dict__['confirm_action'] = lambda _p='': True
+                    _cap = _io.StringIO()
+                    _orig_stdout = _sys.stdout
+                    _sys.stdout = _cap
                     try:
                         result = self.build_card(f"{card_name}-{max_lvl2}")
                     finally:
+                        _sys.stdout = _orig_stdout
+                        _build_output = _cap.getvalue()
+                        print(_build_output, end='')  # show output normally
                         _bi.input = _orig_input
                         if _orig_confirm is not None:
                             _sys.modules[__name__].__dict__['confirm_action'] = _orig_confirm
@@ -13720,6 +13745,8 @@ $(document).ready(function(){
                     print(f"     Pool [{len(pool_ids)}]: {card_name} built (id={max_id})")
                 else:
                     print(f"  ✗ No new copy detected for {card_name} — moving to next card")
+                    if 'not enough sp' in _build_output.lower():
+                        self._loyal_log_issue(nick, step, f"Insufficient SP to build additional {card_name} — fell through to next pool card")
                     break
 
         if len(pool_ids) < ch['pool_min']:
@@ -13760,8 +13787,15 @@ $(document).ready(function(){
                 print(f"  ✗ {reason}")
                 self._loyal_log_issue(nick, step, reason)
 
-        # ── PHASE 5: Replace last N cards ────────────────────────────────
+        # Pad deck to maximum size (10) before replacement so challenge cards
+        # don't reduce the deck size if the original had fewer than 10.
+        while len(new_card_ids) < 10 and new_card_ids:
+            new_card_ids.append(new_card_ids[0])
+
+        # Deck order doesn't affect draw order (game randomises hand from full deck).
+        # Just ensure required + pool cards are in the deck; TUO decides play order.
         all_new = required_ids + pool_ids
+
         if all_new:
             n = len(all_new)
             if n > len(new_card_ids):
@@ -15866,11 +15900,17 @@ $(document).ready(function(){
                         stamina = int(tmp.init_data.get('user_data', {}).get('stamina', 0))
                         if stamina > 0:
                             print(f"\n  [ARENA]")
-                            tmp.live_sim_battle(skip_deck_select=True,
-                                                combat_log=_ma_combat_log_arena,
-                                                focus_unknown=True)
+                            try:
+                                tmp.live_sim_battle(skip_deck_select=True,
+                                                    combat_log=_ma_combat_log_arena,
+                                                    focus_unknown=True)
+                            finally:
+                                if _loyal_orig2:
+                                    tmp._restore_loyal_deck(_loyal_orig2, _loyal_cmdr2)
                         else:
                             print(f"  [ARENA]  skipped (stamina=0)")
+                            if _loyal_orig2:
+                                tmp._restore_loyal_deck(_loyal_orig2, _loyal_cmdr2)
 
                     except PleaseWaitError as e:
                         print(f"  ⏭  {nick}: API busy ({e}) – skipping")
@@ -18681,6 +18721,101 @@ $(document).ready(function(){
 
     # ---------- Workflow: Buy + Salvage ----------
 
+    def fill_sp_to_cap(self, silent=False):
+        """Fill SP to cap: buy 10 packs + salvage commons/rares/base epics in a loop.
+        Stops when SP >= cap - 400 (too close to cap for another round) or Gold runs out."""
+        PACKS_PER_ROUND = 10
+
+        self.initialize(verbose=False)
+        sp_cap = self.get_sp_cap()
+        nick   = (self.api.settings.get('request_data', {}).get('kong_name', '')
+                  or self.api.settings.get('kong_name', ''))
+
+        if not silent:
+            print(f"\n{'='*60}")
+            print(f"  FILL SP TO CAP  —  {nick}")
+            print(f"{'='*60}")
+
+        round_num = 0
+        initial_salvage_done = False
+
+        while True:
+            # Step 1: check SP cap
+            self.initialize(verbose=False)
+            sp_now = int(self.init_data.get('user_data', {}).get('salvage', 0))
+
+            if sp_now >= sp_cap - 600:
+                print(f"  {'✓' if sp_now >= sp_cap else '⚠'} SP at {sp_now:,}/{sp_cap:,} — within 600 of cap, stopping")
+                break
+
+            # Step 2: initial salvage (once, before first pack buy) to free inventory
+            if not initial_salvage_done:
+                print(f"  Initial salvage to free inventory...")
+                self.salvage_all_commons(silent=True)
+                self.salvage_all_rares(silent=True)
+                self.salvage_base_epics_keep_x(keep_count=10, silent=True, auto_confirm=True)
+                initial_salvage_done = True
+                self.initialize(verbose=False)
+                sp_now = int(self.init_data.get('user_data', {}).get('salvage', 0))
+                if sp_now >= sp_cap - 600:
+                    print(f"  ⚠ SP at {sp_now:,}/{sp_cap:,} — within 600 of cap after initial salvage, stopping")
+                    break
+
+            # Step 3: check inventory space (10 packs × 20 cards = 200 slots)
+            max_packs, free_slots = self.calculate_max_packs()
+            if max_packs < PACKS_PER_ROUND:
+                print(f"  ✗ Not enough inventory space ({free_slots} free slots, need {PACKS_PER_ROUND * 20}) — stopping")
+                break
+
+            gold = self.get_gold()
+            round_num += 1
+            print(f"\n  Round {round_num}  │  SP: {sp_now:,}/{sp_cap:,}  │  Gold: {gold:,}")
+
+            bought, _ = self.buy_packs(PACKS_PER_ROUND, silent=True)
+            if bought < PACKS_PER_ROUND:
+                print(f"  ✗ Only bought {bought}/{PACKS_PER_ROUND} packs (Gold insufficient or inventory full?) — stopping")
+                break
+
+            self.salvage_all_commons(silent=True)
+            self.salvage_all_rares(silent=True)
+            self.salvage_base_epics_keep_x(keep_count=10, silent=True, auto_confirm=True)
+
+            self.initialize(verbose=False)
+            sp_after = int(self.init_data.get('user_data', {}).get('salvage', 0))
+            print(f"  SP: {sp_now:,} → {sp_after:,} (+{sp_after - sp_now:,})")
+
+        if not silent:
+            print(f"\n  Done after {round_num} round(s).")
+            print("="*60)
+
+    def fill_sp_to_cap_all_accounts(self):
+        """Fill SP to cap for all play_enabled accounts."""
+        import glob as _glob
+        settings_dirs  = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings')]
+        settings_files = []
+        for sd in settings_dirs:
+            settings_files += _glob.glob(os.path.join(sd, 'settings_*.json'))
+        settings_files = [f for f in settings_files
+                          if not os.path.basename(f).startswith('settings_TEMPLATE')]
+        settings_files = sorted({os.path.normpath(f): f for f in settings_files}.values())
+
+        print(f"\n{'='*60}")
+        print(f"  FILL SP TO CAP – ALL ACCOUNTS")
+        print(f"{'='*60}")
+
+        for sf in settings_files:
+            tmp = TyrantCommander(sf)
+            if not tmp.initialize(verbose=False):
+                nick = tmp.api.settings.get('kong_name', sf)
+                print(f"  ✗ {nick}: login failed")
+                continue
+            if not tmp.api.settings.get('play_enabled', True):
+                continue
+            nick = (tmp.api.settings.get('request_data', {}).get('kong_name', '')
+                    or tmp.api.settings.get('kong_name', sf))
+            print(f"\n  ── {nick} ──")
+            tmp.fill_sp_to_cap(silent=False)
+
     def shop_salvage_workflow(self, pack_count, salvage_base_epics=False, keep_base_epics=1):
         """
         Kompletter Workflow:
@@ -20249,9 +20384,12 @@ $(document).ready(function(){
                 
                 if not success:
                     print(f"\n⚠ Error at {req['name']}")
-                    if not confirm_action("Continue with next Card?"):
-                        print("\n✗ Canceled")
-                        return False
+                    if sys.stdin.isatty():
+                        if not confirm_action("Continue with next Card?"):
+                            print("\n✗ Canceled")
+                            return False
+                    else:
+                        print("  ↷ Non-interactive: continuing with next card")
             
             # Show summary only if multiple cards or if something was actually built
             
@@ -24006,6 +24144,10 @@ def interactive_menu():
                 commander.buy_packs(int(n_input)); input("\n[ENTER] to continue...")
             except ValueError:
                 print("✗ Invalid number"); input("\n[ENTER] to continue...")
+        elif choice == "fill_sp":
+            commander.fill_sp_to_cap(); input("\n[ENTER] to continue...")
+        elif choice == "fill_sp_all":
+            commander.fill_sp_to_cap_all_accounts(); input("\n[ENTER] to continue...")
         elif choice == "20":
             commander.salvage_all_commons(); input("\n[ENTER] to continue...")
         elif choice == "21":
@@ -24410,8 +24552,10 @@ def interactive_menu():
             '20': 'shards_all',
             '21': 'fuse_maxed',
             '22': 'fuse_maxed_all',
+            '23': 'fill_sp',
+            '24': 'fill_sp_all',
         }
-        _multi_opts = {'95', 'set_ad_all', 'opt_mission_all', 'salvage_outdated_all', 'shards_all', 'fuse_maxed_all'}
+        _multi_opts = {'95', 'set_ad_all', 'opt_mission_all', 'salvage_outdated_all', 'shards_all', 'fuse_maxed_all', 'fill_sp_all'}
         while True:
             print("\n" + "="*52)
             print("  INVENTORY & CARD MANAGEMENT")
@@ -24439,6 +24583,8 @@ def interactive_menu():
                 print("  20.   Use Shards – All Accounts")
                 print("  21.   Fuse All Maxed Cards (Epic+, Tier 0/1, Level 6)")
                 print("  22.   Fuse All Maxed Cards – All Accounts")
+                print("  23.   Fill SP to Cap (Buy + Salvage loop)")
+                print("  24.   Fill SP to Cap – All Accounts")
             print("─"*52)
             print("  0.   ← Back to Main Menu")
             print("="*52)
