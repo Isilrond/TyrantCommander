@@ -9967,8 +9967,8 @@ $(document).ready(function(){
             mimic = flags.get('mimic_skill')
             if isinstance(mimic, dict):
                 skill_id = mimic.get('id', '')
-                val = mimic.get('n') or mimic.get('x')
-                if skill_id and val:
+                val = mimic.get('x') or mimic.get('n') or '1'  # x=magnitude, n=target count; default 1
+                if skill_id:
                     try:
                         tokens.append(f'{skill_id}={int(val)}')
                     except (ValueError, TypeError):
@@ -10529,8 +10529,8 @@ $(document).ready(function(){
                     # UID schema (empirically verified):
                     # own assault=1-10, own dominion=51, own summons=52+
                     # enemy assault=101-110, enemy dominion=151, enemy summons=152+
-                    _own_range   = list(range(1, 11))   + [51] + list(range(52, 100))
-                    _enemy_range = list(range(101, 111)) + [151] + list(range(152, 200))
+                    _own_range   = list(range(1, 11))   + [50] + [51] + list(range(52, 100))
+                    _enemy_range = list(range(101, 111)) + [150] + [151] + list(range(152, 200))
                     _token_card_map.update(self._extract_token_card_map(battle_data))
                     _card_map    = {**battle_data.get('card_map', {}), **_token_card_map}
                     # Add commander card_ids (API gives them separately, not in card_map)
@@ -10602,9 +10602,12 @@ $(document).ready(function(){
                                 ev_h = s_check.get('h')
                                 if ev_h is not None and int(ev_h) <= 0:
                                     continue
-                            s = _cl_card_states.get(uid, {})
-                            # Skip dict-valued flags (e.g. mimic_skill)
-                            s = {k: v for k, v in s.items() if not isinstance(v, dict)}
+                            s = dict(_cl_card_states.get(uid, {}))
+                            # For commanders (uid 50/150), merge API internal states (-1/-2)
+                            if uid_i == 150:
+                                s.update(_cl_card_states.get('-2', {}))
+                            elif uid_i == 50:
+                                s.update(_cl_card_states.get('-1', {}))
                             name = self._card_id_to_tuo_name(cid, card_data)
                             # Include even if s is empty (card on field with full HP, no effects)
                             if name and cid:
@@ -11084,8 +11087,8 @@ $(document).ready(function(){
                     # Brawl: own=101-110, own dominion=51, enemy dominion=151
                     # Own forts=152-153 (2 forts), own summons=154+
                     # Enemy forts=52-53 (2 forts), enemy summons=54+
-                    _own_range   = list(range(101, 111)) + [51] + list(range(54, 100)) + [152, 153]
-                    _enemy_range = list(range(1, 11))   + [151] + [52, 53] + list(range(154, 200))
+                    _own_range   = list(range(101, 111)) + [50] + [51] + list(range(54, 100)) + [152, 153]
+                    _enemy_range = list(range(1, 11))   + [150] + [151] + [52, 53] + list(range(154, 200))
                     _token_card_map.update(self._extract_token_card_map(battle_data))
                     _card_map    = {**battle_data.get('card_map', {}), **_token_card_map}
                     # Brawl: own commander=UID 150, enemy commander=UID 50
@@ -11145,9 +11148,12 @@ $(document).ready(function(){
                                 ev_h = s_check.get('h')
                                 if ev_h is not None and int(ev_h) <= 0:
                                     continue
-                            s = _cl_card_states.get(uid, {})
-                            # Skip dict-valued flags (e.g. mimic_skill)
-                            s = {k: v for k, v in s.items() if not isinstance(v, dict)}
+                            s = dict(_cl_card_states.get(uid, {}))
+                            # For commanders (uid 50/150), merge API internal states (-1/-2)
+                            if uid_i == 150:
+                                s.update(_cl_card_states.get('-2', {}))
+                            elif uid_i == 50:
+                                s.update(_cl_card_states.get('-1', {}))
                             name = self._card_id_to_tuo_name(cid, card_data)
                             if name and cid:
                                 result.append((name, s))
@@ -11704,17 +11710,17 @@ $(document).ready(function(){
                     _n_own_forts   = sum(1 for u in my_fort_uids if card_map.get(u))
                     _n_enemy_forts = sum(1 for u in en_fort_uids if card_map.get(u))
                     if brawl_mode_uids:  # own=101-110
-                        _gw_own_range   = (list(range(101, 111)) + [51] +
+                        _gw_own_range   = (list(range(101, 111)) + [50] + [51] +
                                            list(range(52 + _n_enemy_forts, 100)) +
                                            list(range(152, 152 + _n_own_forts)))
-                        _gw_enemy_range = (list(range(1, 11)) + [151] +
+                        _gw_enemy_range = (list(range(1, 11)) + [150] + [151] +
                                            list(range(52, 52 + _n_enemy_forts)) +
                                            list(range(152 + _n_own_forts, 200)))
                     else:  # own=1-10
-                        _gw_own_range   = (list(range(1, 11)) + [51] +
+                        _gw_own_range   = (list(range(1, 11)) + [50] + [51] +
                                            list(range(152 + _n_enemy_forts, 200)) +
                                            list(range(52, 52 + _n_own_forts)))
-                        _gw_enemy_range = (list(range(101, 111)) + [151] +
+                        _gw_enemy_range = (list(range(101, 111)) + [150] + [151] +
                                            list(range(152, 152 + _n_enemy_forts)) +
                                            list(range(52 + _n_own_forts, 100)))
                     _gw_killed      = self._collect_killed_uids(battle_data, brawl_mode=brawl_mode_uids)
@@ -11768,9 +11774,12 @@ $(document).ready(function(){
                                 ev_h = s_check.get('h')
                                 if ev_h is not None and int(ev_h) <= 0:
                                     continue
-                            s = _gw_card_states.get(uid, {})
-                            # Skip dict-valued flags (e.g. mimic_skill) — not serializable
-                            s = {k: v for k, v in s.items() if not isinstance(v, dict)}
+                            s = dict(_gw_card_states.get(uid, {}))
+                            # For commanders (uid 50/150), merge API internal states (-1/-2)
+                            if uid_i == 150:
+                                s.update(_gw_card_states.get('-2', {}))
+                            elif uid_i == 50:
+                                s.update(_gw_card_states.get('-1', {}))
                             name = self._card_id_to_tuo_name(cid, card_data)
                             if name and cid:
                                 result.append((name, s))
