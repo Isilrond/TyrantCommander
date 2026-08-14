@@ -9917,7 +9917,7 @@ $(document).ready(function(){
             'enhance_armor', 'enhance_armored', 'enhance_avenge', 'enhance_barrier',
             'enhance_berserk', 'enhance_besiege', 'enhance_coalition', 'enhance_corrosive',
             'enhance_counter', 'enhance_disease', 'enhance_drain', 'enhance_evade',
-            'enhance_fortify', 'enhance_hunt', 'enhance_inhibit', 'enhance_leech',
+            'enhance_besiege', 'enhance_fortify', 'enhance_hunt', 'enhance_inhibit', 'enhance_leech',
             'enhance_legion', 'enhance_mark', 'enhance_poison', 'enhance_sabotage',
             'enhance_stasis', 'enhance_swipe', 'enhance_tribute', 'enhance_venom',
         }
