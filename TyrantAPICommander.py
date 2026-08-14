@@ -9823,14 +9823,6 @@ $(document).ready(function(){
                     pass
             if turn_kills:
                 turns_with_kills[turn_key] = [int(u) for u in turn_kills if str(u).lstrip('-').isdigit()]
-        if turns_with_kills or not killed:
-            _dbg_parts = []
-            if turns_with_kills:
-                for tk, uids in sorted(turns_with_kills.items(), key=lambda x: int(x[0])):
-                    _dbg_parts.append(f"Turn {tk}: UIDs {uids}")
-                print(f"    [kill-dbg] {kill_key} found: {'; '.join(_dbg_parts)} → killed={sorted(killed)}")
-            else:
-                print(f"    [kill-dbg] {kill_key} = empty in all turns → no kills tracked")
         return killed
 
     def _extract_token_card_map(self, battle_data):
@@ -9908,7 +9900,7 @@ $(document).ready(function(){
           - OrderedDict / list of (name, flags) tuples  -> preserves order, adds #N
           - plain dict {name: flags}  -> legacy, no index
         """
-        SKIP_FLAGS = {'poisoner', 'h', 'mimic_skill', 'corroder'}
+        SKIP_FLAGS = {'poisoner', 'h', 'mimic_skill', 'corroder'}  # mimic_skill handled separately below
         INT_FLAGS  = {
             # Core HP/ATK modifiers
             'h', 'perm_max_health', 'attack_boost', 'avenge_attack',
@@ -9926,8 +9918,8 @@ $(document).ready(function(){
             'enhance_berserk', 'enhance_besiege', 'enhance_coalition', 'enhance_corrosive',
             'enhance_counter', 'enhance_disease', 'enhance_drain', 'enhance_evade',
             'enhance_fortify', 'enhance_hunt', 'enhance_inhibit', 'enhance_leech',
-            'enhance_legion', 'enhance_mark', 'enhance_poison', 'enhance_stasis',
-            'enhance_swipe', 'enhance_tribute', 'enhance_venom',
+            'enhance_legion', 'enhance_mark', 'enhance_poison', 'enhance_sabotage',
+            'enhance_stasis', 'enhance_swipe', 'enhance_tribute', 'enhance_venom',
         }
         BOOL_FLAGS = {'jammed', 'overloaded', 'sunder', 'enrage'}
 
@@ -9970,6 +9962,18 @@ $(document).ready(function(){
                         tokens.append(f'{flag}=1')
                 elif flag in INT_FLAGS:
                     tokens.append(f'{flag}={ival}')
+            # mimic_skill: nested dict {"id": "jam", "n": "2", "c": "3"}
+            # Pass the mimicked skill directly so TUO can simulate it
+            mimic = flags.get('mimic_skill')
+            if isinstance(mimic, dict):
+                skill_id = mimic.get('id', '')
+                val = mimic.get('n') or mimic.get('x')
+                if skill_id and val:
+                    try:
+                        tokens.append(f'{skill_id}={int(val)}')
+                    except (ValueError, TypeError):
+                        pass
+
             if len(tokens) > 1:
                 parts.append(':'.join(tokens))
         return ','.join(parts)
@@ -10094,9 +10098,6 @@ $(document).ready(function(){
                 cname = self._card_id_to_tuo_name(card_id, card_data)
                 names.append(cname)
                 included.append((uid_i, cname))
-        print(f"    [hand-dbg] enemy:hand → included UIDs: {[u for u,_ in included]} = {[n for _,n in included]}")
-        if excluded:
-            print(f"    [hand-dbg] excluded (killed): {excluded}")
         return names
 
     def _print_sim_bar(self, win, stall=0.0):
