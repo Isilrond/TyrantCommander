@@ -9451,6 +9451,34 @@ $(document).ready(function(){
     # So "Iron-Will" (API) -> "iron-will" ≠ "ironwill" (TUO) - must be mapped explicitly.
     # All other multi-word names (spaces only) resolve correctly via simplify_name on both sides.
     @classmethod
+    @staticmethod
+    def _get_active_gbge():
+        """Parse battleground_effects.xml and return the currently active global BGE name, or None."""
+        import xml.etree.ElementTree as _ET
+        import time as _time
+        # Try SCRIPT_DIR and data/ subdirectory
+        for _d in (SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'data')):
+            bge_xml = os.path.join(_d, 'battleground_effects.xml')
+            if os.path.isfile(bge_xml):
+                break
+        else:
+            return None
+        try:
+            tree = _ET.parse(bge_xml)
+            now  = int(_time.time())
+            root = tree.getroot()
+            # Try common element names
+            candidates = tree.findall('.//battleground')
+            for bge in candidates:
+                start = bge.findtext('global_start_time')
+                end   = bge.findtext('global_end_time')
+                if start and end and int(start) <= now <= int(end):
+                    name = bge.findtext('name')
+                    return name.strip() if name else None
+        except Exception as _e:
+            print(f"  ⚠ GBGE parse error: {_e}")
+        return None
+
     def _api_bge_to_tuo(cls, api_name):
         """Convert an API BGE name to the TUO effect flag value.
 
@@ -9473,6 +9501,7 @@ $(document).ready(function(){
             'EnduringRage 2':           'EnduringRage 2',
             "Zealot's Preservation":    'Zealots-Preservation',
             'Superheroism':             'SuperHeroism',
+            'Crackdown':                'Crackdown 2',
         }
 
         if api_name in _explicit:
@@ -9964,11 +9993,13 @@ $(document).ready(function(){
                     tokens.append(f'{flag}={ival}')
             # mimic_skill: nested dict {"id": "jam", "n": "2", "c": "3"}
             # Pass the mimicked skill directly so TUO can simulate it
+            # Skip if a real state flag with the same name already exists (e.g. enfeeble=40 vs mimic enfeeble=10)
             mimic = flags.get('mimic_skill')
             if isinstance(mimic, dict):
                 skill_id = mimic.get('id', '')
                 val = mimic.get('x') or mimic.get('n') or '1'  # x=magnitude, n=target count; default 1
-                if skill_id:
+                # Skip skills with non-standard triggers (e.g. "attacked") - can't be represented in hand-state
+                if skill_id and not flags.get(skill_id):
                     try:
                         tokens.append(f'{skill_id}={int(val)}')
                     except (ValueError, TypeError):
@@ -10007,29 +10038,11 @@ $(document).ready(function(){
             card_id = card_map.get(uid)
             name    = (self._card_id_to_tuo_name(card_id, card_data)
                        if card_id else f'UID{uid}')
-            # Max HP: base from card_data + permanent boost
-            base_hp = None
-            if card_id and card_data:
-                for c in card_data:
-                    if not isinstance(c, dict):
-                        continue
-                    if str(c.get('id','')) == str(card_id):
-                        base_hp = c.get('health')
-                        break
-            perm_bonus = s.get('perm_max_health', 0) or 0
-            max_hp = (base_hp + perm_bonus) if base_hp is not None else None
-            hp_pct = round(hp / max_hp * 100) if (hp is not None and max_hp) else None
             return {
-                'uid':             uid_i,
-                'card_id':         card_id,
-                'name':            name,
-                'hp':              hp,
-                'max_hp':          max_hp,
-                'hp_pct':          hp_pct,
-                'barrier':         s.get('protect', 0) or 0,
-                'attack_boost':    s.get('attack_boost', 0) or 0,
-                'corrosion':       s.get('corrosion', 0) or 0,
-                'flurry_countdown':s.get('flurry_countdown', 0) or 0,
+                'uid':     uid_i,
+                'card_id': card_id,
+                'name':    name,
+                'hp':      hp,
             }
 
         own   = [e for uid_i in own_range   if (e := build_card_entry(uid_i)) is not None]
@@ -11151,9 +11164,9 @@ $(document).ready(function(){
                             s = dict(_cl_card_states.get(uid, {}))
                             # For commanders (uid 50/150), merge API internal states (-1/-2)
                             if uid_i == 150:
-                                s.update(_cl_card_states.get('-2', {}))
+                                s.update(_brawl_card_states.get('-2', {}))
                             elif uid_i == 50:
-                                s.update(_cl_card_states.get('-1', {}))
+                                s.update(_brawl_card_states.get('-1', {}))
                             name = self._card_id_to_tuo_name(cid, card_data)
                             if name and cid:
                                 result.append((name, s))
@@ -13461,23 +13474,26 @@ $(document).ready(function(){
                 if meta_extreme is None:
                     meta_extreme = a
 
-        # Pick best candidate
-        meta  = meta_loyal or meta_loyal_expired
-        table = self.LOYAL_CHALLENGES
-        if not meta and meta_extreme:
-            meta  = meta_extreme
-            table = self.EXTREME_CHALLENGES
+        # Pick best candidate — try loyal first, fall back to extreme if completed/absent
+        candidates = []
+        if meta_loyal or meta_loyal_expired:
+            candidates.append((meta_loyal or meta_loyal_expired, self.LOYAL_CHALLENGES))
+        if meta_extreme:
+            candidates.append((meta_extreme, self.EXTREME_CHALLENGES))
 
-        if not meta:
-            return None, None, None
-        prog = int(meta.get('progress', 0))
-        mx   = int(meta.get('max_progress', len(table)))
-        if prog >= mx:
-            return None, None, None
-        step = prog + 1
-        if step > len(table):
-            return None, None, None
-        return step, meta, table
+        for meta, table in candidates:
+            if not meta:
+                continue
+            prog = int(meta.get('progress', 0))
+            mx   = int(meta.get('max_progress', len(table)))
+            if prog >= mx:
+                continue  # this challenge is done, try next
+            step = prog + 1
+            if step > len(table):
+                continue
+            return step, meta, table
+
+        return None, None, None
 
     def _find_card_id_by_name(self, name, card_data):
         """Return base card_id (lowest level) for a card name, or None."""
@@ -13932,33 +13948,51 @@ $(document).ready(function(){
                 achievements = tmp.init_data.get('user_achievements', {})
 
                 _now = int(_time.time())
-                meta = None
-                meta_fallback = None
+                meta_loyal = meta_loyal_exp = meta_extreme = None
                 for a in achievements.values():
-                    if int(a.get('type', 0)) == 12:
-                        end_t = int(a.get('end_time', 0))
+                    if int(a.get('type', 0)) != 12:
+                        continue
+                    nm    = a.get('name', '').lower()
+                    end_t = int(a.get('end_time', 0))
+                    if 'loyal' in nm or 'forever' in nm:
                         if end_t > _now:
-                            meta = a
-                            break
-                        elif meta_fallback is None:
-                            meta_fallback = a
-                if not meta:
-                    meta = meta_fallback
+                            if meta_loyal is None: meta_loyal = a
+                        elif meta_loyal_exp is None:
+                            meta_loyal_exp = a
+                    elif 'extreme' in nm:
+                        if meta_extreme is None: meta_extreme = a
+
+                candidates = []
+                if meta_loyal or meta_loyal_exp:
+                    candidates.append((meta_loyal or meta_loyal_exp, self.LOYAL_CHALLENGES))
+                if meta_extreme:
+                    candidates.append((meta_extreme, self.EXTREME_CHALLENGES))
+
+                meta = table = None
+                for _m, _t in candidates:
+                    _prog = int(_m.get('progress', 0))
+                    _max  = int(_m.get('max_progress', len(_t)))
+                    if _prog < _max:
+                        meta, table = _m, _t
+                        break
 
                 if not meta:
-                    print(f"  {nick:<22}  {'\u2013':>8}  {'No challenge active':<22}  {'\u2013':<22}  {'\u2013':>14}  {'\u2013':>10}")
+                    _m = (meta_loyal or meta_loyal_exp or meta_extreme)
+                    if _m:
+                        meta_name = _m.get('name', 'PvP Challenge')
+                        meta_end  = int(_m.get('end_time', 0))
+                        end_str   = _dt.datetime.fromtimestamp(meta_end).strftime('%d.%m.%y') if meta_end else '–'
+                        print(f"  {nick:<22}  {'✓':>8}  {meta_name[:22]:<22}  {'All complete!':<22}  {'–':>14}  {end_str:>10}")
+                        prev_state[nick] = {'step': 99, 'prog': 99}
+                    else:
+                        print(f"  {nick:<22}  {'–':>8}  {'No challenge active':<22}  {'–':<22}  {'–':>14}  {'–':>10}")
                     continue
 
                 meta_name = meta.get('name', 'PvP Challenge')
                 meta_prog = int(meta.get('progress', 0))
-                meta_max  = int(meta.get('max_progress', 1))
+                meta_max  = int(meta.get('max_progress', len(table)))
                 meta_end  = int(meta.get('end_time', 0))
-                end_str   = _dt.datetime.fromtimestamp(meta_end).strftime('%d.%m.%y') if meta_end else '\u2013'
-
-                if meta_prog >= meta_max:
-                    print(f"  {nick:<22}  {'\u2713':>8}  {meta_name[:22]:<22}  {'All complete!':<22}  {'\u2013':>14}  {end_str:>10}")
-                    prev_state[nick] = {'step': meta_prog, 'prog': meta_prog}
-                    continue
+                end_str   = _dt.datetime.fromtimestamp(meta_end).strftime('%d.%m.%y') if meta_end else '–'
 
                 step = meta_prog + 1
 
@@ -14624,11 +14658,11 @@ $(document).ready(function(){
             print(f"  ⚠ {owned_fname} not found – optimizing without inventory filter")
 
         # ── BGE (optional) ───────────────────────────────────────────
-        bge_in = input_with_esc("BGE (optional, Enter=none, ESC=Cancel): ", allow_empty=True)
-        if bge_in is None:
-            os.unlink(gauntlet_tmp)
-            return
-        bge_in = bge_in.strip()
+        _auto_gbge = TyrantCommander._get_active_gbge()
+        bge_in = _auto_gbge or ""
+        if _auto_gbge:
+            print(f"  🌐 Active GBGE: {_auto_gbge} (auto)")
+            import time as _t; _t.sleep(5)
 
         # Fixed: random order (optimal for anneal)
         oflags = ['random']
@@ -16106,8 +16140,13 @@ $(document).ready(function(){
         # ── Ask for global BGE (not in init data; only appears during battles) ──
         _gbge = _self.init_data.get('_current_bge', '')
         if not _gbge and instance is None:
-            _gbge_in = input_with_esc("  🌐 Global BGE active? (Enter name or leave empty): ", allow_empty=True)
-            _gbge = (_gbge_in or '').strip() if _gbge_in is not None else ''
+            _auto_gbge = TyrantCommander._get_active_gbge()
+            _gbge = _auto_gbge or ""
+            if _auto_gbge:
+                print(f"  🌐 Active GBGE: {_auto_gbge} (auto)")
+                import time as _t2; _t2.sleep(5)
+                if _gbge_in is None:
+                    _gbge = ''
         if not _gbge:
             _gbge = getattr(_self, '_gbge_override', '')
         if _gbge:
@@ -16300,8 +16339,11 @@ $(document).ready(function(){
         print(f"{'='*65}")
 
         # Ask for GBGE once for all accounts
-        _gbge_all = input_with_esc("  🌐 Global BGE active? (Enter name or leave empty): ", allow_empty=True)
-        _gbge_all = (_gbge_all or '').strip() if _gbge_all is not None else ''
+        _auto_gbge = TyrantCommander._get_active_gbge()
+        _gbge_all = _auto_gbge or ""
+        if _auto_gbge:
+            print(f"  🌐 Active GBGE: {_auto_gbge} (auto)")
+            import time as _t3; _t3.sleep(5)
 
         _settings_dirs = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings')]
         settings_files = []
