@@ -13488,10 +13488,32 @@ $(document).ready(function(){
             mx   = int(meta.get('max_progress', len(table)))
             if prog >= mx:
                 continue  # this challenge is done, try next
-            step = prog + 1
-            if step > len(table):
-                continue
-            return step, meta, table
+            # For Extreme: parallel strands — match by current sub-challenge name (type-9)
+            if table is self.EXTREME_CHALLENGES:
+                sub_name = None
+                meta_end = int(meta.get('end_time', 0))
+                for a in achievements.values():
+                    if int(a.get('type', 0)) == 9:
+                        if meta_end and int(a.get('end_time', 0)) != meta_end:
+                            continue
+                        sp = int(a.get('progress', 0))
+                        sm = int(a.get('max_progress', 1))
+                        if sp < sm:
+                            sub_name = a.get('name', '')
+                            break
+                if sub_name:
+                    # Find matching entry by name
+                    for i, ch in enumerate(table):
+                        if ch['name'].lower() == sub_name.lower():
+                            return i + 1, meta, table
+                # Fallback: linear
+                step = prog + 1
+                if step <= len(table):
+                    return step, meta, table
+            else:
+                step = prog + 1
+                if step <= len(table):
+                    return step, meta, table
 
         return None, None, None
 
