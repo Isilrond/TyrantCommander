@@ -22,9 +22,10 @@ Communicates directly via the official game API — no game client required.
 | `achievements.xml` | Achievement database (`data/` folder) |
 | `items.xml` | Items database (`data/` folder) |
 | `battleground_effects.xml` | Global BGE definitions with active time windows (`data/` folder) |
+| `updates.xml` | Game news/event announcements (`data/` folder) |
 | `database.yml` | TUO database file (auto-managed, max ~310 MB) |
 
-> **Important:** All XML files (`cards_section_*.xml`, `missions.xml`, `achievements.xml`, `items.xml`, `battleground_effects.xml`, etc.) must be kept up to date manually using **F→1 (Download Game Data)**. Run this regularly to ensure card stats, BGE schedules, and mission data reflect the current game state.
+> **Important:** All XML files (`cards_section_*.xml`, `missions.xml`, `achievements.xml`, `items.xml`, `battleground_effects.xml`, `updates.xml`, etc.) must be kept up to date manually using **F→1 (Download Game Data)**. Run this regularly to ensure card stats, BGE schedules, and mission data reflect the current game state.
 
 ---
 
@@ -56,6 +57,7 @@ TUO-Live/
     ├── achievements.xml
     ├── items.xml
     ├── battleground_effects.xml
+    ├── updates.xml
     ├── cards_section_*.xml
     ├── fusion_recipes_cj2.xml
     └── database.yml
@@ -102,7 +104,7 @@ Settings (`91`/`92`) accessible from main menu at any time.
 | 18 | Multi-Account: Raid + Quest Mission + Arena | Raid → Quest → Arena; Loyal Challenge deck applied + restored |
 | 19 | Multi-Account: Quest Mission + Arena | Quest → Arena; Loyal Challenge deck applied + restored |
 | 20 | Multi-Account: Brawl + Quest Mission + Arena | Brawl → Quest → Arena; Loyal Challenge deck applied + restored |
-| 21 | Energy Tracker (hourly log) | Auto-detects Raid/Brawl; logs to `energylog/` |
+| 21 | Energy Tracker (hourly log) | Auto-detects Raid/Brawl/Guild Brawl; logs to `energylog/` |
 | 22 | Guild War Stats Tracker | Polls every 30 min; JSON + HTML snapshot |
 | 23 | Guild War Summary from JSON files | Generates summary HTML per guild+event group |
 | 24 | Forever Loyal PVP Challenge Overview | Progress table for all accounts; detects stagnation |
@@ -148,30 +150,41 @@ Automatically adapts Slot 1 deck for the current Loyal Challenge step before are
 **Challenge priority:**
 1. Forever Loyal PVP Challenge (time-limited, active window)
 2. Extreme PVP Challenge (fallback when Loyal is completed or absent)
+3. Master the Arena PVP Challenge (defined, deck rules TBD)
+4. Cutlass Unleashed PVP Challenge (defined, deck rules TBD)
 
 **How it works:**
 
 1. Detects the current challenge step via `getPvpChallengeData`
-2. Builds required cards (upgrades via `build_card` if needed; skips if insufficient SP — logs issue, deck unchanged)
-3. Builds pool cards from inventory (up to `pool_min` copies)
-4. Pads deck to 10 cards if original has fewer than 10
-5. Replaces last N slots with challenge cards via `setDeckCards`
-6. Runs arena battles (`live_sim_battle`)
-7. Restores original deck via `_restore_loyal_deck` (always, via `finally` block)
+2. Checks if required commander is owned; auto-builds via `build_card(id)` if not
+3. Builds required cards (upgrades via `build_card` if needed; skips if insufficient SP — logs issue, deck unchanged)
+4. Builds pool cards from inventory (up to `pool_min` copies)
+5. Pads deck to 10 cards if original has fewer than 10
+6. Replaces last N slots with challenge cards via `setDeckCards`
+7. Runs arena battles (`live_sim_battle`)
+8. Restores original deck via `_restore_loyal_deck` (always, via `finally` block)
 
 **Abort conditions** (deck left unchanged):
 - Required card cannot be built (SP/gold insufficient) → `return None, None` before any deck modification
 - Fewer than `pool_min` pool cards available
 
+**Extreme PVP Challenge:** parallel quest strands — sub-challenge detected by type-9 achievement name, not linear step counter. Only names from EXTREME_CHALLENGES table are accepted to avoid false matches with other challenge types.
+
 **Issues log:** `export/loyal_challenge_issues.txt`
 
-**Challenge Overview (F→24):** shows all accounts with step, sub-challenge name, progress, and end date. Highlights stagnating accounts (+0 between snapshots). Falls back to Extreme PVP Challenge for completed Loyal accounts.
+**Challenge Overview (F→24):** shows all accounts with step, sub-challenge name, progress, and end date. Highlights stagnating accounts (+0 between snapshots). Uses `_detect_loyal_challenge_step()` for consistency with battle selection.
 
 ### Auto GBGE Detection (B→16/17)
 
 Mission deck optimization (B→16 single account, B→17 all accounts) automatically reads the active Global Battleground Effect from `battleground_effects.xml`. If an active GBGE is found (current time within `global_start_time`/`global_end_time`), it is applied automatically with a 5-second notice — no manual input required. If no GBGE is active, the optimizer runs without one.
 
 **XML name → TUO flag conversion:** names with spaces are hyphenated by default. Known overrides: `Crackdown` → `Crackdown 2`, `Oath of Loyalty` → `Oath-Of-Loyalty`, etc.
+
+### Brawl & Guild Brawl
+
+Guild Brawls are treated identically to regular Brawls for energy tracking and sim. Score calculation differs (guild sum vs individual) but energy source (`player_brawl_data.energy.battle_energy`) is the same.
+
+**Structure/Summon UID assignment:** Own and enemy structures (uid 52-99, 152-199) are assigned dynamically by matching card names against `own_states`/`enemy_states` from the API turn data. This correctly handles infinite summon chains (e.g., Kozel the Deathless, Industry of Eden). Ambiguous cases fall back to convention (52-99 = enemy, 152-199 = own).
 
 ### Live Sim Battle
 
@@ -205,14 +218,21 @@ Matching files are auto-copied to `combatlog/suspicious/`.
 
 ### Combat Log Validator (`check_combat_log.py`)
 
-Standalone script — validates that `api_card_states` in each JSON log matches the `hand-state` string in `tuo_cmd`. Reports mismatches with field-level diff. Handles mimic_skill extraction, commander state merging (-1/-2 → uid 50/150), and extended UID ranges for dominions and structures.
+Standalone script — validates that `api_card_states` in each JSON log matches the `hand-state` string in `tuo_cmd`. Reports mismatches with field-level diff. Handles:
+- mimic_skill extraction (before SKIP_FLAGS check)
+- Commander state merging (-1/-2 → uid 50/150)
+- Extended UID ranges for dominions and structures
+- Brawl own/enemy side detection via `enemy:hand` uid matching (priority over deck-name matching)
+- Structure disambiguation via mimic_skill extraction in `_acs_to_flag_set`
 
 ### Energy Tracker (F→21)
 
 Auto-detects active event type each run:
 - Raid active → reads `raid_info.energy.battle_energy`, column: `Raid /25`
-- Brawl active → reads `player_brawl_data.energy.battle_energy`, column: brawl name
+- Brawl/Guild Brawl active → reads `player_brawl_data.energy.battle_energy`, column: brawl name
 - Otherwise → column: `Event /25`
+
+Brawl detected via `active_brawl_data` name + time fields. Brawl not marked active before `start_time`. Guild Brawls detected identically to regular Brawls.
 
 ### Build Brawl Gauntlet (B→13 & 14)
 
@@ -290,13 +310,23 @@ Generated by **B → 11 Sync All Guild Decks** (combined defense + attack pass).
 ### v5.5 — August 2026 *(current)*
 
 - **NEW** Auto GBGE detection for B→16/17 — reads active Global BGE from `battleground_effects.xml` (unix timestamps); passes `effect 'Crackdown 2'` to TUO automatically; 5-second notice instead of manual prompt
-- **NEW** `battleground_effects.xml` added to required data files (download via F→1)
+- **NEW** `battleground_effects.xml` and `updates.xml` added to required data files (download via F→1)
+- **NEW** Crackdown → Crackdown 2 override in `_api_bge_to_tuo()`
+- **FIX** Brawl structure/summon UID assignment — dynamic name-matching against `own_states`/`enemy_states`; correctly handles infinite summon chains (Kozel the Deathless, Industry of Eden)
+- **FIX** Guild Brawl detected as regular Brawl for energy tracking (same energy source)
+- **FIX** Brawl `start_time` check — brawl not active before `start_time` (3 detection points fixed)
+- **FIX** Brawl NameError — `_brawl_card_states` → `_cl_card_states`
 - **FIX** Challenge fallback — when Forever Loyal PVP Challenge is completed, Extreme PVP Challenge is correctly used as fallback (both in battle selection and F→24 overview)
-- **FIX** Loyal Challenge Overview (F→24) — previously showed wrong challenge for completed accounts; now uses same priority logic as battle selection
-- **FIX** mimic_skill handling — commander UIDs (50/150) now included in hand-state ranges; internal API states (-1/-2) merged into commander states; mimic-derived skills not overwritten by real state flags (e.g. enfeeble)
+- **FIX** Extreme PVP Challenge — deck selection by sub-challenge name (type-9 achievement), not linear step; parallel quest strands supported; type-9 filter accepts only names from EXTREME_CHALLENGES table
+- **FIX** F→24 overview — uses `_detect_loyal_challenge_step()` for consistency with battle selection
+- **FIX** `Loyal Dominion (16)` → `Loyal Dominion` to match API name
+- **FIX** Commander auto-build for Loyal Challenge — checks inventory, builds via `build_card(id)` if not owned
+- **FIX** `play_first` override removed — TUO decides card order
+- **FIX** mimic_skill handling — real state flags not overwritten by mimic-derived values; trigger field is metadata only; Mimic fires as normal activation
 - **FIX** sim.cpp — `enhance_sabotage` → `Skill::sabotage`; `enhance_besiege` → `Skill::mortar` added
-- **FIX** check_combat_log — `enhance_sabotage` added to INT_FLAGS; mimic_skill handled before SKIP_FLAGS check; commander UID ranges extended to include uid 50/150
+- **FIX** check_combat_log — `enemy:hand` uid 1-10 detection moved before deck-name matching; mimic_skill extraction in `_acs_to_flag_set` for structure disambiguation
 - **CHANGE** Combat log field snapshot — removed redundant fields (`barrier`, `attack_boost`, `corrosion`, `flurry_countdown`, `max_hp`, `hp_pct`); logs now contain only `uid`, `card_id`, `name`, `hp`
+- **ADD** `MASTER_ARENA_CHALLENGES` and `CUTLASS_CHALLENGES` tables defined (deck rules TBD)
 
 ### v5.4 — August 2026
 
