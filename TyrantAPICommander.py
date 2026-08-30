@@ -3155,8 +3155,10 @@ $(document).ready(function(){
 
         # Show Brawl information — only if brawl is still active
         import time as _time
-        brawl_end = int((active_brawl or {}).get('end_time', 0))
-        if active_brawl and player_brawl and brawl_end > int(_time.time()):
+        brawl_end   = int((active_brawl or {}).get('end_time', 0))
+        brawl_start = int((active_brawl or {}).get('start_time', 0))
+        _now_ts = int(_time.time())
+        if active_brawl and player_brawl and brawl_end > _now_ts and (brawl_start == 0 or brawl_start <= _now_ts):
             event_name = active_brawl.get('name', 'Event')
             brawl_energy = player_brawl.get('energy', {})
             current_energy = int(brawl_energy.get('battle_energy', 0))
@@ -5959,11 +5961,14 @@ $(document).ready(function(){
             elif not _is_guild_brawl:
                 import time as _time
                 _end_time     = int(abd.get('end_time', 0))
-                _brawl_active = _end_time > 0 and _end_time > int(_time.time())
+                _start_time   = int(abd.get('start_time', 0))
+                _now_t        = int(_time.time())
+                _brawl_active = _end_time > 0 and _end_time > _now_t and (_start_time == 0 or _start_time <= _now_t)
 
                 # Fallback: API sometimes delays setting end_time in the first
                 # hours after brawl start. If brawl energy > 0, a brawl IS active.
-                if not _brawl_active:
+                # Only apply fallback if start_time is already in the past (or unknown).
+                if not _brawl_active and (_start_time == 0 or _start_time <= _now_t):
                     _brawl_energy = (self.init_data.get('player_brawl_data') or {}).get('energy') or {}
                     _battle_energy = int(_brawl_energy.get('battle_energy', 0))
                     if _battle_energy > 0:
@@ -10651,21 +10656,6 @@ $(document).ready(function(){
                                     recommended_idx = idx2
                                     break
 
-                        # play_first override: play specific card ASAP if in hand
-                        _pf_card = None
-                        try:
-                            _pf_step, _, _pf_table = self._detect_loyal_challenge_step()
-                            if _pf_step and _pf_table:
-                                _pf_card = _pf_table[_pf_step - 1].get('play_first')
-                        except Exception:
-                            pass
-                        if _pf_card:
-                            _pf_base = _pf_card.lower().rsplit('-', 1)[0].strip()
-                            for idx2, (_, hc, cname) in enumerate(hand_display):
-                                if cname.lower().rsplit('-', 1)[0].strip() == _pf_base:
-                                    recommended_idx = idx2
-                                    print(f"  \u265f  play_first override: {cname}")
-                                    break
 
                 if recommended_idx is not None and sim_deck:
                     _, play_hc, play_name = hand_display[recommended_idx]
@@ -11098,10 +11088,34 @@ $(document).ready(function(){
                     enemy_played = self._parse_enemy_played_cards(battle_data, card_data, brawl_mode=True)
 
                     # Brawl: own=101-110, own dominion=51, enemy dominion=151
-                    # Own forts=152-153 (2 forts), own summons=154+
-                    # Enemy forts=52-53 (2 forts), enemy summons=54+
-                    _own_range   = list(range(101, 111)) + [50] + [51] + list(range(54, 100)) + [152, 153]
-                    _enemy_range = list(range(1, 11))   + [150] + [151] + [52, 53] + list(range(154, 200))
+                    # Structures/summons (52-99, 152-199) assigned dynamically via field data
+                    # Assign structure UIDs (52-99, 152-199) by matching card names
+                    # against own_states/enemy_states from the API turn data
+                    _own_struct_uids   = set()
+                    _enemy_struct_uids = set()
+                    _combined_map = {**battle_data.get('card_map', {}), **_token_card_map}
+                    _own_state_names   = {s[0].lower() for s in battle_data.get('own_states', [])}
+                    _enemy_state_names = {s[0].lower() for s in battle_data.get('enemy_states', [])}
+                    for _uid_str, _cid in _combined_map.items():
+                        if not _uid_str.isdigit(): continue
+                        _uid_i = int(_uid_str)
+                        if not ((52 <= _uid_i <= 99) or (152 <= _uid_i <= 199)): continue
+                        _cname = self._card_id_to_tuo_name(_cid, card_data)
+                        if not _cname: continue
+                        _cbase = _cname.lower()
+                        _in_own   = _cbase in _own_state_names
+                        _in_enemy = _cbase in _enemy_state_names
+                        if _in_own and not _in_enemy:
+                            _own_struct_uids.add(_uid_i)
+                        elif _in_enemy and not _in_own:
+                            _enemy_struct_uids.add(_uid_i)
+                        elif _uid_i <= 99:
+                            # Ambiguous or unknown: 52-99 default enemy, 152-199 default own
+                            _enemy_struct_uids.add(_uid_i)
+                        else:
+                            _own_struct_uids.add(_uid_i)
+                    _own_range   = list(range(101, 111)) + [50, 51] + sorted(_own_struct_uids)
+                    _enemy_range = list(range(1, 11))   + [150, 151] + sorted(_enemy_struct_uids)
                     _token_card_map.update(self._extract_token_card_map(battle_data))
                     _card_map    = {**battle_data.get('card_map', {}), **_token_card_map}
                     # Brawl: own commander=UID 150, enemy commander=UID 50
@@ -11164,9 +11178,9 @@ $(document).ready(function(){
                             s = dict(_cl_card_states.get(uid, {}))
                             # For commanders (uid 50/150), merge API internal states (-1/-2)
                             if uid_i == 150:
-                                s.update(_brawl_card_states.get('-2', {}))
+                                s.update(_cl_card_states.get('-2', {}))
                             elif uid_i == 50:
-                                s.update(_brawl_card_states.get('-1', {}))
+                                s.update(_cl_card_states.get('-1', {}))
                             name = self._card_id_to_tuo_name(cid, card_data)
                             if name and cid:
                                 result.append((name, s))
@@ -13259,7 +13273,7 @@ $(document).ready(function(){
          'commander': 'Malort Blightfather',
          'required': ['Collapser Deadline'],
          'pool': [], 'pool_min': 0,
-         'play_first': 'Collapser Deadline'},
+         },
         # step 9 - 2 berserk cards from pool
         {'name': 'Loyal Berserker',
          'commander': None,
@@ -13294,7 +13308,7 @@ $(document).ready(function(){
          'commander': 'Malort Blightfather',
          'required': ["Constantine's Cheetah"],
          'pool': [], 'pool_min': 0,
-         'play_first': "Constantine's Cheetah"},
+         },
         # step 15
         {'name': 'Loyal Vindicator',
          'commander': 'Octane Optimized',
@@ -13302,7 +13316,7 @@ $(document).ready(function(){
          'pool': ['Gate Pulser', 'Malediction', 'Anchorage Defender'],
          'pool_min': 3},
         # step 16
-        {'name': 'Loyal Dominion (16)',
+        {'name': 'Loyal Dominion',
          'commander': None,
          'required': ['The Revered'],
          'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Metro Monitor',
@@ -13448,6 +13462,37 @@ $(document).ready(function(){
          'pool': [], 'pool_min': 0},
     ]
 
+
+    MASTER_ARENA_CHALLENGES = [
+        # step 1 — Win 20 Battles
+        {'name': 'Arena: Shard Hunter',           'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 2 — Win 5 Battles using 4 Imperial Assaults
+        {'name': 'Arena: Imperial Captain',        'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 3 — Win 5 Battles using 4 Raider Assaults
+        {'name': 'Arena: Raider Captain',          'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 4 — Win 5 Battles using 4 Bloodthirsty Assaults
+        {'name': 'Arena: Bloodthirsty Captain',    'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 5 — Win 5 Battles using 4 Xeno Assaults
+        {'name': 'Arena: Xeno Captain',            'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 6 — Win 5 Battles using 4 Righteous Assaults
+        {'name': 'Arena: Righteous Captain',       'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 7 — Win 15 Battles
+        {'name': 'Arena: Improve your Rank II',    'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 8 — Win 15 Battles
+        {'name': 'Arena: Vindicated II',           'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+    ]
+
+    CUTLASS_CHALLENGES = [
+        # step 1 — Rally Vigil-6 in 10 battles
+        {'name': 'Cutlass I',   'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 2 — Fortify Cutlass-6 in 25 battles
+        {'name': 'Cutlass II',  'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 3 — Entrap Cutlass Jagged-6 in 50 battles
+        {'name': 'Cutlass III', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 4 — Protect Cutlass Jag-6 in 75 battles
+        {'name': 'Cutlass IV',  'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+    ]
+
     def _detect_loyal_challenge_step(self):
         """Returns (step_number, meta_achievement, challenge_table) or (None, None, None).
         Prefers time-limited challenges (Forever Loyal); falls back to Extreme PVP Challenge."""
@@ -13491,6 +13536,9 @@ $(document).ready(function(){
             # For Extreme: parallel strands — match by current sub-challenge name (type-9)
             if table is self.EXTREME_CHALLENGES:
                 sub_name = None
+                _extreme_names = {ch['name'].lower() for ch in self.EXTREME_CHALLENGES}
+                _master_names  = {ch['name'].lower() for ch in self.MASTER_ARENA_CHALLENGES}
+                _cutlass_names = {ch['name'].lower() for ch in self.CUTLASS_CHALLENGES}
                 meta_end = int(meta.get('end_time', 0))
                 for a in achievements.values():
                     if int(a.get('type', 0)) == 9:
@@ -13498,8 +13546,10 @@ $(document).ready(function(){
                             continue
                         sp = int(a.get('progress', 0))
                         sm = int(a.get('max_progress', 1))
-                        if sp < sm:
-                            sub_name = a.get('name', '')
+                        _aname = a.get('name', '')
+                        # Only accept if name matches an Extreme sub-challenge
+                        if sp < sm and _aname.lower() in _extreme_names:
+                            sub_name = _aname
                             break
                 if sub_name:
                     # Find matching entry by name
@@ -13827,13 +13877,45 @@ $(document).ready(function(){
         new_cmdr_id = orig_cmdr
         if ch['commander']:
             cmdr_id = self._find_card_id_by_name(ch['commander'], card_data)
-            if cmdr_id:
-                new_cmdr_id = cmdr_id
-                print(f"     Commander → {ch['commander']} (id={cmdr_id})")
-            else:
+            if not cmdr_id:
                 reason = f"Commander not found in card data: {ch['commander']}"
                 print(f"  ✗ {reason}")
                 self._loyal_log_issue(nick, step, reason)
+            else:
+                # Check if commander is owned; build if not
+                uc_cmdr = self.init_data.get('user_cards', {})
+                owned_cmdr = int((uc_cmdr.get(str(cmdr_id)) or {}).get('num_owned', 0))
+                if owned_cmdr > 0:
+                    new_cmdr_id = cmdr_id
+                    print(f"     Commander → {ch['commander']} (id={cmdr_id}, owned)")
+                else:
+                    print(f"     Commander {ch['commander']} not owned — attempting build...")
+                    try:
+                        import builtins as _bi2
+                        _orig_input2 = _bi2.input
+                        _bi2.input = lambda _p='': 'yes'
+                        try:
+                            _build_res = self.build_card(str(cmdr_id))
+                        finally:
+                            _bi2.input = _orig_input2
+                        if _build_res is False:
+                            reason = f"Commander {ch['commander']} build failed (insufficient resources)"
+                            print(f"  ✗ {reason}")
+                            self._loyal_log_issue(nick, step, reason)
+                        else:
+                            self.initialize(verbose=False)
+                            uc_cmdr2 = self.init_data.get('user_cards', {})
+                            if int((uc_cmdr2.get(str(cmdr_id)) or {}).get('num_owned', 0)) > 0:
+                                new_cmdr_id = cmdr_id
+                                print(f"     Commander → {ch['commander']} built and set (id={cmdr_id})")
+                            else:
+                                reason = f"Commander {ch['commander']} build returned success but not in inventory"
+                                print(f"  ✗ {reason}")
+                                self._loyal_log_issue(nick, step, reason)
+                    except Exception as _ex2:
+                        reason = f"Commander {ch['commander']} build exception: {_ex2}"
+                        print(f"  ✗ {reason}")
+                        self._loyal_log_issue(nick, step, reason)
 
         # Pad deck to maximum size (10) before replacement so challenge cards
         # don't reduce the deck size if the original had fewer than 10.
@@ -14018,18 +14100,24 @@ $(document).ready(function(){
 
                 step = meta_prog + 1
 
+                # Use same logic as battle selection for consistency
                 sub_name = sub_prog = sub_max = None
-                for a in achievements.values():
-                    if int(a.get('type', 0)) == 9:
-                        if meta_end and int(a.get('end_time', 0)) != meta_end:
-                            continue
-                        sp = int(a.get('progress', 0))
-                        sm = int(a.get('max_progress', 1))
-                        if sp < sm:
-                            sub_name = a.get('name', '')
-                            sub_prog = sp
-                            sub_max  = sm
-                            break
+                _det_step, _det_meta, _det_table = tmp._detect_loyal_challenge_step()
+                if _det_step and _det_table and _det_step <= len(_det_table):
+                    _ch = _det_table[_det_step - 1]
+                    sub_name = _ch.get('name', '')
+                    # Find matching type-9 achievement for progress
+                    _valid_sub_names = {sub_name.lower()}
+                    for a in achievements.values():
+                        if int(a.get('type', 0)) == 9:
+                            if meta_end and int(a.get('end_time', 0)) != meta_end:
+                                continue
+                            sp = int(a.get('progress', 0))
+                            sm = int(a.get('max_progress', 1))
+                            if a.get('name', '').lower() in _valid_sub_names:
+                                sub_prog = sp
+                                sub_max  = sm
+                                break
 
                 prev      = prev_state.get(nick, {})
                 prev_step = prev.get('step')
@@ -14904,7 +14992,13 @@ $(document).ready(function(){
                         _brawl_end  = int(_brawl.get('end_time', 0))
                         _brawl_name = _brawl.get('name', '')
                         _is_guild_brawl = any(w in _brawl_name.lower() for w in ('guild', 'guildbrawl'))
-                        _brawl_live = _brawl_end > _now and not _is_guild_brawl
+                        _brawl_start = int(_brawl.get('start_time', 0))
+                        # For energy tracking: guild brawl also uses player_brawl_data energy
+                        if (_brawl_start == 0 or _brawl_start <= _now):
+                            if _brawl_end > _now:
+                                _brawl_live = True
+                            elif _brawl_end == 0 and _brawl_name:
+                                _brawl_live = True
                         if _raid_active:
                             event_label = 'Raid'
                             event_detected = True
