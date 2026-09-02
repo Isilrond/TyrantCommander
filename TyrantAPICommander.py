@@ -11096,21 +11096,35 @@ $(document).ready(function(){
                     _combined_map = {**battle_data.get('card_map', {}), **_token_card_map}
                     _own_state_names   = {s[0].lower() for s in battle_data.get('own_states', [])}
                     _enemy_state_names = {s[0].lower() for s in battle_data.get('enemy_states', [])}
+                    # Build flag sets for own/enemy states for fallback matching
+                    _own_flag_sets   = [frozenset((k, v) for k, v in s[1].items() if v and int(v) != 0)
+                                        for s in battle_data.get('own_states', [])
+                                        if isinstance(s[1], dict)]
+                    _enemy_flag_sets = [frozenset((k, v) for k, v in s[1].items() if v and int(v) != 0)
+                                        for s in battle_data.get('enemy_states', [])
+                                        if isinstance(s[1], dict)]
                     for _uid_str, _cid in _combined_map.items():
                         if not _uid_str.isdigit(): continue
                         _uid_i = int(_uid_str)
                         if not ((52 <= _uid_i <= 99) or (152 <= _uid_i <= 199)): continue
+                        # Try name-based matching first
                         _cname = self._card_id_to_tuo_name(_cid, card_data)
-                        if not _cname: continue
-                        _cbase = _cname.lower()
-                        _in_own   = _cbase in _own_state_names
-                        _in_enemy = _cbase in _enemy_state_names
+                        _cbase = _cname.lower() if _cname and _cname != str(_cid) else None
+                        _in_own   = _cbase in _own_state_names   if _cbase else False
+                        _in_enemy = _cbase in _enemy_state_names if _cbase else False
+                        if not _in_own and not _in_enemy and _cbase is None:
+                            # Name unknown — match by flags from api_card_states
+                            _uid_flags = frozenset((k, v) for k, v in
+                                         battle_data.get('api_card_states', {}).get(_uid_str, {}).items()
+                                         if v and isinstance(v, int) and v != 0)
+                            if _uid_flags:
+                                _in_own   = any(_uid_flags <= fs for fs in _own_flag_sets)
+                                _in_enemy = any(_uid_flags <= fs for fs in _enemy_flag_sets)
                         if _in_own and not _in_enemy:
                             _own_struct_uids.add(_uid_i)
                         elif _in_enemy and not _in_own:
                             _enemy_struct_uids.add(_uid_i)
                         elif _uid_i <= 99:
-                            # Ambiguous or unknown: 52-99 default enemy, 152-199 default own
                             _enemy_struct_uids.add(_uid_i)
                         else:
                             _own_struct_uids.add(_uid_i)
@@ -13225,6 +13239,8 @@ $(document).ready(function(){
     # FOREVER LOYAL PVP CHALLENGE AUTOMATION
     # ─────────────────────────────────────────────────────────────────────────
 
+    # LEGACY — Forever Loyal PVP Challenge table (Aug 2026 one-time event)
+    # Functions _apply_challenge_deck/_restore_challenge_deck are still used for all PvP challenges
     LOYAL_CHALLENGES = [
         # step 1
         {'name': 'Loyal Persecutor',
@@ -13361,7 +13377,7 @@ $(document).ready(function(){
         {'name': 'Extreme - Imperial',
          'commander': None,
          'required': ['Tiamat the Destroyer'],
-         'pool': ['Primal Yeren', 'Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+         'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
                   'Impurity Arrester', 'Restore Sequencer'],
          'pool_min': 4},
         # step 12 — Rally Masterwork Aegis-6 4x in 40 battles and win
@@ -13395,7 +13411,7 @@ $(document).ready(function(){
         {'name': 'Not Extreme - Bloodthirsty',
          'commander': None,
          'required': ['Blight Demolisher'],
-         'pool': ['Primal Yeren', 'Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+         'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
                   'Impurity Arrester', 'Restore Sequencer'],
          'pool_min': 4},
         # step 18 — Heal Draconian Matriarch-6 2x in 20 battles and win
@@ -13441,7 +13457,7 @@ $(document).ready(function(){
         {'name': 'Not Extreme - Righteous',
          'commander': None,
          'required': ['Divine Equalizer'],
-         'pool': ['Primal Yeren', 'Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+         'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
                   'Impurity Arrester', 'Restore Sequencer'],
          'pool_min': 4},
         # step 26 — Rally Glorious Vigil-6 2x in 20 battles and win
@@ -13464,36 +13480,69 @@ $(document).ready(function(){
 
 
     MASTER_ARENA_CHALLENGES = [
-        # step 1 — Win 20 Battles
-        {'name': 'Arena: Shard Hunter',           'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 1 — Win 20 Battles (no deck restrictions)
+        {'name': 'Arena: Shard Hunter',
+         'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
         # step 2 — Win 5 Battles using 4 Imperial Assaults
-        {'name': 'Arena: Imperial Captain',        'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Arena: Imperial Captain',
+         'commander': None, 'required': [],
+         'pool': ['Surveillance UAV', 'Avalonian Sheriff', 'Forward Engineer', "Halcyon's APC"],
+         'pool_min': 6},
         # step 3 — Win 5 Battles using 4 Raider Assaults
-        {'name': 'Arena: Raider Captain',          'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Arena: Raider Captain',
+         'commander': None, 'required': [],
+         'pool': ['Rebel Ranger', 'Forgeborn Immortal', 'Zed the Persecutor', "Vlade's Meathook"],
+         'pool_min': 6},
         # step 4 — Win 5 Battles using 4 Bloodthirsty Assaults
-        {'name': 'Arena: Bloodthirsty Captain',    'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Arena: Bloodthirsty Captain',
+         'commander': None, 'required': [],
+         'pool': ['Ghoulish Specter', 'Tongues of Tirlok', 'Kraken of Terror', 'Insatiable Gastobront'],
+         'pool_min': 6},
         # step 5 — Win 5 Battles using 4 Xeno Assaults
-        {'name': 'Arena: Xeno Captain',            'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Arena: Xeno Captain',
+         'commander': None, 'required': [],
+         'pool': ['Ikadri Rex', 'Raxil Cultivator', 'Vengeful Spectre', 'Mezarkos of Thule'],
+         'pool_min': 6},
         # step 6 — Win 5 Battles using 4 Righteous Assaults
-        {'name': 'Arena: Righteous Captain',       'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
-        # step 7 — Win 15 Battles
-        {'name': 'Arena: Improve your Rank II',    'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
-        # step 8 — Win 15 Battles
-        {'name': 'Arena: Vindicated II',           'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Arena: Righteous Captain',
+         'commander': None, 'required': [],
+         'pool': ["Gaia's Strategist", 'Devoted Adept', "Constantine's Cheetah",
+                  'Sanctuary Warden', 'Triton Monarch'],
+         'pool_min': 6},
+        # step 7 — Win 15 Battles (no deck restrictions)
+        {'name': 'Arena: Improve your Rank II',
+         'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 8 — Win 15 Battles (no deck restrictions)
+        {'name': 'Arena: Vindicated II',
+         'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
     ]
 
     CUTLASS_CHALLENGES = [
-        # step 1 — Rally Vigil-6 in 10 battles
-        {'name': 'Cutlass I',   'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
-        # step 2 — Fortify Cutlass-6 in 25 battles
-        {'name': 'Cutlass II',  'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
-        # step 3 — Entrap Cutlass Jagged-6 in 50 battles
-        {'name': 'Cutlass III', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
-        # step 4 — Protect Cutlass Jag-6 in 75 battles
-        {'name': 'Cutlass IV',  'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 1 — Rally Vigil-6 in 10 battles and win
+        {'name': 'Cutlass I',
+         'commander': 'Octane Optimized',
+         'required': ['Vigil'],
+         'pool': [], 'pool_min': 0},
+        # step 2 — Fortify Cutlass-6 in 25 battles and win
+        {'name': 'Cutlass II',
+         'commander': None,
+         'required': ['Cutlass'],
+         'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+                  'Impurity Arrester', 'Restore Sequencer'],
+         'pool_min': 4},
+        # step 3 — Entrap Cutlass Jagged-6 in 50 battles and win
+        {'name': 'Cutlass III',
+         'commander': 'Octane Optimized',
+         'required': ['Cutlass'],
+         'pool': [], 'pool_min': 0},
+        # step 4 — Protect Cutlass Jag-6 in 75 battles and win
+        {'name': 'Cutlass IV',
+         'commander': 'Gaia the Purifier',
+         'required': ['Cutlass'],
+         'pool': [], 'pool_min': 0},
     ]
 
-    def _detect_loyal_challenge_step(self):
+    def _detect_challenge_step(self):
         """Returns (step_number, meta_achievement, challenge_table) or (None, None, None).
         Prefers time-limited challenges (Forever Loyal); falls back to Extreme PVP Challenge."""
         achievements = self.init_data.get('user_achievements', {})
@@ -13648,7 +13697,13 @@ $(document).ready(function(){
             # so the Gold→SP workflow triggers automatically if SP is insufficient
             print(f"  ⚙  Upgrading {name} from L{owned_xml} to L{max_xml} via build_card...")
             try:
-                result = self.build_card(f"{name}-{max_xml}")
+                import builtins as _bi_ens
+                _orig_inp_ens = _bi_ens.input
+                _bi_ens.input = lambda _p='': 'yes'
+                try:
+                    result = self.build_card(f"{name}-{max_xml}")
+                finally:
+                    _bi_ens.input = _orig_inp_ens
                 if result is False:
                     print(f"  ✗ build_card upgrade failed for {name}")
                     return None
@@ -13666,7 +13721,13 @@ $(document).ready(function(){
         # Not in inventory at all — use build_card
         print(f"  ⚙  Building {name} from scratch via build_card...")
         try:
-            result = self.build_card(name)
+            import builtins as _bi_ens2
+            _orig_inp_ens2 = _bi_ens2.input
+            _bi_ens2.input = lambda _p='': 'yes'
+            try:
+                result = self.build_card(name)
+            finally:
+                _bi_ens2.input = _orig_inp_ens2
             if result is False:
                 print(f"  ✗ build_card failed for {name}")
                 return None
@@ -13682,17 +13743,17 @@ $(document).ready(function(){
         print(f"  ✗ {name} still not at L{max_xml} after build_card")
         return None
 
-    def _loyal_log_issue(self, account_nick, step, reason):
-        """Append an issue entry to export/loyal_challenge_issues.txt."""
+    def _challenge_log_issue(self, account_nick, step, reason):
+        """Append an issue entry to export/pvp_challenge_issues.txt."""
         import datetime as _dt
-        log_path = os.path.join(SCRIPT_DIR, 'export', 'loyal_challenge_issues.txt')
+        log_path = os.path.join(SCRIPT_DIR, 'export', 'pvp_challenge_issues.txt')
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         ts = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         with open(log_path, 'a', encoding='utf-8') as _f:
             _f.write(f"[{ts}]  Account: {account_nick}  Step {step}: {reason}\n")
         print(f"  ⚠  Logged issue to {log_path}")
 
-    def _apply_loyal_deck_adjustments(self, step, card_data, deck_slot=1, challenge_table=None):
+    def _apply_challenge_deck(self, step, card_data, deck_slot=1, challenge_table=None):
         """Adjust slot-1 deck for the current challenge step.
         Returns (original_deck_cards, original_commander_id) for restore, or (None, None) on error."""
         table = challenge_table if challenge_table is not None else self.LOYAL_CHALLENGES
@@ -13763,7 +13824,7 @@ $(document).ready(function(){
             else:
                 reason = f"Required card not available: {card_name}"
                 print(f"  ✗ {reason}")
-                self._loyal_log_issue(nick, step, reason)
+                self._challenge_log_issue(nick, step, reason)
                 return None, None  # abort before modifying deck
 
         pool_ids = []
@@ -13844,14 +13905,14 @@ $(document).ready(function(){
                 else:
                     print(f"  ✗ No new copy detected for {card_name} — moving to next card")
                     if 'not enough sp' in _build_output.lower():
-                        self._loyal_log_issue(nick, step, f"Insufficient SP to build additional {card_name} — fell through to next pool card")
+                        self._challenge_log_issue(nick, step, f"Insufficient SP to build additional {card_name} — fell through to next pool card")
                     break
 
         if len(pool_ids) < ch['pool_min']:
             reason = (f"Only {len(pool_ids)}/{ch['pool_min']} pool cards available "
                       f"(needed from: {', '.join(pool_order)})")
             print(f"  ✗ {reason} — proceeding with what we have")
-            self._loyal_log_issue(nick, step, reason)
+            self._challenge_log_issue(nick, step, reason)
 
         # ── PHASE 3: Re-read deck AFTER all builds for new configuration ──
         self.initialize(verbose=False)
@@ -13860,7 +13921,7 @@ $(document).ready(function(){
         if not isinstance(deck_info, dict):
             reason = f"Could not read deck slot {deck_slot} after build"
             print(f"  ✗ {reason}")
-            self._loyal_log_issue(nick, step, reason)
+            self._challenge_log_issue(nick, step, reason)
             return None, None
 
         orig_cmdr = orig_cmdr_snap  # use pre-build snapshot for restore
@@ -13880,7 +13941,7 @@ $(document).ready(function(){
             if not cmdr_id:
                 reason = f"Commander not found in card data: {ch['commander']}"
                 print(f"  ✗ {reason}")
-                self._loyal_log_issue(nick, step, reason)
+                self._challenge_log_issue(nick, step, reason)
             else:
                 # Check if commander is owned; build if not
                 uc_cmdr = self.init_data.get('user_cards', {})
@@ -13901,7 +13962,7 @@ $(document).ready(function(){
                         if _build_res is False:
                             reason = f"Commander {ch['commander']} build failed (insufficient resources)"
                             print(f"  ✗ {reason}")
-                            self._loyal_log_issue(nick, step, reason)
+                            self._challenge_log_issue(nick, step, reason)
                         else:
                             self.initialize(verbose=False)
                             uc_cmdr2 = self.init_data.get('user_cards', {})
@@ -13911,11 +13972,11 @@ $(document).ready(function(){
                             else:
                                 reason = f"Commander {ch['commander']} build returned success but not in inventory"
                                 print(f"  ✗ {reason}")
-                                self._loyal_log_issue(nick, step, reason)
+                                self._challenge_log_issue(nick, step, reason)
                     except Exception as _ex2:
                         reason = f"Commander {ch['commander']} build exception: {_ex2}"
                         print(f"  ✗ {reason}")
-                        self._loyal_log_issue(nick, step, reason)
+                        self._challenge_log_issue(nick, step, reason)
 
         # Pad deck to maximum size (10) before replacement so challenge cards
         # don't reduce the deck size if the original had fewer than 10.
@@ -13966,17 +14027,17 @@ $(document).ready(function(){
             else:
                 reason = f"setDeckCards failed: {result}"
                 print(f"  ✗ {reason}")
-                self._loyal_log_issue(nick, step, reason)
+                self._challenge_log_issue(nick, step, reason)
                 return None, None
         except Exception as ex:
             reason = f"setDeckCards exception: {ex}"
             print(f"  ✗ {reason}")
-            self._loyal_log_issue(nick, step, reason)
+            self._challenge_log_issue(nick, step, reason)
             return None, None
 
         return (orig_card_ids, str(orig_cmdr_snap))
 
-    def _restore_loyal_deck(self, orig_card_ids, orig_cmdr_id, deck_slot=1):
+    def _restore_challenge_deck(self, orig_card_ids, orig_cmdr_id, deck_slot=1):
         """Restore original deck after Loyal challenge battles."""
         if not orig_card_ids:
             return
@@ -14102,7 +14163,7 @@ $(document).ready(function(){
 
                 # Use same logic as battle selection for consistency
                 sub_name = sub_prog = sub_max = None
-                _det_step, _det_meta, _det_table = tmp._detect_loyal_challenge_step()
+                _det_step, _det_meta, _det_table = tmp._detect_challenge_step()
                 if _det_step and _det_table and _det_step <= len(_det_table):
                     _ch = _det_table[_det_step - 1]
                     sub_name = _ch.get('name', '')
@@ -14159,7 +14220,7 @@ $(document).ready(function(){
         self.initialize(verbose=False)
         card_data = self._load_card_data_with_rarity() or {}
 
-        step, meta, _ch_table = self._detect_loyal_challenge_step()
+        step, meta, _ch_table = self._detect_challenge_step()
         if not step:
             ach = self.init_data.get('user_achievements', {})
             has_any = any(
@@ -14187,13 +14248,13 @@ $(document).ready(function(){
             print(f"  Pool ({ch['pool_min']}x): {', '.join(set(ch['pool']))}")
 
         print()
-        orig_ids, orig_cmdr = self._apply_loyal_deck_adjustments(step, card_data, challenge_table=_ch_table)
+        orig_ids, orig_cmdr = self._apply_challenge_deck(step, card_data, challenge_table=_ch_table)
         if orig_ids:
             input("\n  Deck updated. Press ENTER to start arena battles, Ctrl+C to abort.")
             try:
                 self.multi_account_live_sim(mode='arena')
             finally:
-                self._restore_loyal_deck(orig_ids, orig_cmdr)
+                self._restore_challenge_deck(orig_ids, orig_cmdr)
 
     def _export_arena_opponent_deck(self, enemy_name, winner, battle_data, enemy_guild='', silent=False, brawl_mode=False, live_deck_str=None):
         """
@@ -14994,6 +15055,7 @@ $(document).ready(function(){
                         _is_guild_brawl = any(w in _brawl_name.lower() for w in ('guild', 'guildbrawl'))
                         _brawl_start = int(_brawl.get('start_time', 0))
                         # For energy tracking: guild brawl also uses player_brawl_data energy
+                        _brawl_live = False
                         if (_brawl_start == 0 or _brawl_start <= _now):
                             if _brawl_end > _now:
                                 _brawl_live = True
@@ -15468,18 +15530,18 @@ $(document).ready(function(){
                             print("  ⚠ Could not determine active deck slot")
                         if mode == 'arena':
                             # ── Loyal Challenge deck adjustment ───────────────
-                            _loyal_step, _, _loyal_table = tmp_cmd._detect_loyal_challenge_step()
-                            _loyal_orig_ids = _loyal_orig_cmdr = None
-                            if _loyal_step:
-                                _loyal_cd = tmp_cmd._load_card_data_with_rarity() or {}
-                                _loyal_orig_ids, _loyal_orig_cmdr = tmp_cmd._apply_loyal_deck_adjustments(_loyal_step, _loyal_cd, challenge_table=_loyal_table)
-                                if _loyal_orig_ids:
+                            _ch_step, _, _ch_table = tmp_cmd._detect_challenge_step()
+                            _ch_orig_ids = _ch_orig_cmdr = None
+                            if _ch_step:
+                                _ch_cd = tmp_cmd._load_card_data_with_rarity() or {}
+                                _ch_orig_ids, _ch_orig_cmdr = tmp_cmd._apply_challenge_deck(_ch_step, _ch_cd, challenge_table=_ch_table)
+                                if _ch_orig_ids:
                                     tmp_cmd.initialize(verbose=False)
                             try:
                                 stats = tmp_cmd.live_sim_battle(skip_deck_select=True, combat_log=_ma_combat_log, focus_unknown=_ma_focus_unknown)
                             finally:
-                                if _loyal_orig_ids:
-                                    tmp_cmd._restore_loyal_deck(_loyal_orig_ids, _loyal_orig_cmdr)
+                                if _ch_orig_ids:
+                                    tmp_cmd._restore_challenge_deck(_ch_orig_ids, _ch_orig_cmdr)
                             # Restore original active deck if changed
                             if active_slot:
                                 try:
@@ -15718,20 +15780,20 @@ $(document).ready(function(){
                         if stamina > 0:
                             print(f"\n  [ARENA]")
                             # Loyal Challenge deck adjustment
-                            _loyal_step_x, _, _loyal_table_x = tmp._detect_loyal_challenge_step()
-                            _loyal_orig_x = _loyal_cmdr_x = None
-                            if _loyal_step_x:
-                                _lcd_x = tmp._load_card_data_with_rarity() or {}
-                                _loyal_orig_x, _loyal_cmdr_x = tmp._apply_loyal_deck_adjustments(_loyal_step_x, _lcd_x, challenge_table=_loyal_table_x)
-                                if _loyal_orig_x:
+                            _ch_step_x, _, _ch_table_x = tmp._detect_challenge_step()
+                            _ch_orig_x = _ch_cmdr_x = None
+                            if _ch_step_x:
+                                _ch_lcd_x = tmp._load_card_data_with_rarity() or {}
+                                _ch_orig_x, _ch_cmdr_x = tmp._apply_challenge_deck(_ch_step_x, _ch_lcd_x, challenge_table=_ch_table_x)
+                                if _ch_orig_x:
                                     tmp.initialize(verbose=False)
                             try:
                                 tmp.live_sim_battle(skip_deck_select=True,
                                                 combat_log=_ma_combat_log_arena,
                                                 focus_unknown=True)
                             finally:
-                                if _loyal_orig_x:
-                                    tmp._restore_loyal_deck(_loyal_orig_x, _loyal_cmdr_x)
+                                if _ch_orig_x:
+                                    tmp._restore_challenge_deck(_ch_orig_x, _ch_cmdr_x)
                             # Restore original active deck if changed
                             tmp.initialize(verbose=False)
                             _active_deck_after = str(tmp.init_data.get('user_data', {}).get('active_deck', '1'))
@@ -15890,20 +15952,20 @@ $(document).ready(function(){
                         if stamina > 0:
                             print(f"\n  [ARENA]")
                             # Loyal Challenge deck adjustment
-                            _loyal_step_x, _, _loyal_table_x = tmp._detect_loyal_challenge_step()
-                            _loyal_orig_x = _loyal_cmdr_x = None
-                            if _loyal_step_x:
-                                _lcd_x = tmp._load_card_data_with_rarity() or {}
-                                _loyal_orig_x, _loyal_cmdr_x = tmp._apply_loyal_deck_adjustments(_loyal_step_x, _lcd_x, challenge_table=_loyal_table_x)
-                                if _loyal_orig_x:
+                            _ch_step_x, _, _ch_table_x = tmp._detect_challenge_step()
+                            _ch_orig_x = _ch_cmdr_x = None
+                            if _ch_step_x:
+                                _ch_lcd_x = tmp._load_card_data_with_rarity() or {}
+                                _ch_orig_x, _ch_cmdr_x = tmp._apply_challenge_deck(_ch_step_x, _ch_lcd_x, challenge_table=_ch_table_x)
+                                if _ch_orig_x:
                                     tmp.initialize(verbose=False)
                             try:
                                 tmp.live_sim_battle(skip_deck_select=True,
                                                 combat_log=_ma_combat_log_arena,
                                                 focus_unknown=True)
                             finally:
-                                if _loyal_orig_x:
-                                    tmp._restore_loyal_deck(_loyal_orig_x, _loyal_cmdr_x)
+                                if _ch_orig_x:
+                                    tmp._restore_challenge_deck(_ch_orig_x, _ch_cmdr_x)
                             # Restore original active deck if changed
                             tmp.initialize(verbose=False)
                             _active_deck_after = str(tmp.init_data.get('user_data', {}).get('active_deck', '1'))
@@ -16039,12 +16101,12 @@ $(document).ready(function(){
                         tmp.auto_claim_daily_bonus()
 
                         # ── 0.5 LOYAL CHALLENGE DECK ────────────────
-                        _loyal_step2, _, _loyal_table2 = tmp._detect_loyal_challenge_step()
-                        _loyal_orig2 = _loyal_cmdr2 = None
-                        if _loyal_step2:
+                        _ch_step2, _, _ch_table2 = tmp._detect_challenge_step()
+                        _ch_orig2 = _ch_cmdr2 = None
+                        if _ch_step2:
                             _lcd2 = tmp._load_card_data_with_rarity() or {}
-                            _loyal_orig2, _loyal_cmdr2 = tmp._apply_loyal_deck_adjustments(_loyal_step2, _lcd2, challenge_table=_loyal_table2)
-                            if _loyal_orig2:
+                            _ch_orig2, _ch_cmdr2 = tmp._apply_challenge_deck(_ch_step2, _lcd2, challenge_table=_ch_table2)
+                            if _ch_orig2:
                                 tmp.initialize(verbose=False)
 
                         # ── 1. QUEST MISSION ─────────────────────────
@@ -16065,12 +16127,12 @@ $(document).ready(function(){
                                                     combat_log=_ma_combat_log_arena,
                                                     focus_unknown=True)
                             finally:
-                                if _loyal_orig2:
-                                    tmp._restore_loyal_deck(_loyal_orig2, _loyal_cmdr2)
+                                if _ch_orig2:
+                                    tmp._restore_challenge_deck(_ch_orig2, _ch_cmdr2)
                         else:
                             print(f"  [ARENA]  skipped (stamina=0)")
-                            if _loyal_orig2:
-                                tmp._restore_loyal_deck(_loyal_orig2, _loyal_cmdr2)
+                            if _ch_orig2:
+                                tmp._restore_challenge_deck(_ch_orig2, _ch_cmdr2)
 
                     except PleaseWaitError as e:
                         print(f"  ⏭  {nick}: API busy ({e}) – skipping")
@@ -18907,6 +18969,7 @@ $(document).ready(function(){
         round_num = 0
         initial_salvage_done = False
 
+        _stop_reason = 'unknown'
         while True:
             # Step 1: check SP cap
             self.initialize(verbose=False)
@@ -18914,6 +18977,7 @@ $(document).ready(function(){
 
             if sp_now >= sp_cap - 600:
                 print(f"  {'✓' if sp_now >= sp_cap else '⚠'} SP at {sp_now:,}/{sp_cap:,} — within 600 of cap, stopping")
+                _stop_reason = 'near cap'
                 break
 
             # Step 2: initial salvage (once, before first pack buy) to free inventory
@@ -18927,12 +18991,14 @@ $(document).ready(function(){
                 sp_now = int(self.init_data.get('user_data', {}).get('salvage', 0))
                 if sp_now >= sp_cap - 600:
                     print(f"  ⚠ SP at {sp_now:,}/{sp_cap:,} — within 600 of cap after initial salvage, stopping")
+                    _stop_reason = 'near cap'
                     break
 
             # Step 3: check inventory space (10 packs × 20 cards = 200 slots)
             max_packs, free_slots = self.calculate_max_packs()
             if max_packs < PACKS_PER_ROUND:
                 print(f"  ✗ Not enough inventory space ({free_slots} free slots, need {PACKS_PER_ROUND * 20}) — stopping")
+                _stop_reason = f'inventory full ({free_slots} free slots)'
                 break
 
             gold = self.get_gold()
@@ -18942,6 +19008,7 @@ $(document).ready(function(){
             bought, _ = self.buy_packs(PACKS_PER_ROUND, silent=True)
             if bought < PACKS_PER_ROUND:
                 print(f"  ✗ Only bought {bought}/{PACKS_PER_ROUND} packs (Gold insufficient or inventory full?) — stopping")
+                _stop_reason = f'gold insufficient (only {bought}/{PACKS_PER_ROUND} packs bought)'
                 break
 
             self.salvage_all_commons(silent=True)
@@ -18955,6 +19022,10 @@ $(document).ready(function(){
         if not silent:
             print(f"\n  Done after {round_num} round(s).")
             print("="*60)
+
+        self.initialize(verbose=False)
+        final_sp = int(self.init_data.get('user_data', {}).get('salvage', 0))
+        return final_sp, sp_cap, _stop_reason
 
     def fill_sp_to_cap_all_accounts(self):
         """Fill SP to cap for all play_enabled accounts."""
@@ -18971,6 +19042,8 @@ $(document).ready(function(){
         print(f"  FILL SP TO CAP – ALL ACCOUNTS")
         print(f"{'='*60}")
 
+        _low_sp_accounts = []
+
         for sf in settings_files:
             tmp = TyrantCommander(sf)
             if not tmp.initialize(verbose=False):
@@ -18982,7 +19055,17 @@ $(document).ready(function(){
             nick = (tmp.api.settings.get('request_data', {}).get('kong_name', '')
                     or tmp.api.settings.get('kong_name', sf))
             print(f"\n  ── {nick} ──")
-            tmp.fill_sp_to_cap(silent=False)
+            final_sp, sp_cap, stop_reason = tmp.fill_sp_to_cap(silent=False)
+            if stop_reason != 'near cap' and sp_cap > 0 and final_sp < sp_cap * 0.5:
+                _low_sp_accounts.append((nick, final_sp, sp_cap, stop_reason))
+
+        if _low_sp_accounts:
+            print(f"\n{'='*60}")
+            print(f"  ACCOUNTS WITH LOW SP (< 50%) — SKIPPED EARLY")
+            print(f"{'='*60}")
+            for _nick, _sp, _cap, _reason in _low_sp_accounts:
+                print(f"  ⚠  {_nick}: {_sp:,}/{_cap:,} SP ({_sp*100//_cap}%) — {_reason}")
+            print("="*60)
 
     def shop_salvage_workflow(self, pack_count, salvage_base_epics=False, keep_base_epics=1):
         """
@@ -19579,33 +19662,47 @@ $(document).ready(function(){
                 print("✗ No card name entered")
                 return
             
-            # Search for card (using same logic as build_card)
             import re
-            search_name = re.sub(r'\d+$', '', card_name.lower()).strip()
+            # Allow entry by card ID (any numeric level ID)
+            base_id = None
+            card_display_name = None
+            if card_name.isdigit():
+                lookup_id = int(card_name)
+                info = card_data.get(lookup_id, {})
+                if not isinstance(info, dict) or not info:
+                    print(f"✗ Card ID {card_name} not found in card data")
+                    return
+                base_id = info.get('base_id', lookup_id)
+                card_display_name = re.sub(r'-\d+$', '', info.get('name', str(lookup_id))).strip()
+                print(f"  Found: {card_display_name} (base_id={base_id})")
             
-            # Find all matching cards
-            found_cards = []
-            for card_id, info in card_data.items():
-                if isinstance(info, dict):
-                    full_name = info.get('name', '')
-                    base_name = re.sub(r'-\d+$', '', full_name.lower()).strip()
-                    
-                    # Exact match
-                    if search_name == base_name:
-                        found_cards.append({
-                            'id': card_id,
-                            'name': full_name,
-                            'level': info.get('level', 1),
-                            'base_id': info.get('base_id', card_id)
-                        })
-            
-            if not found_cards:
-                print(f"✗ Card '{card_name}' not found")
-                return
-            
-            # Get base_id from first match
-            base_id = found_cards[0]['base_id']
-            card_display_name = found_cards[0]['name'].rsplit('-', 1)[0] if '-' in found_cards[0]['name'] else found_cards[0]['name']
+            if base_id is None:
+                # Search by name
+                search_name = re.sub(r'\d+$', '', card_name.lower()).strip()
+                found_cards = []
+                for cid, info in card_data.items():
+                    if isinstance(info, dict):
+                        full_name = info.get('name', '')
+                        base_name = re.sub(r'-\d+$', '', full_name.lower()).strip()
+                        if search_name == base_name:
+                            found_cards.append({
+                                'id': cid, 'name': full_name,
+                                'level': info.get('level', 1),
+                                'base_id': info.get('base_id', cid)
+                            })
+                if not found_cards:
+                    print(f"✗ Card '{card_name}' not found")
+                    return
+                if len({c['base_id'] for c in found_cards}) > 1:
+                    print(f"⚠ Multiple cards match '{card_name}' — please enter the card ID instead:")
+                    seen = set()
+                    for c in found_cards:
+                        if c['base_id'] not in seen:
+                            seen.add(c['base_id'])
+                            print(f"    ID {c['id']:>6}  {c['name']}")
+                    return
+                base_id = found_cards[0]['base_id']
+                card_display_name = found_cards[0]['name'].rsplit('-', 1)[0] if '-' in found_cards[0]['name'] else found_cards[0]['name']
             
             # Find ALL levels (1-6) for this card
             all_level_ids = []
@@ -20031,6 +20128,31 @@ $(document).ready(function(){
             print(f"✗ Error salvaging outdated cards: {e}")
             traceback.print_exc()
     
+    def refill_arena_stamina(self):
+        """Refill Arena stamina using buyStaminaRefillTokens."""
+        self.initialize(verbose=False)
+        ud = self.init_data.get('user_data', {}) or {}
+        stamina     = int(ud.get('stamina', 0))
+        max_stamina = (int(ud.get('max_stamina', 0))
+                       or int(self.init_data.get('max_stamina', 0))
+                       or 15)
+        print(f"  Arena Stamina: {stamina}/{max_stamina}")
+        if stamina >= max_stamina:
+            print("  ✓ Stamina already full — nothing to do")
+            return
+        confirm = input_with_esc(f"  Refill Arena stamina? [y/N] ")
+        if not confirm or confirm.strip().lower() not in ('y', 'yes'):
+            print("  Cancelled")
+            return
+        result = self.api.call('buyStaminaRefillTokens')
+        if result and result.get('result') in ('ok', True, 1):
+            self.initialize(verbose=False)
+            ud2 = self.init_data.get('user_data', {}) or {}
+            new_stamina = int(ud2.get('stamina', 0))
+            print(f"  ✓ Stamina refilled: {stamina} → {new_stamina}/{max_stamina}")
+        else:
+            print(f"  ✗ Refill failed: {result}")
+
     def claim_daily_bonus(self):
         """
         Claims the daily bonus (useDailyBonus)
@@ -24559,6 +24681,10 @@ def interactive_menu():
             commander.auto_claim_daily_bonus(); input("\n[ENTER] to continue...")
         elif choice == "daily_all":
             commander.claim_daily_reward_all_accounts(); input("\n[ENTER] to continue...")
+        elif choice == "refill_stamina":
+            commander.refill_arena_stamina(); input("\n[ENTER] to continue...")
+        elif choice == '27':
+            commander.refill_arena_stamina(); input("\n[ENTER] to continue...")
         elif choice == "41":
             commander.export_starterdecks(slot='1', mode='arena'); input("\n[ENTER] to continue...")
         elif choice == "42":
@@ -24850,6 +24976,7 @@ def interactive_menu():
             '24': 'comb',    # Multi-Account: Brawl + Quest Mission + Arena
             '25': 'enlog',   # Energy Tracker
             '26': 'daily_all',  # Claim Daily Reward – All Accounts
+            '27': 'refill_stamina',  # Refill Arena Stamina
         }
         _multi_opts = {'14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25', '26'}
         while True:
@@ -24869,6 +24996,7 @@ def interactive_menu():
             print(" 11.   Guild War Summary from JSON files")
             print(" 12.   Guild War Auto-Pipeline 🚀")
             print(" 13.   Claim Daily Reward")
+            print(" 14.   Refill Arena Stamina")
             if _multi:
                 print("─"*52)
                 print(" 14.   Claim Rewards – All Accounts")
@@ -24884,6 +25012,7 @@ def interactive_menu():
                 print(" 24.   Multi-Account: Brawl + Quest Mission + Arena")
                 print(" 25.   Energy Tracker (hourly log – Brawl/Mission/Arena)")
                 print(" 26.   Claim Daily Reward – All Accounts")
+                print(" 27.   Refill Arena Stamina")
             print("─"*52)
             print("  0.   ← Back to Main Menu")
             print("="*52)
