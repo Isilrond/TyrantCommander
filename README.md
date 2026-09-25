@@ -3,7 +3,7 @@
 **Python-based automation tool for Tyrant Unleashed**  
 Communicates directly via the official game API — no game client required.
 
-> August 2026 — v5.5
+> September 2026 — v5.6
 
 ---
 
@@ -23,9 +23,18 @@ Communicates directly via the official game API — no game client required.
 | `items.xml` | Items database (`data/` folder) |
 | `battleground_effects.xml` | Global BGE definitions with active time windows (`data/` folder) |
 | `updates.xml` | Game news/event announcements (`data/` folder) |
+| `battleground_effects.xml` | Global BGE definitions with active time windows (`data/` folder) |
+| `battle_events_h52.xml` | Brawl event schedule with start/end timestamps (`data/` folder) |
+| `raids_x42.xml` | Raid event schedule with start/end timestamps (`data/` folder) |
+| `faction_wars_fp3.xml` | Guild War schedule with start/end timestamps (`data/` folder) |
+| `event_box.xml` | Event box definitions (`data/` folder) |
+| `conquest.xml` | Conquest event data (`data/` folder) |
+| `mini_packs_36i.xml` | Mini pack definitions (`data/` folder) |
+| `assetbundles5_4_2.xml` | Asset bundle index (`data/` folder) |
+| `assetbundles4_6.xml` | Asset bundle index legacy (`data/` folder) |
 | `database.yml` | TUO database file (auto-managed, max ~310 MB) |
 
-> **Important:** All XML files (`cards_section_*.xml`, `missions.xml`, `achievements.xml`, `items.xml`, `battleground_effects.xml`, `updates.xml`, etc.) must be kept up to date manually using **F→1 (Download Game Data)**. Run this regularly to ensure card stats, BGE schedules, and mission data reflect the current game state.
+> **Important:** All XML files must be kept up to date using **F→1 (Download Game Data)**. The event XMLs (`battle_events_h52.xml`, `raids_x42.xml`, `faction_wars_fp3.xml`) are read by F→28/29 for automatic event detection — they typically contain future events, so a single download suffices until a new event cycle begins.
 
 ---
 
@@ -48,7 +57,7 @@ TUO-Live/
     ├── import/                      ← Drop *.txt files here for D→18
     ├── ownedcards/                  ← Export target (all accounts)
     ├── export/                      ← Gauntlet + challenge issue output
-    │   └── loyal_challenge_issues.txt
+    │   └── pvp_challenge_issues.txt   ← Challenge build failures (all types)
     ├── combatlog/                   ← Combat logs per account (Arena + Brawl)
     │   └── suspicious/             ← Auto-copied suspicious loss logs
     ├── energylog/                   ← Hourly energy snapshots
@@ -58,6 +67,14 @@ TUO-Live/
     ├── items.xml
     ├── battleground_effects.xml
     ├── updates.xml
+    ├── battle_events_h52.xml
+    ├── raids_x42.xml
+    ├── faction_wars_fp3.xml
+    ├── event_box.xml
+    ├── conquest.xml
+    ├── mini_packs_36i.xml
+    ├── assetbundles5_4_2.xml
+    ├── assetbundles4_6.xml
     ├── cards_section_*.xml
     ├── fusion_recipes_cj2.xml
     └── database.yml
@@ -100,16 +117,19 @@ Settings (`91`/`92`) accessible from main menu at any time.
 | 14 | Optimize Deck vs Guild Defense | TUO anneal (500 iter) vs all guild defenses |
 | 15 | Multi-Account: Arena | Live Sim Arena; Loyal Challenge deck applied + restored per account |
 | 16 | Multi-Account: Brawl | Live Sim Brawl for account range |
-| 17 | Multi-Account: Guild War | Live Sim Guild War for account range |
+| 17 | Multi-Account: Guild War | Live Sim Guild War for account range; GW prep-phase guard |
 | 18 | Multi-Account: Raid + Quest Mission + Arena | Raid → Quest → Arena; Loyal Challenge deck applied + restored |
 | 19 | Multi-Account: Quest Mission + Arena | Quest → Arena; Loyal Challenge deck applied + restored |
 | 20 | Multi-Account: Brawl + Quest Mission + Arena | Brawl → Quest → Arena; Loyal Challenge deck applied + restored |
 | 21 | Energy Tracker (hourly log) | Auto-detects Raid/Brawl/Guild Brawl; logs to `energylog/` |
 | 22 | Guild War Stats Tracker | Polls every 30 min; JSON + HTML snapshot |
 | 23 | Guild War Summary from JSON files | Generates summary HTML per guild+event group |
-| 24 | Forever Loyal PVP Challenge Overview | Progress table for all accounts; detects stagnation |
+| 24 | PvP Challenge Overview – All Accounts | Progress table; all challenge types; detects stagnation |
 | 25 | Claim Daily Reward | Claims daily bonus for current account |
 | 26 | Claim Daily Reward – All Accounts | Claims for all `play_enabled` accounts |
+| 27 | Refill Arena Stamina | Buys stamina refill token for current account |
+| 28 | Auto: Event + Quest Mission + Arena | Auto-detects Raid/Brawl from XML per loop pass; Brawl always logged; PvP Challenge deck for Arena; GW prep-phase guard |
+| 29 | Auto: Event + Quest Mission + Arena (GW Pipeline) | GW phase prepended when `_gw_in_active_phase()` is True; then delegates to F→28 |
 
 ---
 
@@ -143,15 +163,19 @@ All multi-account options offer 6 run modes:
 
 ## Key Features
 
-### Forever Loyal PVP Challenge (F→15/18/19/20 + F→24)
+### PvP Challenge System (F→15/18/19/20/24/28/29)
 
-Automatically adapts Slot 1 deck for the current Loyal Challenge step before arena battles, then restores the original deck after. Runs fully unattended across all accounts.
+Automatically adapts Slot 1 deck for the active PvP Challenge step before arena battles, then restores the original deck. Runs fully unattended across all accounts.
 
 **Challenge priority:**
-1. Forever Loyal PVP Challenge (time-limited, active window)
-2. Extreme PVP Challenge (fallback when Loyal is completed or absent)
-3. Master the Arena PVP Challenge (defined, deck rules TBD)
-4. Cutlass Unleashed PVP Challenge (defined, deck rules TBD)
+1. Forever Loyal PVP Challenge *(LEGACY — Aug 2026 one-time event)*
+2. Extreme PVP Challenge (28 steps across 6 faction streams)
+3. Enter the Arena PVP Challenge (8 steps)
+4. Orbo Underground PVP Challenge (12 steps, Mythic Orbo required)
+5. Dominate the Arena PVP Challenge (9 steps)
+6. Progenitor Requiem PVP Challenge (13 steps)
+7. Master the Arena PVP Challenge (8 steps)
+8. Cutlass Unleashed PVP Challenge (4 steps)
 
 **How it works:**
 
@@ -162,7 +186,7 @@ Automatically adapts Slot 1 deck for the current Loyal Challenge step before are
 5. Pads deck to 10 cards if original has fewer than 10
 6. Replaces last N slots with challenge cards via `setDeckCards`
 7. Runs arena battles (`live_sim_battle`)
-8. Restores original deck via `_restore_loyal_deck` (always, via `finally` block)
+8. Restores original deck via `_restore_challenge_deck` (always, via `finally` block)
 
 **Abort conditions** (deck left unchanged):
 - Required card cannot be built (SP/gold insufficient) → `return None, None` before any deck modification
@@ -170,7 +194,7 @@ Automatically adapts Slot 1 deck for the current Loyal Challenge step before are
 
 **Extreme PVP Challenge:** parallel quest strands — sub-challenge detected by type-9 achievement name, not linear step counter. Only names from EXTREME_CHALLENGES table are accepted to avoid false matches with other challenge types.
 
-**Issues log:** `export/loyal_challenge_issues.txt`
+**Issues log:** `export/pvp_challenge_issues.txt`
 
 **Challenge Overview (F→24):** shows all accounts with step, sub-challenge name, progress, and end date. Highlights stagnating accounts (+0 between snapshots). Uses `_detect_loyal_challenge_step()` for consistency with battle selection.
 
@@ -178,7 +202,7 @@ Automatically adapts Slot 1 deck for the current Loyal Challenge step before are
 
 Mission deck optimization (B→16 single account, B→17 all accounts) automatically reads the active Global Battleground Effect from `battleground_effects.xml`. If an active GBGE is found (current time within `global_start_time`/`global_end_time`), it is applied automatically with a 5-second notice — no manual input required. If no GBGE is active, the optimizer runs without one.
 
-**XML name → TUO flag conversion:** names with spaces are hyphenated by default. Known overrides: `Crackdown` → `Crackdown 2`, `Oath of Loyalty` → `Oath-Of-Loyalty`, etc.
+**XML name → TUO flag conversion:** names with spaces are hyphenated by default. Known overrides: `Overcharged` → `Overload all`, `Crackdown` → `Crackdown 2`, `Oath of Loyalty` → `Oath-Of-Loyalty`, `Enduring Rage` → `EnduringRage 2`, etc.
 
 ### Brawl & Guild Brawl
 
@@ -307,7 +331,30 @@ Generated by **B → 11 Sync All Guild Decks** (combined defense + attack pass).
 
 ## Changelog
 
-### v5.5 — August 2026 *(current)*
+### v5.6 — September 2026 *(current)*
+
+- **NEW** F→27 Refill Arena Stamina — buys stamina refill token; reads `max_stamina` from `init_data` with fallback 15
+- **NEW** F→28 Auto: Event + Quest Mission + Arena — auto-detects Raid/Brawl from local XML per loop pass; Brawl always logged; PvP Challenge deck for Arena phase; GW prep-phase guard; raid drain after event end (leftover energy used)
+- **NEW** F→29 Auto: Event + Quest Mission + Arena (GW Pipeline) — GW phase prepended when `_gw_in_active_phase()` is True
+- **NEW** `_detect_active_event_from_xml()` — reads `raids_x42.xml` (`<raid>`) and `battle_events_h52.xml` (`<battle_event>`); child-element timestamps via `findtext()`; Raid checked before Brawl
+- **NEW** `_gw_in_active_phase()` — reads `faction_wars_fp3.xml` (`<faction_war>`); child-element timestamps
+- **NEW** XML downloads: `battle_events_h52.xml`, `raids_x42.xml`, `faction_wars_fp3.xml`, `event_box.xml`, `conquest.xml`, `mini_packs_36i.xml`, `assetbundles5_4_2.xml`, `assetbundles4_6.xml`
+- **NEW** Challenge tables: `ENTER_THE_ARENA_CHALLENGES` (8), `ORBO_UNDERGROUND_CHALLENGES` (12, `MYTHIC_ORBO_ID=58573`), `DOMINATE_THE_ARENA_CHALLENGES` (9), `PROGENITOR_REQUIEM_CHALLENGES` (13)
+- **NEW** `_AUTO_CONFIRM_INPUT` flag — suppresses `input_with_esc()` and `confirm_action()` prompts during pipeline deck builds; works on Windows (`msvcrt`-based input)
+- **COMPLETE** `EXTREME_CHALLENGES` — all 28 steps with `desc`, `pvp`, `commander`, `pool`
+- **COMPLETE** `MASTER_ARENA_CHALLENGES` — all 8 steps; `CUTLASS_CHALLENGES` — all 4 steps
+- **LEGACY** `LOYAL_CHALLENGES` marked `# LEGACY (Aug 2026 one-time event)`
+- **FIX** F→17 GW prep-phase guard added
+- **FIX** All event XML parsing — child elements not attributes; correct tags: `<raid>`, `<battle_event>`, `<faction_war>`
+- **FIX** `play_raid_loop(silent=True)` in pipeline — no start prompt
+- **FIX** BGE: `Overcharged` → `Overload all` in `_api_bge_to_tuo()`
+- **FIX** Issues log: `loyal_challenge_issues.txt` → `pvp_challenge_issues.txt`
+- **FIX** Helper methods reconstructed after file corruption: `_collect_settings_files()`, `_load_setting()`, `_select_account_range()`
+- **FIX** Duplicate menu entry "14. Refill Arena Stamina" removed
+- **FIX** `claim_event_rewards` docstring: `claimGuildwarRewards` → `claimFactionWarRewards`
+
+### v5.5 — August 2026
+
 
 - **NEW** Auto GBGE detection for B→16/17 — reads active Global BGE from `battleground_effects.xml` (unix timestamps); passes `effect 'Crackdown 2'` to TUO automatically; 5-second notice instead of manual prompt
 - **NEW** `battleground_effects.xml` and `updates.xml` added to required data files (download via F→1)
@@ -383,4 +430,4 @@ Guild War Stats Tracker, Guild War Summary, Live Sim Guild War, Build Brawl Gaun
 
 ---
 
-*TyrantAPICommander — August 2026 — v5.5*
+*TyrantAPICommander — September 2026 — v5.6*
