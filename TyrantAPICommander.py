@@ -3360,6 +3360,14 @@ $(document).ready(function(){
             ("events.xml",             base_url + "events.xml"),
             ("battleground_effects.xml", base_url + "battleground_effects.xml"),
             ("updates.xml",             base_url + "updates.xml"),
+            ("battle_events_h52.xml",   base_url + "battle_events_h52.xml"),
+            ("raids_x42.xml",           base_url + "raids_x42.xml"),
+            ("faction_wars_fp3.xml",    base_url + "faction_wars_fp3.xml"),
+            ("event_box.xml",           base_url + "event_box.xml"),
+            ("conquest.xml",            base_url + "conquest.xml"),
+            ("mini_packs_36i.xml",      base_url + "mini_packs_36i.xml"),
+            ("assetbundles5_4_2.xml",   base_url + "assetbundles5_4_2.xml"),
+            ("assetbundles4_6.xml",     base_url + "assetbundles4_6.xml"),
         ]
         for i in range(1, 22):
             files_to_download.append((f"cards_section_{i}.xml", base_url + f"cards_section_{i}.xml"))
@@ -8029,6 +8037,361 @@ $(document).ready(function(){
 
         _pr(f"\n{pfx} ✓ Pipeline complete")
 
+    # ── Multi-account pipeline helpers ────────────────────────────────────────
+
+    def _collect_settings_files(self):
+        """Return sorted list of all settings_*.json paths (excl. TEMPLATE)."""
+        import glob as _glob
+        settings_dirs = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings')]
+        files = []
+        for sd in settings_dirs:
+            files += _glob.glob(os.path.join(sd, 'settings_*.json'))
+        files = [f for f in files
+                 if not os.path.basename(f).startswith('settings_TEMPLATE')]
+        return sorted({os.path.normpath(f): f for f in files}.values())
+
+    def _load_setting(self, sf, key, default=None):
+        """Read a single key from a settings JSON file with a default fallback."""
+        import json as _json
+        try:
+            with open(sf, 'r', encoding='utf-8') as fh:
+                cfg = _json.load(fh)
+            return cfg.get(key, default)
+        except Exception:
+            return default
+
+    def _select_account_range(self, settings_files, label=''):
+        """Wrap the module-level _select_account_range for pipeline use.
+
+        Builds (nick, sf) tuples from file paths, delegates to the module-level
+        function, and returns a plain list of settings file paths (or None on
+        cancel) plus a loop_mode bool.
+        """
+        playable = []
+        for sf in settings_files:
+            nick = os.path.basename(sf).replace('settings_', '').replace('.json', '')
+            playable.append((nick, sf))
+        result, loop_mode = _select_account_range(playable, mode_label=label)
+        if result is None:
+            return None, False
+        return [sf for _nick, sf in result], loop_mode
+
+
+    # ── Active-event detection (reads local XML files) ────────────────────────
+
+    def _detect_active_event_from_xml(self):
+        """Return ('raid'|'brawl'|None) based on local XML timestamps.
+
+        Reads battle_events_h52.xml / raids_x42.xml / faction_wars_fp3.xml
+        and event_box.xml to determine which live event is currently active.
+        Returns the string 'raid' if a raid is running, 'brawl' if a brawl
+        (or placement brawl) is running, or None when nothing is active.
+        """
+        import xml.etree.ElementTree as _ET
+        import time as _time
+        now = int(_time.time())
+        data_dir = os.path.join(SCRIPT_DIR, 'data') if os.path.isdir(
+            os.path.join(SCRIPT_DIR, 'data')) else SCRIPT_DIR
+
+        def _ts(node, field):
+            """Read timestamp from child element or attribute (handles both layouts)."""
+            val = node.findtext(field) or node.get(field) or '0'
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                return 0
+
+        # --- Raid check (raids_x42.xml) ---
+        raid_xml = os.path.join(data_dir, 'raids_x42.xml')
+        if os.path.isfile(raid_xml):
+            try:
+                root = _ET.parse(raid_xml).getroot()
+                for node in root.findall('.//raid_event') + root.findall('.//raid') + root.findall('.//event'):
+                    s = _ts(node, 'start_time')
+                    e = _ts(node, 'end_time')
+                    if s and e and s <= now < e:
+                        return 'raid'
+            except Exception:
+                pass
+
+        # --- Brawl check (battle_events_h52.xml / event_box.xml) ---
+        # battle_events_h52.xml uses <battle_event> child-element layout;
+        # tag name alone identifies it as a brawl - no 'type' attribute present.
+        for fname in ('battle_events_h52.xml', 'event_box.xml'):
+            brawl_xml = os.path.join(data_dir, fname)
+            if not os.path.isfile(brawl_xml):
+                continue
+            try:
+                root = _ET.parse(brawl_xml).getroot()
+                for node in (root.findall('.//battle_event')
+                              + root.findall('.//brawl_event')
+                              + root.findall('.//event')):
+                    tag = node.tag.lower()
+                    name_txt = (node.findtext('name') or '').lower()
+                    kind = (node.get('type') or node.get('event_type') or '').lower()
+                    is_brawl = ('battle_event' in tag or 'brawl' in tag
+                                or 'brawl' in name_txt or 'placement' in name_txt
+                                or 'brawl' in kind or 'placement' in kind)
+                    if not is_brawl:
+                        continue
+                    s = _ts(node, 'start_time')
+                    e = _ts(node, 'end_time')
+                    if s and e and s <= now < e:
+                        return 'brawl'
+            except Exception:
+                pass
+
+        return None
+
+    def _gw_in_active_phase(self):
+        """Return True if a Guild War battle phase is currently active.
+
+        Reads faction_wars_fp3.xml and checks whether the current time
+        falls between the GW battle start and end timestamps.
+        """
+        import xml.etree.ElementTree as _ET
+        import time as _time
+        now = int(_time.time())
+        data_dir = os.path.join(SCRIPT_DIR, 'data') if os.path.isdir(
+            os.path.join(SCRIPT_DIR, 'data')) else SCRIPT_DIR
+        gw_xml = os.path.join(data_dir, 'faction_wars_fp3.xml')
+        if not os.path.isfile(gw_xml):
+            return False
+        try:
+            root = _ET.parse(gw_xml).getroot()
+            for node in (root.findall('.//faction_war')
+                          + root.findall('.//faction_war_event')
+                          + root.findall('.//event')):
+                def _ts(n, f):
+                    val = n.findtext(f) or n.get(f) or '0'
+                    try: return int(val)
+                    except: return 0
+                s = _ts(node, 'start_time')
+                e = _ts(node, 'end_time')
+                if s and e and s <= now < e:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    # ── F→28  Auto: Event + Quest Mission + Arena ─────────────────────────────
+
+    def pvp_auto_event_pipeline(self):
+        """F→28 – Auto-detect active event (Raid/Brawl), then Quest Mission,
+        then Arena.  Works like F→18/F→20 but picks the event phase
+        automatically from local XML files.  GW prep-phase guard: if a Guild
+        War battle phase is currently live, a warning is shown so the user can
+        switch to F→29 (GW pipeline) instead.
+        """
+        print("\n" + "="*65)
+        print("  F→28  AUTO: Event + Quest Mission + Arena")
+        print("="*65)
+
+        # GW prep-phase guard
+        if self._gw_in_active_phase():
+            print("  ⚠  Guild War battle phase is ACTIVE.")
+            print("     Consider using F→29 (GW Auto-Pipeline) instead.")
+            ok = input_with_esc("  Continue anyway? [y/N] ", allow_empty=True)
+            if not ok or ok.strip().lower() not in ('y', 'yes'):
+                print("  Cancelled – use F→29 for GW.")
+                return
+
+        event_type = self._detect_active_event_from_xml()
+        if event_type == 'raid':
+            print("  📡 Active event detected: RAID")
+        elif event_type == 'brawl':
+            print("  📡 Active event detected: BRAWL")
+        else:
+            print("  ℹ  No active event detected from XML.")
+            print("     Will run Quest Mission + Arena only.")
+            ok = input_with_esc("  Continue? [y/N] ", allow_empty=True)
+            if not ok or ok.strip().lower() not in ('y', 'yes'):
+                return
+
+        settings_files = self._collect_settings_files()
+        if not settings_files:
+            print("  ✗ No settings files found")
+            return
+        play_enabled = [f for f in settings_files
+                        if self._load_setting(f, 'play_enabled', True)]
+        if not play_enabled:
+            print("  ✗ No play_enabled accounts found")
+            return
+
+        selected, _loop_mode = self._select_account_range(play_enabled,
+                                                          label="Auto-Event Pipeline")
+        if not selected:
+            return
+
+        # Brawl: always log. Arena: ask once.
+        _brawl_cl = True
+        _cl_a = input_with_esc("  Enable combat log for Arena? [y/N] ", allow_empty=True)
+        _arena_cl = bool(_cl_a and _cl_a.strip().lower().startswith('y'))
+
+        print(f"\n  Accounts  : {len(selected)}")
+        print(f"  Event     : {event_type or 'none'}")
+        print(f"  Phases    : {(event_type or '').capitalize() or ''}{'→ ' if event_type else ''}Quest Mission → Arena")
+        print()
+
+        try:
+            while True:
+                # Re-detect event at the start of every loop pass
+                event_type = self._detect_active_event_from_xml()
+                if event_type == 'raid':
+                    print(f"\n  📡 Event: RAID")
+                elif event_type == 'brawl':
+                    print(f"\n  📡 Event: BRAWL")
+                else:
+                    print(f"\n  ℹ  No active event — Quest Mission + Arena only")
+
+                for nick, sf in zip(
+                        [os.path.basename(f).replace('settings_','').replace('.json','')
+                         for f in selected],
+                        selected):
+                    print(f"\n{'─'*65}")
+                    print(f"  ▶  {nick}")
+                    print(f"{'─'*65}")
+                    try:
+                        tmp = TyrantCommander(sf)
+                        tmp.tuo_threads    = self.tuo_threads
+                        tmp.tuo_order_mode = 'flexible'
+                        if not tmp.initialize(verbose=False):
+                            print("  ✗ Login failed")
+                            continue
+
+                        _active_deck_before = str(
+                            tmp.init_data.get('user_data', {}).get('active_deck', '1'))
+
+                        # Phase 0: Daily Bonus
+                        print("  [DAILY]")
+                        tmp.auto_claim_daily_bonus()
+
+                        # Phase 1: Event (Raid or Brawl)
+                        if event_type == 'raid':
+                            print("\n  [RAID]")
+                            tmp.play_raid_loop(silent=True)
+                        elif event_type == 'brawl':
+                            if tmp.api.settings.get('skip_brawl'):
+                                print("  [BRAWL]  skipped (skip_brawl=true)")
+                            else:
+                                be = int(tmp.init_data.get('user_data', {}).get('battle_energy', 0))
+                                if be > 0:
+                                    print("\n  [BRAWL]")
+                                    tmp.live_sim_brawl(skip_deck_select=True, combat_log=_brawl_cl)
+                                else:
+                                    print("  [BRAWL]  skipped (battle_energy=0)")
+                        else:
+                            # No active event — but check for leftover raid energy
+                            # (raid ended but a level may still be active)
+                            try:
+                                _ri = (tmp.api.call('getRaidInfo') or {}).get('raid_info', {})
+                                _raid_be = 0
+                                for _rdata in (_ri.values() if isinstance(_ri, dict) else []):
+                                    _raid_be = int((_rdata.get('energy') or {}).get('battle_energy', 0))
+                                    if _raid_be > 0:
+                                        break
+                                if _raid_be > 0:
+                                    print(f"\n  [RAID]  draining {_raid_be} leftover energy (event ended)")
+                                    tmp.play_raid_loop(silent=True)
+                            except Exception:
+                                pass
+
+                        # Phase 2: Quest Mission
+                        tmp.initialize(verbose=False)
+                        energy = int(tmp.init_data.get('user_data', {}).get('energy', 0))
+                        if energy > 0:
+                            print("\n  [QUEST]")
+                            tmp.play_first_quest_mission_loop()
+                        else:
+                            print("  [QUEST]  skipped (energy=0)")
+
+                        # Phase 3: Arena (with challenge deck)
+                        tmp.initialize(verbose=False)
+                        stamina = int(tmp.init_data.get('user_data', {}).get('stamina', 0))
+                        if stamina > 0:
+                            print("\n  [ARENA]")
+                            _ch_step, _, _ch_table = tmp._detect_challenge_step()
+                            _card_data = tmp._load_card_data_with_rarity() or {} if _ch_step else {}
+                            _orig, _cmdr = (None, None)
+                            if _ch_step and _card_data:
+                                _orig, _cmdr = tmp._apply_challenge_deck(
+                                    _ch_step, _card_data, challenge_table=_ch_table)
+                                if _orig:
+                                    tmp.initialize(verbose=False)
+                            try:
+                                tmp.live_sim_battle(skip_deck_select=True,
+                                                    combat_log=_arena_cl,
+                                                    focus_unknown=True)
+                            finally:
+                                if _orig:
+                                    tmp._restore_challenge_deck(_orig, _cmdr)
+                        else:
+                            print("  [ARENA]  skipped (stamina=0)")
+
+                        # Restore active deck if shifted
+                        tmp.initialize(verbose=False)
+                        _active_deck_after = str(
+                            tmp.init_data.get('user_data', {}).get('active_deck', '1'))
+                        if _active_deck_after != _active_deck_before:
+                            tmp.api.call('setActiveDeck',
+                                         deck_id=int(_active_deck_before))
+
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:
+                        print(f"  ✗ Account error: {exc}")
+
+                if not _loop_mode:
+                    break
+                print(f"\n{'═'*65}")
+                print("  Loop complete — restarting (Ctrl+C to stop)")
+                print(f"{'═'*65}")
+        except KeyboardInterrupt:
+            print("\n  Stopped by user.")
+
+        print(f"\n{'─'*65}")
+        print("  ✓ Auto-Event Pipeline complete")
+
+    # ── F→29  Auto: Event + Quest Mission + Arena (GW Pipeline) ──────────────
+
+    def pvp_auto_gw_pipeline(self):
+        """F→29 – Like F→28 but also runs the GW Auto-Pipeline when a Guild
+        War battle phase is active.  Order: GW (if active) → Event → Quest
+        Mission → Arena.  GW prep-phase is detected from faction_wars_fp3.xml.
+        """
+        print("\n" + "="*65)
+        print("  F→29  AUTO: Event + Quest Mission + Arena  (GW Pipeline)")
+        print("="*65)
+
+        gw_active = self._gw_in_active_phase()
+        event_type = self._detect_active_event_from_xml()
+
+        if gw_active:
+            print("  ⚔  Guild War battle phase ACTIVE — GW pipeline will run.")
+        else:
+            print("  ℹ  No active GW battle phase detected.")
+        if event_type:
+            print(f"  📡 Active event: {event_type.upper()}")
+        else:
+            print("  ℹ  No active event detected from XML.")
+
+        ok = input_with_esc("  Start pipeline? [y/N] ", allow_empty=True)
+        if not ok or ok.strip().lower() not in ('y', 'yes'):
+            return
+
+        # Phase 0: GW Auto-Pipeline (if battle phase active)
+        if gw_active:
+            print("\n  ── GW Auto-Pipeline ──")
+            try:
+                self.gw_auto_pipeline()
+            except Exception as exc:
+                print(f"  ⚠ GW pipeline error: {exc}")
+
+        # Phases 1-3: delegate to F→28
+        print("\n  ── Event + Quest Mission + Arena ──")
+        self.pvp_auto_event_pipeline()
+
+
     def gw_auto_pipeline(self):
         """
         Guild War Auto-Pipeline.
@@ -8060,7 +8423,7 @@ $(document).ready(function(){
             print("  ✗ No play_enabled accounts found")
             return
 
-        selected = self._select_account_range(play_enabled, label="GW Pipeline")
+        selected, _loop_mode = self._select_account_range(play_enabled, label="GW Pipeline")
         if not selected:
             return
 
@@ -9507,6 +9870,7 @@ $(document).ready(function(){
             "Zealot's Preservation":    'Zealots-Preservation',
             'Superheroism':             'SuperHeroism',
             'Crackdown':                'Crackdown 2',
+            'Overcharged':              'Overload all',
         }
 
         if api_name in _explicit:
@@ -9545,7 +9909,7 @@ $(document).ready(function(){
         return api_name.replace(' ', '-')
 
     def _run_tuo_sim(self, my_deck, enemy_deck, bge_name=None,
-                     sim_count=500, hand_card=None, ordered=False, surge=False, verbose=False, force_ordered=False):
+                     sim_count=500, hand_card=None, ordered=False, surge=False, verbose=False, force_ordered=False, pvp_random=False):
         import subprocess, re as _re
 
 
@@ -9561,7 +9925,11 @@ $(document).ready(function(){
             _oflags = ['flexible', 'flexible-iter', '100']
         else:
             _oflags = ['ordered']
-        cmd = [self._tuo_path, my_deck, enemy_deck, 'surge' if surge else 'pvp', 'no-db', 'no-ml'] + _oflags
+        _pvp_mode = 'surge' if surge else ('pvp', 'random') if pvp_random else 'pvp'
+        _pvp_args = list(_pvp_mode) if isinstance(_pvp_mode, tuple) else [_pvp_mode]
+        # pvp random handles its own ordering — no flexible/ordered flags needed
+        _mode_flags = [] if pvp_random else _oflags
+        cmd = [self._tuo_path, my_deck, enemy_deck] + _pvp_args + ['no-db', 'no-ml'] + _mode_flags
         if bge_name:
             tuo_bge = self._api_bge_to_tuo(bge_name)
             cmd += ['-e', tuo_bge]
@@ -10317,8 +10685,8 @@ $(document).ready(function(){
                         win_pre, _, _ = self._run_tuo_sim(
                             my_deck_pre, deck_str,
                             bge_name=bge_pre or None,
-                            sim_count=10000,
-                            force_ordered=True,
+                            sim_count=50000,
+                            pvp_random=True,
                         )
                         if win_pre is None:
                             print("sim failed – skip")
@@ -13241,7 +13609,7 @@ $(document).ready(function(){
 
     # LEGACY — Forever Loyal PVP Challenge table (Aug 2026 one-time event)
     # Functions _apply_challenge_deck/_restore_challenge_deck are still used for all PvP challenges
-    LOYAL_CHALLENGES = [
+    LOYAL_CHALLENGES = [  # LEGACY (Aug 2026 one-time event)
         # step 1
         {'name': 'Loyal Persecutor',
          'commander': 'Gaia the Purifier',
@@ -13343,21 +13711,31 @@ $(document).ready(function(){
 
     EXTREME_CHALLENGES = [
         # step 1 — Win 10 times
-        {'name': 'Not Extreme - Destroyer', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Not Extreme - Destroyer',
+         'desc': 'Win 10 times in battle', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
         # step 2 — Defeat 20 Progenitor Commanders
-        {'name': 'Not Extreme - Dominion', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Not Extreme - Dominion',
+         'desc': 'Defeat 20 Progenitor Commanders in battles', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
         # step 3 — Win 20 times
-        {'name': 'Slightly Extreme - Destroyer', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Slightly Extreme - Destroyer',
+         'desc': 'Win 20 times in battle', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
         # step 4 — Destroy 100 Progenitor Assault cards
-        {'name': 'Slightly Extreme - Salvager', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Slightly Extreme - Salvager',
+         'desc': 'Destroy 100 Progenitor Assault cards in battles', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
         # step 5 — Win 30 times
-        {'name': 'Extreme - Destroyer', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Extreme - Destroyer',
+         'desc': 'Win 30 times in battle', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
         # step 6 — Destroy 75 Progenitor Structure cards
-        {'name': 'Extreme - Vindicated', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Extreme - Vindicated',
+         'desc': 'Destroy 75 Progenitor Structure cards in battles',
+         'commander': None, 'required': [],
+         'pool': ['Gate Pulser', 'Malediction', 'Anchorage Defender'], 'pool_min': 3},
         # step 7 — Win 40 times
-        {'name': 'Mega Extreme - Destroyer', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        {'name': 'Mega Extreme - Destroyer',
+         'desc': 'Win 40 times in battle', 'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
         # step 8 — Win 40 battles playing 5 Structure cards each
         {'name': 'Mega Extreme - Vindicated',
+         'desc': 'Win 40 battles after playing 5 Structure cards in each',
          'commander': None,
          'required': [],
          'pool': ['Flourish Turbine', 'Mount Pristine Synod', 'SkyCom Perfect',
@@ -13365,16 +13743,19 @@ $(document).ready(function(){
          'pool_min': 5},
         # step 9 — Protect Stormreaver-6 in 10 battles and win
         {'name': 'Not Extreme - Imperial',
+         'desc': 'Protect a Lv. 6 Stormreaver in 10 battles and win',
          'commander': 'Gaia the Purifier',
          'required': ['Stormreaver'],
          'pool': [], 'pool_min': 0},
         # step 10 — Rally Blackrock Driller-6 2x in 20 battles and win
         {'name': 'Slightly Extreme - Imperial',
+         'desc': 'Win 20 battles after Rallying a Lv.6 Blackrock Driller 2 times in each',
          'commander': 'Octane Optimized',
          'required': ['Blackrock Driller'],
          'pool': [], 'pool_min': 0},
         # step 11 — Fortify Tiamat the Destroyer-6 3x in 30 battles and win
         {'name': 'Extreme - Imperial',
+         'desc': 'Win 30 battles after Fortifying a Lv.6 Tiamat the Destroyer 3 times in each',
          'commander': None,
          'required': ['Tiamat the Destroyer'],
          'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
@@ -13382,21 +13763,25 @@ $(document).ready(function(){
          'pool_min': 4},
         # step 12 — Rally Masterwork Aegis-6 4x in 40 battles and win
         {'name': 'Mega Extreme - Imperial',
+         'desc': 'Win 40 battles after Rallying a Lv.6 Masterwork Aegis 4 times in each',
          'commander': 'Octane Optimized',
          'required': ['Masterwork Aegis'],
          'pool': [], 'pool_min': 0},
         # step 13 — Entrap Razor Maiden-6 in 10 battles and win
         {'name': 'Not Extreme - Raider',
+         'desc': 'Entrap a Lv. 6 Razor Maiden in 10 battles and win',
          'commander': 'Octane Optimized',
          'required': ['Razor Maiden'],
          'pool': [], 'pool_min': 0},
         # step 14 — Enrage Demon of Flame-6 2x in 20 battles and win
         {'name': 'Slightly Extreme - Raider',
+         'desc': 'Win 20 battles after Enraging a Lv.6 Demon of Flame 2 times in each',
          'commander': 'Daedalus Charged',
          'required': ['Demon of Flame'],
          'pool': [], 'pool_min': 0},
         # step 15 — Overload Lead Dozer-6 3x in 30 battles and win
         {'name': 'Extreme - Raider',
+         'desc': 'Win 30 battles after Overloading a Lv.6 Lead Dozer 3 times in each',
          'commander': None,
          'required': ['Lead Dozer'],
          'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Metro Monitor',
@@ -13404,11 +13789,13 @@ $(document).ready(function(){
          'pool_min': 2},
         # step 16 — Enrage Havoc Alpha-6 4x in 40 battles and win
         {'name': 'Mega Extreme - Raider',
+         'desc': 'Win 40 battles after Enraging a Lv.6 Havoc Alpha 4 times in each',
          'commander': 'Daedalus Charged',
          'required': ['Havoc Alpha'],
          'pool': [], 'pool_min': 0},
         # step 17 — Fortify Blight Demolisher-6 in 10 battles and win
         {'name': 'Not Extreme - Bloodthirsty',
+         'desc': 'Fortify a Lv. 6 Blight Demolisher in 10 battles and win',
          'commander': None,
          'required': ['Blight Demolisher'],
          'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
@@ -13416,45 +13803,53 @@ $(document).ready(function(){
          'pool_min': 4},
         # step 18 — Heal Draconian Matriarch-6 2x in 20 battles and win
         {'name': 'Slightly Extreme - Bloodthirsty',
+         'desc': 'Win 20 battles after Healing a Lv.6 Draconian Matriarch 2 times in each',
          'commander': 'Malort Blightfather',
          'required': ['Draconian Matriarch'],
          'pool': [], 'pool_min': 0,
          'play_first': 'Draconian Matriarch'},
         # step 19 — Entrap Toxic Tank-6 3x in 30 battles and win
         {'name': 'Extreme - Bloodthirsty',
+         'desc': 'Win 30 battles after Entrapping a Lv.6 Toxic Tank 3 times in each',
          'commander': 'Octane Optimized',
          'required': ['Toxic Tank'],
          'pool': [], 'pool_min': 0},
         # step 20 — Heal Sinew Sticher-6 4x in 40 battles and win
         {'name': 'Mega Extreme - Bloodthirsty',
+         'desc': 'Win 40 battles after Healing a Lv.6 Sinew Sticher 4 times in each',
          'commander': 'Malort Blightfather',
          'required': ['Sinew Sticher'],
          'pool': [], 'pool_min': 0,
          'play_first': 'Sinew Sticher'},
         # step 21 — Protect Unholy Daemon-6 in 10 battles and win
         {'name': 'Not Extreme - Xeno',
+         'desc': 'Protect a Lv. 6 Unholy Daemon in 10 battles and win',
          'commander': 'Gaia the Purifier',
          'required': ['Unholy Daemon'],
          'pool': [], 'pool_min': 0},
         # step 22 — Heal Fleet Mothership-6 2x in 20 battles and win
         {'name': 'Slightly Extreme - Xeno',
+         'desc': 'Win 20 battles after Healing a Lv.6 Fleet Mothership 2 times in each',
          'commander': 'Malort Blightfather',
          'required': ['Fleet Mothership'],
          'pool': [], 'pool_min': 0,
          'play_first': 'Fleet Mothership'},
         # step 23 — Enrage Lurker Horror-6 3x in 30 battles and win
         {'name': 'Extreme - Xeno',
+         'desc': 'Win 30 battles after Enraging a Lv.6 Lurker Horror 3 times in each',
          'commander': 'Daedalus Charged',
          'required': ['Lurker Horror'],
          'pool': [], 'pool_min': 0},
         # step 24 — Heal Stealth Dreadship-6 4x in 40 battles and win
         {'name': 'Mega Extreme - Xeno',
+         'desc': 'Win 40 battles after Healing a Lv.6 Stealth Dreadship 4 times in each',
          'commander': 'Malort Blightfather',
          'required': ['Stealth Dreadship'],
          'pool': [], 'pool_min': 0,
          'play_first': 'Stealth Dreadship'},
         # step 25 — Fortify Divine Equalizer-6 in 10 battles and win
         {'name': 'Not Extreme - Righteous',
+         'desc': 'Fortify a Lv. 6 Divine Equalizer in 10 battles and win',
          'commander': None,
          'required': ['Divine Equalizer'],
          'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
@@ -13462,17 +13857,20 @@ $(document).ready(function(){
          'pool_min': 4},
         # step 26 — Rally Glorious Vigil-6 2x in 20 battles and win
         {'name': 'Slightly Extreme - Righteous',
+         'desc': 'Win 20 battles after Rallying a Lv.6 Glorious Vigil 2 times in each',
          'commander': 'Octane Optimized',
          'required': ['Glorious Vigil'],
          'pool': [], 'pool_min': 0},
         # step 27 — Heal Virulent Falcion-6 3x in 30 battles and win
         {'name': 'Extreme - Righteous',
+         'desc': 'Win 30 battles after Healing a Lv.6 Virulent Falcion 3 times in each',
          'commander': 'Malort Blightfather',
          'required': ['Virulent Falcion'],
          'pool': [], 'pool_min': 0,
          'play_first': 'Virulent Falcion'},
         # step 28 — Rally Contaminant Purge-6 4x in 40 battles and win
         {'name': 'Mega Extreme - Righteous',
+         'desc': 'Win 40 battles after Rallying a Lv.6 Contaminant Purge 4 times in each',
          'commander': 'Octane Optimized',
          'required': ['Contaminant Purge'],
          'pool': [], 'pool_min': 0},
@@ -13482,49 +13880,69 @@ $(document).ready(function(){
     MASTER_ARENA_CHALLENGES = [
         # step 1 — Win 20 Battles (no deck restrictions)
         {'name': 'Arena: Shard Hunter',
+         'desc': 'Win 20 Arena Battles to hunt for Shards',
+         'pvp': {'type_id': 5, 'wins': 20},
          'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
         # step 2 — Win 5 Battles using 4 Imperial Assaults
         {'name': 'Arena: Imperial Captain',
+         'desc': 'Win 5 Arena Battles using 4 Imperial Assaults',
+         'pvp': {'type_id': 3, 'faction': 1, 'wins': 5},
          'commander': None, 'required': [],
          'pool': ['Surveillance UAV', 'Avalonian Sheriff', 'Forward Engineer', "Halcyon's APC"],
          'pool_min': 6},
         # step 3 — Win 5 Battles using 4 Raider Assaults
         {'name': 'Arena: Raider Captain',
+         'desc': 'Win 5 Arena Battles using 4 Raider Assaults',
+         'pvp': {'type_id': 3, 'faction': 2, 'wins': 5},
          'commander': None, 'required': [],
          'pool': ['Rebel Ranger', 'Forgeborn Immortal', 'Zed the Persecutor', "Vlade's Meathook"],
          'pool_min': 6},
         # step 4 — Win 5 Battles using 4 Bloodthirsty Assaults
         {'name': 'Arena: Bloodthirsty Captain',
+         'desc': 'Win 5 Arena Battles using 4 Bloodthirsty Assaults',
+         'pvp': {'type_id': 3, 'faction': 3, 'wins': 5},
          'commander': None, 'required': [],
          'pool': ['Ghoulish Specter', 'Tongues of Tirlok', 'Kraken of Terror', 'Insatiable Gastobront'],
          'pool_min': 6},
         # step 5 — Win 5 Battles using 4 Xeno Assaults
         {'name': 'Arena: Xeno Captain',
+         'desc': 'Win 5 Arena Battles using 4 Xeno Assaults',
+         'pvp': {'type_id': 3, 'faction': 4, 'wins': 5},
          'commander': None, 'required': [],
          'pool': ['Ikadri Rex', 'Raxil Cultivator', 'Vengeful Spectre', 'Mezarkos of Thule'],
          'pool_min': 6},
         # step 6 — Win 5 Battles using 4 Righteous Assaults
         {'name': 'Arena: Righteous Captain',
+         'desc': 'Win 5 Arena Battles using 4 Righteous Assaults',
+         'pvp': {'type_id': 3, 'faction': 5, 'wins': 5},
          'commander': None, 'required': [],
          'pool': ["Gaia's Strategist", 'Devoted Adept', "Constantine's Cheetah",
                   'Sanctuary Warden', 'Triton Monarch'],
          'pool_min': 6},
         # step 7 — Win 15 Battles (no deck restrictions)
         {'name': 'Arena: Improve your Rank II',
+         'desc': 'Win 15 Arena Battles to improve your rank',
+         'pvp': {'type_id': 5, 'wins': 15},
          'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
         # step 8 — Win 15 Battles (no deck restrictions)
         {'name': 'Arena: Vindicated II',
+         'desc': 'Win 15 Arena Battles for Vindicator Stacks',
+         'pvp': {'type_id': 5, 'wins': 15},
          'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
     ]
 
     CUTLASS_CHALLENGES = [
         # step 1 — Rally Vigil-6 in 10 battles and win
         {'name': 'Cutlass I',
+         'desc': 'Rally a Lv. 6 Vigil in 10 battles and win',
+         'pvp': {'type_id': 6, 'card_id': 157, 'skill': 'rally', 'wins': 10},
          'commander': 'Octane Optimized',
          'required': ['Vigil'],
          'pool': [], 'pool_min': 0},
         # step 2 — Fortify Cutlass-6 in 25 battles and win
         {'name': 'Cutlass II',
+         'desc': 'Fortify a Lv. 6 Cutlass in 25 battles and win',
+         'pvp': {'type_id': 6, 'card_id': 271, 'skill': 'fortify', 'wins': 25},
          'commander': None,
          'required': ['Cutlass'],
          'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
@@ -13532,13 +13950,305 @@ $(document).ready(function(){
          'pool_min': 4},
         # step 3 — Entrap Cutlass Jagged-6 in 50 battles and win
         {'name': 'Cutlass III',
+         'desc': 'Entrap a Lv. 6 Cutlass Jagged in 50 battles and win',
+         'pvp': {'type_id': 6, 'card_id': 277, 'skill': 'entrap', 'wins': 50},
          'commander': 'Octane Optimized',
-         'required': ['Cutlass'],
+         'required': ['Cutlass Jagged'],
          'pool': [], 'pool_min': 0},
         # step 4 — Protect Cutlass Jag-6 in 75 battles and win
         {'name': 'Cutlass IV',
+         'desc': 'Protect a Lv. 6 Cutlass Jag in 75 battles and win',
+         'pvp': {'type_id': 6, 'card_id': 283, 'skill': 'protect', 'wins': 75},
          'commander': 'Gaia the Purifier',
-         'required': ['Cutlass'],
+         'required': ['Cutlass Jag'],
+         'pool': [], 'pool_min': 0},
+    ]
+
+    # ── Enter the Arena PVP Challenge (parent 3201) ──────────────────────────────
+    ENTER_THE_ARENA_CHALLENGES = [
+        # step 1 — Deal 2000 attack damage
+        {'name': 'Arena: Shard Finder',
+         'desc': 'Deal 2000 attack damage in Arena Battles to win Shard Stacks',
+         'pvp': {'type_id': 2, 'skill': 0, 'value': 2000},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 2 — Heal 50x
+        {'name': 'Arena: Imperial Healer',
+         'desc': 'Activate Heal 50 times in Battles to win a Nimbus',
+         'pvp': {'type_id': 1, 'skill': 'heal', 'value': 50},
+         'commander': 'Malort Blightfather', 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 3 — Strike 50x
+        {'name': 'Arena: Raider Striker',
+         'desc': 'Activate Strike 50 times in Battles to win an Omega',
+         'pvp': {'type_id': 1, 'skill': 'strike', 'value': 50},
+         'commander': 'Insurgent Malika', 'required': ['The Revered'],
+         'pool': [], 'pool_min': 0},
+        # step 4 — Berserk 50x
+        {'name': 'Arena: Bloodthirsty Berserker',
+         'desc': 'Activate Berserk 50 times in Battles to win a Malgoth',
+         'pvp': {'type_id': 1, 'skill': 'berserk', 'value': 50},
+         'commander': None, 'required': [],
+         'pool': ['Tongues of Tirlok', 'Razorsharp Hydroblade', 'Yobedyssseus', 'Primal Yeren'],
+         'pool_min': 3},
+        # step 5 — Enfeeble 50x
+        {'name': 'Arena: Xeno Enfeebler',
+         'desc': 'Activate Enfeeble 50 times in Battles to win an Apex',
+         'pvp': {'type_id': 1, 'skill': 'enfeeble', 'value': 50},
+         'commander': 'Malort Blightfather', 'required': ["Vlade's Meathook"],
+         'pool': [], 'pool_min': 0},
+        # step 6 — Rally 50x
+        {'name': 'Arena: Righteous Rallier',
+         'desc': 'Activate Rally 50 times in Battles to win a Benediction',
+         'pvp': {'type_id': 1, 'skill': 'rally', 'value': 50},
+         'commander': 'Octane Optimized', 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 7 — Deal 1500 attack damage
+        {'name': 'Arena: Improve your Rank',
+         'desc': 'Deal 1500 attack damage in Arena Battles',
+         'pvp': {'type_id': 2, 'skill': 0, 'value': 1500},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 8 — Deal 1500 attack damage
+        {'name': 'Arena: Vindicated',
+         'desc': 'Deal 1500 attack damage in Arena Battles',
+         'pvp': {'type_id': 2, 'skill': 0, 'value': 1500},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+    ]
+
+    # ── Orbo Underground PVP Challenge (parent 3261) ─────────────────────────────
+    MYTHIC_ORBO_ID = 58573  # card_id of the Mythic-rarity Orbo card
+    ORBO_UNDERGROUND_CHALLENGES = [
+        # step 1 — Win 5 battles
+        {'name': 'Arena: Acquire the Orbo',
+         'desc': 'Win 5 Arena Battles to acquire a Blue Shard',
+         'pvp': {'type_id': 5, 'wins': 5},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 2 — Protect Orbo (card 58573) in 20 battles
+        {'name': 'Arena: Shard Collector',
+         'desc': 'Protect Orbo in 20 Arena Battles to collect more Shards',
+         'pvp': {'type_id': 6, 'card_id': 58573, 'skill': 'protect', 'wins': 20},
+         'commander': 'Gaia the Purifier', 'required': ['Orbo'], 'required_id': [58573],
+         'pool': [], 'pool_min': 0},
+        # step 3 — Rally Orbo in 5 battles
+        {'name': 'Arena: Imperial Commander',
+         'desc': 'Rally Orbo in 5 Arena Battles to win Imperial Shards',
+         'pvp': {'type_id': 6, 'card_id': 58573, 'skill': 'rally', 'wins': 5},
+         'commander': 'Octane Optimized', 'required': ['Orbo'], 'required_id': [58573],
+         'pool': [], 'pool_min': 0},
+        # step 4 — Protect Orbo in 5 battles
+        {'name': 'Arena: Raider Commander',
+         'desc': 'Protect Orbo in 5 Arena Battles to win Raider Shards',
+         'pvp': {'type_id': 6, 'card_id': 58573, 'skill': 'protect', 'wins': 5},
+         'commander': 'Gaia the Purifier', 'required': ['Orbo'], 'required_id': [58573],
+         'pool': [], 'pool_min': 0},
+        # step 5 — Enrage Orbo in 5 battles
+        {'name': 'Arena: Bloodthirsty Commander',
+         'desc': 'Enrage Orbo in 5 Arena Battles to win Bloodthirsty Shards',
+         'pvp': {'type_id': 6, 'card_id': 58573, 'skill': 'enrage', 'wins': 5},
+         'commander': 'Daedalus Charged', 'required': ['Orbo'], 'required_id': [58573],
+         'pool': [], 'pool_min': 0},
+        # step 6 — Entrap Orbo in 5 battles
+        {'name': 'Arena: Xeno Commander',
+         'desc': 'Entrap Orbo in 5 Arena Battles to win Xeno Shards',
+         'pvp': {'type_id': 6, 'card_id': 58573, 'skill': 'entrap', 'wins': 5},
+         'commander': 'Octane Optimized', 'required': ['Orbo'], 'required_id': [58573],
+         'pool': [], 'pool_min': 0},
+        # step 7 — Fortify Orbo in 5 battles
+        {'name': 'Arena: Righteous Commander',
+         'desc': 'Fortify Orbo in 5 Arena Battles to win Righteous Shards',
+         'pvp': {'type_id': 6, 'card_id': 58573, 'skill': 'fortify', 'wins': 5},
+         'commander': None, 'required': ['Orbo'], 'required_id': [58573],
+         'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+                  'Impurity Arrester', 'Restore Sequencer'],
+         'pool_min': 4},
+        # step 8 — Win 5 battles with 4 Progenitor Assaults
+        {'name': 'Arena: Blue Shards?',
+         'desc': 'Win 5 Arena Battles using 4 Progenitor Assault cards',
+         'pvp': {'type_id': 3, 'faction': 6, 'wins': 5},
+         'commander': None, 'required': [],
+         'pool': ['Zashikinoz', 'The Mass', 'Primal Yeren', 'Leriax Putrefier'],
+         'pool_min': 6},
+        # step 9 — Protect Gilian Shardkeeper (card 65699) in 15 battles
+        {'name': 'Arena: I am FREE!',
+         'desc': 'Protect Gilian Shardkeeper in 15 Arena Battles to free the Shards',
+         'pvp': {'type_id': 6, 'card_id': 65699, 'skill': 'protect', 'wins': 15},
+         'commander': 'Gaia the Purifier', 'required': ['Gilian Shardkeeper'],
+         'pool': [], 'pool_min': 0},
+        # step 10 — Rally Gilian in 15 battles
+        {'name': 'Arena: Lets free Zorbo!',
+         'desc': 'Rally Gilian Shardkeeper in 15 Arena Battles',
+         'pvp': {'type_id': 6, 'card_id': 65699, 'skill': 'rally', 'wins': 15},
+         'commander': 'Octane Optimized', 'required': ['Gilian Shardkeeper'],
+         'pool': [], 'pool_min': 0},
+        # step 11 — Entrap Gilian in 15 battles
+        {'name': 'Arena: Yay, Orbo the Wrathful!',
+         'desc': 'Entrap Gilian Shardkeeper in 15 Arena Battles',
+         'pvp': {'type_id': 6, 'card_id': 65699, 'skill': 'entrap', 'wins': 15},
+         'commander': 'Octane Optimized', 'required': ['Gilian Shardkeeper'],
+         'pool': [], 'pool_min': 0},
+        # step 12 — Heal Gilian in 15 battles
+        {'name': 'Arena: Ouch, that HURTS!',
+         'desc': 'Heal Gilian Shardkeeper in 15 Arena Battles',
+         'pvp': {'type_id': 6, 'card_id': 65699, 'skill': 'heal', 'wins': 15},
+         'commander': 'Malort Blightfather', 'required': ['Gilian Shardkeeper'],
+         'pool': [], 'pool_min': 0},
+    ]
+
+    # ── Dominate the Arena PVP Challenge (parent 3289) ───────────────────────────
+    DOMINATE_THE_ARENA_CHALLENGES = [
+        # step 1 — Destroy 15 Structures
+        {'name': 'Arena: Structural Test',
+         'desc': 'Destroy 15 Structures in Arena Battles to win Boneforge Stacks',
+         'pvp': {'type_id': 4, 'target': 'structure', 'value': 15},
+         'commander': None, 'required': [],
+         'pool': ['Gate Pulser', 'Malediction', 'Anchorage Defender'],
+         'pool_min': 3},
+        # step 2 — Win 20 battles
+        {'name': 'Arena: Shard Hoarder',
+         'desc': 'Win 20 Arena Battles to hoard more Shards',
+         'pvp': {'type_id': 5, 'wins': 20},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 3 — Destroy 15 Imperial Assaults
+        {'name': 'Arena: Imperial Dominator',
+         'desc': 'Destroy 15 Imperial Assault cards in Arena Battles',
+         'pvp': {'type_id': 4, 'target': 'imperial', 'value': 15},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 4 — Destroy 15 Raider Assaults
+        {'name': 'Arena: Raider Dominator',
+         'desc': 'Destroy 15 Raider Assault cards in Arena Battles',
+         'pvp': {'type_id': 4, 'target': 'raider', 'value': 15},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 5 — Destroy 15 Bloodthirsty Assaults
+        {'name': 'Arena: Bloodthirsty Dominator',
+         'desc': 'Destroy 15 Bloodthirsty Assault cards in Arena Battles',
+         'pvp': {'type_id': 4, 'target': 'bt', 'value': 15},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 6 — Destroy 15 Xeno Assaults
+        {'name': 'Arena: Xeno Dominator',
+         'desc': 'Destroy 15 Xeno Assault cards in Arena Battles',
+         'pvp': {'type_id': 4, 'target': 'xeno', 'value': 15},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 7 — Destroy 15 Righteous Assaults
+        {'name': 'Arena: Righteous Dominator',
+         'desc': 'Destroy 15 Righteous Assault cards in Arena Battles',
+         'pvp': {'type_id': 4, 'target': 'righteous', 'value': 15},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 8 — Destroy 25 Assaults
+        {'name': 'Arena: Improve your Rank IV',
+         'desc': 'Destroy 25 Assault cards in Arena Battles',
+         'pvp': {'type_id': 4, 'target': 'assault', 'value': 25},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 9 — Destroy 25 Structures
+        {'name': 'Arena: Vindicated IV',
+         'desc': 'Destroy 25 Structures for 4 Vindicator Reactors',
+         'pvp': {'type_id': 4, 'target': 'structure', 'value': 25},
+         'commander': None, 'required': [],
+         'pool': ['Gate Pulser', 'Malediction', 'Anchorage Defender'],
+         'pool_min': 3},
+    ]
+
+    # ── Progenitor Requiem PVP Challenge (parent 3301) ───────────────────────────
+    PROGENITOR_REQUIEM_CHALLENGES = [
+        # step 1 — Win 25 battles with 4 Progenitors
+        {'name': 'Progenitor Reactor',
+         'desc': 'Win 25 battles using 4 Progenitor Assault cards',
+         'pvp': {'type_id': 3, 'faction': 6, 'wins': 25},
+         'commander': None, 'required': [],
+         'pool': ['Zashikinoz', 'The Mass', 'Primal Yeren', 'Leriax Putrefier'],
+         'pool_min': 6},
+        # step 2 — Corrosive 300x
+        {'name': 'Progenitor Winsalvo',
+         'desc': 'Activate Corrosive 300 times in battles',
+         'pvp': {'type_id': 1, 'skill': 'corrosive', 'value': 300},
+         'commander': None, 'required': [],
+         'pool': ['Insatiable Gastrobront', 'Ezamit Tranq'],
+         'pool_min': 3},
+        # step 3 — Fortify 300x
+        {'name': 'Progenitor Arcadia',
+         'desc': 'Activate Fortify 300 times in battles',
+         'pvp': {'type_id': 1, 'skill': 'fortify', 'value': 300},
+         'commander': None, 'required': [],
+         'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+                  'Impurity Arrester', 'Restore Sequencer'],
+         'pool_min': 4},
+        # step 4 — Heal 300x
+        {'name': 'Progenitor Farsyo',
+         'desc': 'Activate Heal 300 times in battles',
+         'pvp': {'type_id': 1, 'skill': 'heal', 'value': 300},
+         'commander': 'Malort Blightfather', 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 5 — Swipe 300x
+        {'name': 'Progenitor Metronome',
+         'desc': 'Activate Swipe 300 times in battles',
+         'pvp': {'type_id': 1, 'skill': 'swipe', 'value': 300},
+         'commander': None, 'required': [],
+         'pool': ['Rebel Ranger', 'Mezarkos of Thule', "Halcyon's Regiment",
+                  'Igniting Cargo', 'Skydrop Pyxis'],
+         'pool_min': 3},
+        # step 6 — Coalition 300x (max 1 of each)
+        {'name': 'Progenitor Mahabharata',
+         'desc': 'Activate Coalition 300 times in battles',
+         'pvp': {'type_id': 1, 'skill': 'coalition', 'value': 300},
+         'commander': None, 'required': [],
+         'pool': ['Prixis Worldbender', 'Co-operated Crawler', 'Peacekeeper Unifier',
+                  "Yurich's Grunt", 'Infesting Mass', "Slaver's Enfeebler"],
+         'pool_min': 6,
+         'pool_unique': True},
+        # step 7 — Destroy 100 Progenitor Assaults
+        {'name': 'Progenitor Reactor II',
+         'desc': 'Destroy 100 Progenitor Assault cards in battles',
+         'pvp': {'type_id': 4, 'target': 'progenitor', 'value': 100},
+         'commander': None, 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 8 — Weaken 750x
+        {'name': 'Progenitor Veles',
+         'desc': 'Activate Weaken 750 times in battles',
+         'pvp': {'type_id': 1, 'skill': 'weaken', 'value': 750},
+         'commander': 'Gaia the Purifier', 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 9 — Leech 500x
+        {'name': 'Progenitor Omnipulse',
+         'desc': 'Activate Leech 500 times in battles',
+         'pvp': {'type_id': 1, 'skill': 'leech', 'value': 500},
+         'commander': None, 'required': [],
+         'pool': ['Kraken of Terror', 'Spiteful Raptor'],
+         'pool_min': 3},
+        # step 10 — Overload 300x
+        {'name': 'Progenitor Prophet',
+         'desc': 'Activate Overload 300 times in battles',
+         'pvp': {'type_id': 1, 'skill': 'overload', 'value': 300},
+         'commander': None, 'required': [],
+         'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Metro Monitor',
+                  'Veles Shapeshifter', "Yurich's Toeslasher", 'Tengri Godhammer'],
+         'pool_min': 2},
+        # step 11 — Mimic 375x
+        {'name': 'Progenitor Ra',
+         'desc': 'Activate Mimic 375 times in battles',
+         'pvp': {'type_id': 1, 'skill': 'mimic', 'value': 375},
+         'commander': 'Serapherus the Blade', 'required': [],
+         'pool': [], 'pool_min': 0},
+        # step 12 — Poison 7500 damage
+        {'name': 'Progenitor Xixod',
+         'desc': 'Deal 7500 Poison damage in battles',
+         'pvp': {'type_id': 1, 'skill': 'poison', 'value': 7500},
+         'commander': None, 'required': [],
+         'pool': ['Narscious the Eerie', 'Shatterbone Cyclops'],
+         'pool_min': 3},
+        # step 13 — Deal 15000 damage
+        {'name': 'Progenitor Reactor III',
+         'desc': 'Deal 15000 attack damage in battles',
+         'pvp': {'type_id': 2, 'skill': 0, 'value': 15000},
+         'commander': None, 'required': [],
          'pool': [], 'pool_min': 0},
     ]
 
@@ -13697,13 +14407,13 @@ $(document).ready(function(){
             # so the Gold→SP workflow triggers automatically if SP is insufficient
             print(f"  ⚙  Upgrading {name} from L{owned_xml} to L{max_xml} via build_card...")
             try:
-                import builtins as _bi_ens
-                _orig_inp_ens = _bi_ens.input
-                _bi_ens.input = lambda _p='': 'yes'
+                import sys as _sys_ens
+                _mod = _sys_ens.modules[__name__]
+                _mod._AUTO_CONFIRM_INPUT = True
                 try:
                     result = self.build_card(f"{name}-{max_xml}")
                 finally:
-                    _bi_ens.input = _orig_inp_ens
+                    _mod._AUTO_CONFIRM_INPUT = False
                 if result is False:
                     print(f"  ✗ build_card upgrade failed for {name}")
                     return None
@@ -13721,13 +14431,13 @@ $(document).ready(function(){
         # Not in inventory at all — use build_card
         print(f"  ⚙  Building {name} from scratch via build_card...")
         try:
-            import builtins as _bi_ens2
-            _orig_inp_ens2 = _bi_ens2.input
-            _bi_ens2.input = lambda _p='': 'yes'
+            import sys as _sys_ens2
+            _mod2 = _sys_ens2.modules[__name__]
+            _mod2._AUTO_CONFIRM_INPUT = True
             try:
                 result = self.build_card(name)
             finally:
-                _bi_ens2.input = _orig_inp_ens2
+                _mod2._AUTO_CONFIRM_INPUT = False
             if result is False:
                 print(f"  ✗ build_card failed for {name}")
                 return None
@@ -13871,23 +14581,19 @@ $(document).ready(function(){
                     max_lvl2  = (max_info2.get('xml_level') or max_info2.get('level', 6)
                                  if isinstance(max_info2, dict) else 6)
                     # Capture output to detect SP vs material failure; suppress prompts
-                    import builtins as _bi, sys as _sys, io as _io
-                    _orig_input = _bi.input
-                    _bi.input = lambda _p='': (print(f"  [auto] {_p}YES"), 'yes')[1]
-                    _orig_confirm = _sys.modules[__name__].__dict__.get('confirm_action')
-                    _sys.modules[__name__].__dict__['confirm_action'] = lambda _p='': True
+                    import sys as _sys_pool, io as _io
+                    _mod_pool = _sys_pool.modules[__name__]
                     _cap = _io.StringIO()
-                    _orig_stdout = _sys.stdout
-                    _sys.stdout = _cap
+                    _orig_stdout = _sys_pool.stdout
+                    _sys_pool.stdout = _cap
+                    _mod_pool._AUTO_CONFIRM_INPUT = True
                     try:
                         result = self.build_card(f"{card_name}-{max_lvl2}")
                     finally:
-                        _sys.stdout = _orig_stdout
+                        _sys_pool.stdout = _orig_stdout
                         _build_output = _cap.getvalue()
                         print(_build_output, end='')  # show output normally
-                        _bi.input = _orig_input
-                        if _orig_confirm is not None:
-                            _sys.modules[__name__].__dict__['confirm_action'] = _orig_confirm
+                        _mod_pool._AUTO_CONFIRM_INPUT = False
                     if result is False:
                         print(f"  ✗ build_card failed for additional {card_name}")
                         break
@@ -20294,7 +21000,7 @@ $(document).ready(function(){
     def claim_event_rewards(self):
         """
         Claims rewards for the current weekly event.
-        Tries claimBrawlRewards -> claimRaidRewards -> claimGuildwarRewards -> claimRewards
+        Tries claimBrawlRewards -> claimRaidReward -> claimFactionWarRewards -> claimRewards
         in order and uses whichever succeeds.
         """
         try:
@@ -23432,7 +24138,14 @@ def confirm_action(prompt):
         True if Enter pressed (YES), False if ESC or q (NO)
     """
     import sys
-    
+    # Auto-confirm: used by pipeline deck builds to suppress prompts
+    import sys as _sys_ca
+    _mod_ca = _sys_ca.modules.get(__name__) or _sys_ca.modules.get('__main__')
+    if getattr(_mod_ca, '_AUTO_CONFIRM_INPUT', False):
+        print(f"{prompt}")
+        print("  [auto: YES]")
+        return True
+
     print(f"{prompt}")
     print("  [Enter] = YES  |  [ESC/q] = NO")
     print("  ", end='', flush=True)
@@ -23591,6 +24304,9 @@ Examples:
     input("\n[ENTER] to continue...")
 
 
+# Auto-confirm flag: set True during automated pipeline builds to suppress prompts
+_AUTO_CONFIRM_INPUT = False
+
 def input_with_esc(prompt, allow_empty=False):
     """
     Input function with ESC support for cancellation and full text editing
@@ -23602,6 +24318,12 @@ def input_with_esc(prompt, allow_empty=False):
     Returns:
         Input string or None if ESC was pressed
     """
+    # Auto-confirm: used by pipeline deck builds to suppress prompts
+    global _AUTO_CONFIRM_INPUT
+    if _AUTO_CONFIRM_INPUT:
+        print(f"{prompt}[auto: yes]")
+        return 'yes'
+
     print(f"{prompt}", end='', flush=True)
     
     # Windows support with full editing
@@ -24654,6 +25376,14 @@ def interactive_menu():
             cl = input_with_esc("  Combat log? [y=yes / Enter=no]: ", allow_empty=True)
             if cl is not None: commander.live_sim_guildwar(combat_log=(cl.strip().lower().startswith('y')))
         elif choice == "36c":
+            if commander._gw_in_active_phase():
+                print("\n  ⚔  GW battle phase is ACTIVE — starting Multi-Account GW.")
+            else:
+                print("\n  ℹ  No active GW battle phase detected from faction_wars_fp3.xml.")
+                ok_gw = input_with_esc("  Continue anyway? [y/N] ", allow_empty=True)
+                if not ok_gw or ok_gw.strip().lower() not in ('y', 'yes'):
+                    print("  Cancelled.")
+                    return
             commander.multi_account_live_sim(mode='gwar'); input("\n[ENTER] to continue...")
         elif choice == "37":
             commander.clear_old_gauntlet_entries(); input("\n[ENTER] to continue...")
@@ -24685,6 +25415,10 @@ def interactive_menu():
             commander.refill_arena_stamina(); input("\n[ENTER] to continue...")
         elif choice == '27':
             commander.refill_arena_stamina(); input("\n[ENTER] to continue...")
+        elif choice in ('28', 'auto_event'):
+            commander.pvp_auto_event_pipeline(); input("\n[ENTER] to continue...")
+        elif choice in ('29', 'auto_gw_event'):
+            commander.pvp_auto_gw_pipeline(); input("\n[ENTER] to continue...")
         elif choice == "41":
             commander.export_starterdecks(slot='1', mode='arena'); input("\n[ENTER] to continue...")
         elif choice == "42":
@@ -24977,8 +25711,10 @@ def interactive_menu():
             '25': 'enlog',   # Energy Tracker
             '26': 'daily_all',  # Claim Daily Reward – All Accounts
             '27': 'refill_stamina',  # Refill Arena Stamina
+            '28': 'auto_event',       # Auto: Event + Quest Mission + Arena
+            '29': 'auto_gw_event',    # Auto: Event + Quest Mission + Arena (GW Pipeline)
         }
-        _multi_opts = {'14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25', '26'}
+        _multi_opts = {'14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25', '26', '28', '29'}
         while True:
             print("\n" + "="*52)
             print("  AUTOMATION & BATTLE")
@@ -24996,7 +25732,6 @@ def interactive_menu():
             print(" 11.   Guild War Summary from JSON files")
             print(" 12.   Guild War Auto-Pipeline 🚀")
             print(" 13.   Claim Daily Reward")
-            print(" 14.   Refill Arena Stamina")
             if _multi:
                 print("─"*52)
                 print(" 14.   Claim Rewards – All Accounts")
@@ -25013,6 +25748,8 @@ def interactive_menu():
                 print(" 25.   Energy Tracker (hourly log – Brawl/Mission/Arena)")
                 print(" 26.   Claim Daily Reward – All Accounts")
                 print(" 27.   Refill Arena Stamina")
+                print(" 28.   Auto: Event + Quest Mission + Arena")
+                print(" 29.   Auto: Event + Quest Mission + Arena  (GW Pipeline)")
             print("─"*52)
             print("  0.   ← Back to Main Menu")
             print("="*52)
