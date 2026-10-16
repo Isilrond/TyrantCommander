@@ -8218,6 +8218,21 @@ $(document).ready(function(){
             print("  ✗ No play_enabled accounts found")
             return
 
+        # ── TUO threads prompt ────────────────────────────────────────
+        t_in = input_with_esc(
+            f"\n  TUO threads (-t), current={self.tuo_threads} (Enter=keep, ESC=Cancel): ",
+            allow_empty=True)
+        if t_in is None:
+            return
+        if t_in.strip():
+            try:
+                t_val = int(t_in.strip())
+                if 1 <= t_val <= 128:
+                    self.tuo_threads = t_val
+                    print(f"  ✓ TUO threads set to {t_val}")
+            except ValueError:
+                pass
+
         selected, _loop_mode = self._select_account_range(play_enabled,
                                                           label="Auto-Event Pipeline")
         if not selected:
@@ -8281,17 +8296,30 @@ $(document).ready(function(){
                                 else:
                                     print("  [BRAWL]  skipped (battle_energy=0)")
                         else:
-                            # No active event — but check for leftover raid energy
-                            # (raid ended but a level may still be active)
+                            # No active event in local XML (may be stale) —
+                            # check getRaidInfo directly: covers both a freshly-started
+                            # raid the XML hasn't caught yet AND genuinely leftover energy.
                             try:
-                                _ri = (tmp.api.call('getRaidInfo') or {}).get('raid_info', {})
-                                _raid_be = 0
+                                import time as _t
+                                _ri_resp = tmp.api.call('getRaidInfo') or {}
+                                _ri = _ri_resp.get('raid_info', {})
+                                _raid_be  = 0
+                                _raid_end = 0
                                 for _rdata in (_ri.values() if isinstance(_ri, dict) else []):
                                     _raid_be = int((_rdata.get('energy') or {}).get('battle_energy', 0))
+                                    # end_time may live at event level or top-level of rdata
+                                    _raid_end = int(
+                                        (_rdata.get('event') or {}).get('end_time', 0) or
+                                        _rdata.get('end_time', 0) or 0)
                                     if _raid_be > 0:
                                         break
                                 if _raid_be > 0:
-                                    print(f"\n  [RAID]  draining {_raid_be} leftover energy (event ended)")
+                                    _now = int(_t.time())
+                                    if _raid_end and _raid_end > _now:
+                                        # Raid is actually still active — XML was stale
+                                        print(f"\n  [RAID]  {_raid_be} energy  (active raid – XML was stale)")
+                                    else:
+                                        print(f"\n  [RAID]  draining {_raid_be} leftover energy (event ended)")
                                     tmp.play_raid_loop(silent=True)
                             except Exception:
                                 pass
@@ -8306,25 +8334,20 @@ $(document).ready(function(){
                             print("  [QUEST]  skipped (energy=0)")
 
                         # Phase 3: Arena (with challenge deck)
+                        # Challenge deck is applied inside live_sim_battle,
+                        # directly before the first startHuntingBattle call.
                         tmp.initialize(verbose=False)
                         stamina = int(tmp.init_data.get('user_data', {}).get('stamina', 0))
                         if stamina > 0:
                             print("\n  [ARENA]")
                             _ch_step, _, _ch_table = tmp._detect_challenge_step()
                             _card_data = tmp._load_card_data_with_rarity() or {} if _ch_step else {}
-                            _orig, _cmdr = (None, None)
-                            if _ch_step and _card_data:
-                                _orig, _cmdr = tmp._apply_challenge_deck(
-                                    _ch_step, _card_data, challenge_table=_ch_table)
-                                if _orig:
-                                    tmp.initialize(verbose=False)
-                            try:
-                                tmp.live_sim_battle(skip_deck_select=True,
-                                                    combat_log=_arena_cl,
-                                                    focus_unknown=True)
-                            finally:
-                                if _orig:
-                                    tmp._restore_challenge_deck(_orig, _cmdr)
+                            tmp.live_sim_battle(skip_deck_select=True,
+                                                combat_log=_arena_cl,
+                                                focus_unknown=True,
+                                                challenge_step=_ch_step or None,
+                                                challenge_card_data=_card_data or None,
+                                                challenge_table=_ch_table or None)
                         else:
                             print("  [ARENA]  skipped (stamina=0)")
 
@@ -10499,7 +10522,8 @@ $(document).ready(function(){
         else:
             print("  -> 🔴 Difficult matchup")
 
-    def live_sim_battle(self, skip_deck_select=False, combat_log=False, focus_unknown=False):
+    def live_sim_battle(self, skip_deck_select=False, combat_log=False, focus_unknown=False,
+                        challenge_step=None, challenge_card_data=None, challenge_table=None):
         """Live Sim Battle with full debug output. Loops until stamina is empty."""
         import traceback as _tb
 
@@ -10585,6 +10609,11 @@ $(document).ready(function(){
             else:
                 print("  ⚠ Could not disable autopilot – API collisions may occur")
 
+        # ── Challenge deck: applied once, directly before first battle ──
+        _ch_orig        = None   # original card list for restore
+        _ch_cmdr        = None   # original commander id for restore
+        _ch_applied     = False  # applied at most once per session
+
         while True:
 
             # ── Refresh targets ──────────────────────────────────────
@@ -10662,7 +10691,45 @@ $(document).ready(function(){
 
             if sel == '':
                 # ── Auto-select priority logic ───────────────────────
-                my_deck_pre = self._build_active_deck_str(card_data)
+
+                # Apply challenge deck BEFORE pre-sim so the correct
+                # commander + challenge cards are used in the simulation.
+                # This mirrors what actually gets played in the battle.
+                # _ch_applied guards ensure it only happens once per session.
+                if challenge_step and challenge_card_data and not _ch_applied:
+                    _ch_orig, _ch_cmdr = self._apply_challenge_deck(
+                        challenge_step, challenge_card_data,
+                        challenge_table=challenge_table)
+                    _ch_applied = True
+                    _ch_ok = self._verify_challenge_deck(
+                        challenge_step, challenge_card_data,
+                        challenge_table=challenge_table)
+                    if not _ch_ok:
+                        print("  ✗ Challenge deck verification FAILED — aborting arena session")
+                        break
+                    # init_data is now refreshed by _verify_challenge_deck →
+                    # my_deck_pre will be built from the correct challenge deck below.
+
+                # Build pre-sim deck from the (now possibly updated) arena slot.
+                # Always read directly from the slot so commander + cards are current.
+                _arena_deck_info = self.init_data.get('user_decks', {}).get(_arena_slot, {})
+                if _arena_deck_info:
+                    _adc = _arena_deck_info.get('commander_id')
+                    _add = _arena_deck_info.get('dominion_id')
+                    _adr = _arena_deck_info.get('cards', {})
+                    _ade = []
+                    if isinstance(_adr, dict):
+                        for _cid, _cnt in _adr.items():
+                            _ade.extend([_cid] * int(_cnt))
+                    else:
+                        _ade = list(_adr)
+                    my_deck_pre = self._build_tuo_deck_string(_adc, _add, _ade, card_data)
+                else:
+                    my_deck_pre = self._build_active_deck_str(card_data)
+
+                if not my_deck_pre:
+                    print("  ⚠ Could not build deck string for pre-sim – skipping TUO sim")
+
                 # BGE priority: last known from API > arena_battle_info > bge_name from last battle
                 bge_pre = (self.init_data.get('_current_bge') or
                            (self.init_data.get('arena_battle_info') or {})
@@ -10676,38 +10743,47 @@ $(document).ready(function(){
                     target = unknown_targets[0]
                     print(f"  -> Focus unknown: targeting {target['name']} (deck unknown)")
 
-                # Priority 1: known deck ≥30%
+                # Priority 1: pre-sim known targets, pick first ≥30%
                 if target is None:
-                    print("\n  Auto-selecting target...")
-                    for t in known_targets:
-                        deck_str = t['gauntlet'][1]
-                        print(f"  🎯 Pre-sim {t['name']} [{t['guild']}]...", end=' ', flush=True)
-                        win_pre, _, _ = self._run_tuo_sim(
-                            my_deck_pre, deck_str,
-                            bge_name=bge_pre or None,
-                            sim_count=50000,
-                            pvp_random=True,
-                        )
-                        if win_pre is None:
-                            print("sim failed – skip")
-                            continue
-                        print(f"{win_pre:.1f}%", end='')
-                        if win_pre >= 50.0:
-                            print("  ✓")
-                            target = t
-                            break
-                        else:
-                            print("  ✗ <50%")
+                    print("\n  Auto-selecting target...", flush=True)
+                    if not my_deck_pre:
+                        # No deck available – fall through to priorities 2/3 below
+                        pass
+                    else:
+                        _best_t    = None
+                        _best_win  = -1.0
+                        for t in known_targets:
+                            deck_str = t['gauntlet'][1]
+                            print(f"  🎯 Pre-sim {t['name']} [{t['guild']}]...", end=' ', flush=True)
+                            win_pre, _, _ = self._run_tuo_sim(
+                                my_deck_pre, deck_str,
+                                bge_name=bge_pre or None,
+                                sim_count=50000,
+                                pvp_random=True,
+                            )
+                            if win_pre is None:
+                                print("sim failed – skip", flush=True)
+                                continue
+                            print(f"{win_pre:.1f}%", end='')
+                            if win_pre > _best_win:
+                                _best_win = win_pre
+                                _best_t   = t
+                            if win_pre >= 30.0:
+                                print("  ✓", flush=True)
+                                target = t
+                                break
+                            else:
+                                print("  ✗ <30%", flush=True)
 
                     # Priority 2: first unknown deck (all known sims < 30%)
                     if target is None and unknown_targets:
                         target = unknown_targets[0]
-                        print(f"  -> All known decks <50% – using first unknown: {target['name']}")
+                        print(f"  -> All known decks <30% – using first unknown: {target['name']}")
 
-                    # Priority 3: first known deck as last resort
-                    if target is None and known_targets:
-                        target = known_targets[0]
-                        print(f"  -> No unknown targets – using first known: {target['name']}")
+                    # Priority 3: highest pre-sim win rate among known decks
+                    if target is None and _best_t is not None:
+                        target = _best_t
+                        print(f"  -> No pre-sim winner / no unknown targets – using best known: {target['name']} ({_best_win:.1f}%)")
 
                 if target is None:
                     print("✗ No targets available")
@@ -10756,6 +10832,26 @@ $(document).ready(function(){
                 continue
 
             print(f"✓ Target confirmed: {enemy_name} (ID: {fresh_uid})  │  Stamina: {stamina}")
+
+            # ── Challenge deck: apply directly before first battle ───
+            if challenge_step and challenge_card_data and not _ch_applied:
+                _ch_orig, _ch_cmdr = self._apply_challenge_deck(
+                    challenge_step, challenge_card_data,
+                    challenge_table=challenge_table)
+                _ch_applied = True
+                # Verify that the server actually has the challenge deck set.
+                # _verify_challenge_deck calls initialize() internally.
+                _ch_ok = self._verify_challenge_deck(
+                    challenge_step, challenge_card_data,
+                    challenge_table=challenge_table)
+                if not _ch_ok:
+                    print("  ✗ Challenge deck verification FAILED — aborting arena session")
+                    break
+                elif not _ch_orig:
+                    # apply returned None (deck already correct or no change needed)
+                    # but verify passed → init_data already fresh from verify
+                    pass
+                # init_data already refreshed inside _verify_challenge_deck
 
             # ── startHuntingBattle ───────────────────────────────────
             print(f"\n⚔️  Starting battle vs {enemy_name}...")
@@ -11149,6 +11245,10 @@ $(document).ready(function(){
                     break  # inner turn loop -> outer battle loop continues
 
             # end of turn loop – outer while continues automatically
+
+        # ── Challenge deck restore ────────────────────────────────
+        if _ch_orig:
+            self._restore_challenge_deck(_ch_orig, _ch_cmdr)
 
         # ── Session summary ───────────────────────────────────────
         total = arena_wins + arena_losses
@@ -11577,7 +11677,7 @@ $(document).ready(function(){
                         reorder_n=10000,
                         played_cards=play_order_names if play_order_names else None,
                         surge=True,
-                        mode='brawl',
+                        mode='surge',
                         enemy_played_cards=enemy_played if enemy_played else None,
                         hand_states=_own_states if _own_states else None,
                         enemy_hand_states=_enemy_states if _enemy_states else None,
@@ -12204,7 +12304,7 @@ $(document).ready(function(){
                         reorder_n=10000,
                         played_cards=play_order_names if play_order_names else None,
                         surge=True,
-                        mode='gw',
+                        mode='surge',
                         enemy_played_cards=enemy_played if enemy_played else None,
                         yfort=yfort_str,
                         efort=efort_str,
@@ -14254,15 +14354,32 @@ $(document).ready(function(){
 
     def _detect_challenge_step(self):
         """Returns (step_number, meta_achievement, challenge_table) or (None, None, None).
-        Prefers time-limited challenges (Forever Loyal); falls back to Extreme PVP Challenge."""
+        Prefers time-limited challenges (Forever Loyal); falls back to Extreme PVP Challenge,
+        then to permanent arena progression challenges (Master the Arena, Cutlass Unleashed, etc.)."""
         achievements = self.init_data.get('user_achievements', {})
         import time as _time2
         _now2 = int(_time2.time())
 
+        # Build a lookup: sub-challenge step name (lowercase) → challenge table
+        _permanent_tables = [
+            self.MASTER_ARENA_CHALLENGES,
+            self.CUTLASS_CHALLENGES,
+            self.ENTER_THE_ARENA_CHALLENGES,
+            self.ORBO_UNDERGROUND_CHALLENGES,
+            self.DOMINATE_THE_ARENA_CHALLENGES,
+            self.PROGENITOR_REQUIEM_CHALLENGES,
+        ]
+        _step_name_to_table = {}
+        for _tbl in _permanent_tables:
+            for _ch in _tbl:
+                _step_name_to_table[_ch['name'].lower()] = _tbl
+
         # 1st priority: time-limited type-12 with 'loyal'/'forever' in name
         meta_loyal = meta_loyal_expired = None
-        # 2nd priority: Extreme PVP Challenge (no end_time)
+        # 2nd priority: Extreme PVP Challenge (no end_time, 'extreme' in name)
         meta_extreme = None
+        # 3rd priority: other permanent challenges (Master the Arena, Cutlass Unleashed, …)
+        meta_others = []
 
         for aid, a in achievements.items():
             if int(a.get('type', 0)) != 12:
@@ -14277,6 +14394,8 @@ $(document).ready(function(){
             elif 'extreme' in nm:
                 if meta_extreme is None:
                     meta_extreme = a
+            else:
+                meta_others.append(a)
 
         # Pick best candidate — try loyal first, fall back to extreme if completed/absent
         candidates = []
@@ -14284,6 +14403,46 @@ $(document).ready(function(){
             candidates.append((meta_loyal or meta_loyal_expired, self.LOYAL_CHALLENGES))
         if meta_extreme:
             candidates.append((meta_extreme, self.EXTREME_CHALLENGES))
+        # Identify which permanent table each remaining type-12 achievement belongs to.
+        # Strategy 1 (preferred): match meta name against known challenge name keywords.
+        # Strategy 2 (fallback):  scan type-9 sub-achievements for a step name hit.
+        # Using the meta name first prevents cross-table contamination when an account
+        # has sub-achievements from multiple permanent challenge chains simultaneously
+        # (e.g. "Cutlass I" type-9 being found before "Arena: Acquire the Orbo").
+        _permanent_name_keywords = [
+            (['orbo underground', 'orbo'],                self.ORBO_UNDERGROUND_CHALLENGES),
+            (['dominate the arena', 'dominate_arena'],    self.DOMINATE_THE_ARENA_CHALLENGES),
+            (['progenitor requiem', 'progenitor'],        self.PROGENITOR_REQUIEM_CHALLENGES),
+            (['cutlass unleashed', 'cutlass'],            self.CUTLASS_CHALLENGES),
+            (['master the arena', 'master_arena'],        self.MASTER_ARENA_CHALLENGES),
+            (['enter the arena', 'enter_arena'],          self.ENTER_THE_ARENA_CHALLENGES),
+        ]
+
+        for _meta_o in meta_others:
+            _meta_nm  = _meta_o.get('name', '').lower()
+            _meta_end = int(_meta_o.get('end_time', 0))
+            _matched_table = None
+
+            # Strategy 1: name-based lookup (fast and unambiguous)
+            for _keywords, _tbl in _permanent_name_keywords:
+                if any(_kw in _meta_nm for _kw in _keywords):
+                    _matched_table = _tbl
+                    break
+
+            # Strategy 2: sub-achievement scan fallback
+            if _matched_table is None:
+                for _a2 in achievements.values():
+                    if int(_a2.get('type', 0)) != 9:
+                        continue
+                    if _meta_end and int(_a2.get('end_time', 0)) != _meta_end:
+                        continue
+                    _tbl = _step_name_to_table.get(_a2.get('name', '').lower())
+                    if _tbl is not None:
+                        _matched_table = _tbl
+                        break
+
+            if _matched_table is not None:
+                candidates.append((_meta_o, _matched_table))
 
         for meta, table in candidates:
             if not meta:
@@ -14292,30 +14451,44 @@ $(document).ready(function(){
             mx   = int(meta.get('max_progress', len(table)))
             if prog >= mx:
                 continue  # this challenge is done, try next
-            # For Extreme: parallel strands — match by current sub-challenge name (type-9)
-            if table is self.EXTREME_CHALLENGES:
+            # For Extreme and permanent parallel-strand challenges:
+            # match by current active sub-challenge name (type-9, progress < max)
+            if table is self.EXTREME_CHALLENGES or table in _permanent_tables:
                 sub_name = None
-                _extreme_names = {ch['name'].lower() for ch in self.EXTREME_CHALLENGES}
-                _master_names  = {ch['name'].lower() for ch in self.MASTER_ARENA_CHALLENGES}
-                _cutlass_names = {ch['name'].lower() for ch in self.CUTLASS_CHALLENGES}
+                # Build a set of names and their allowed types from the table
+                # (type=9 for normal sub-challenges; pvp.type_id e.g. 6 for PVP steps)
+                _table_names = {ch['name'].lower() for ch in table}
+                _pvp_type_ids = {int(ch['pvp']['type_id'])
+                                 for ch in table if ch.get('pvp', {}).get('type_id') is not None}
+                _scan_types = {9} | _pvp_type_ids
                 meta_end = int(meta.get('end_time', 0))
                 for a in achievements.values():
-                    if int(a.get('type', 0)) == 9:
-                        if meta_end and int(a.get('end_time', 0)) != meta_end:
-                            continue
-                        sp = int(a.get('progress', 0))
-                        sm = int(a.get('max_progress', 1))
-                        _aname = a.get('name', '')
-                        # Only accept if name matches an Extreme sub-challenge
-                        if sp < sm and _aname.lower() in _extreme_names:
-                            sub_name = _aname
-                            break
+                    _atype = int(a.get('type', 0))
+                    if _atype not in _scan_types:
+                        continue
+                    if _atype == 9 and meta_end and int(a.get('end_time', 0)) != meta_end:
+                        continue
+                    sp = int(a.get('progress', 0))
+                    sm = int(a.get('max_progress', 1))
+                    _aname = a.get('name', '')
+                    _aname_lc = _aname.lower()
+                    # API names may have a suffix like " (Improve your Rank III)" –
+                    # match if any table entry name is a prefix of the API name.
+                    _matched_tname = next(
+                        (tn for tn in _table_names
+                         if _aname_lc == tn or _aname_lc.startswith(tn + ' (')),
+                        None)
+                    if sp < sm and _matched_tname is not None:
+                        sub_name = next(
+                            ch['name'] for ch in table
+                            if ch['name'].lower() == _matched_tname)
+                        break
                 if sub_name:
                     # Find matching entry by name
                     for i, ch in enumerate(table):
                         if ch['name'].lower() == sub_name.lower():
                             return i + 1, meta, table
-                # Fallback: linear
+                # Fallback: linear (use meta progress as step index)
                 step = prog + 1
                 if step <= len(table):
                     return step, meta, table
@@ -14481,7 +14654,10 @@ $(document).ready(function(){
             print(f"     No deck changes needed for this step.")
             return None, None
 
-        # ── PHASE 0: Snapshot original deck BEFORE any builds ────────────
+        # ── PHASE 0: Fresh snapshot BEFORE any builds ────────────────────
+        # Always fetch current server state here so the snapshot isn't stale
+        # (live_sim_battle may have done a lot of work since the last initialize).
+        self.initialize(verbose=False)
         user_decks_snap = self.init_data.get('user_decks', {})
         deck_info_snap  = user_decks_snap.get(str(deck_slot), {})
         orig_cmdr_snap  = deck_info_snap.get('commander_id', '') if isinstance(deck_info_snap, dict) else ''
@@ -14514,10 +14690,28 @@ $(document).ready(function(){
                     'card_id': int(cid), 'level': lvl, 'max_level': max_level}
 
         # ── PHASE 2: Build/upgrade required & pool cards ──────────────────
-        required_ids = []
-        for card_name in ch['required']:
+        required_ids  = []
+        required_id_overrides = ch.get('required_id', [])  # explicit IDs (e.g. Orbo=58573)
+
+        for idx, card_name in enumerate(ch['required']):
+            # If the challenge table supplies an explicit base ID, use it directly
+            # to avoid accidentally picking the wrong card when multiple cards share
+            # the same name (e.g. several 'Orbo' variants).
+            forced_base_id = (int(required_id_overrides[idx])
+                              if idx < len(required_id_overrides) and required_id_overrides[idx]
+                              else None)
+
             name_key = card_name.lower()
             in_deck  = deck_card_names.get(name_key)
+
+            # When a forced ID is given, also check deck by ID (not just name)
+            if forced_base_id and not in_deck:
+                forced_max_id = self._resolve_to_max_level_id(forced_base_id, card_data)
+                for cid_str, deck_entry in deck_card_names.items():
+                    if deck_entry['card_id'] in (forced_base_id, forced_max_id):
+                        in_deck = deck_entry
+                        break
+
             if in_deck:
                 lvl = in_deck['level']
                 max_lvl = in_deck['max_level']
@@ -14527,12 +14721,33 @@ $(document).ready(function(){
                     continue
                 else:
                     print(f"     Required: {card_name} in deck at L{lvl}, upgrading to L{max_lvl}...")
-            cid = self._ensure_card_at_max_level(card_name, card_data)
+
+            if forced_base_id:
+                # Use the explicit base ID directly instead of name lookup
+                max_id = self._resolve_to_max_level_id(forced_base_id, card_data)
+                # Check ownership / build via _ensure_card_at_max_level logic
+                user_cards = self.init_data.get('user_cards', {})
+                max_info   = card_data.get(max_id, {}) if isinstance(card_data.get(max_id), dict) else {}
+                owned_cnt  = int((user_cards.get(str(max_id)) or {}).get('num_owned', 0))
+                if owned_cnt > 0:
+                    cid = max_id
+                    print(f"     Required: {card_name} (id={max_id}) owned, using directly")
+                else:
+                    # Fall through to name-based build (may need crafting)
+                    cid = self._ensure_card_at_max_level(card_name, card_data)
+                    if not cid:
+                        # Try once more by forced base id
+                        owned_base = int((user_cards.get(str(forced_base_id)) or {}).get('num_owned', 0))
+                        if owned_base > 0:
+                            cid = forced_base_id
+            else:
+                cid = self._ensure_card_at_max_level(card_name, card_data)
+
             if cid:
                 required_ids.append(str(cid))
                 print(f"     Required: {card_name} ready (id={cid})")
             else:
-                reason = f"Required card not available: {card_name}"
+                reason = f"Required card not available: {card_name} (forced_id={forced_base_id})"
                 print(f"  ✗ {reason}")
                 self._challenge_log_issue(nick, step, reason)
                 return None, None  # abort before modifying deck
@@ -14638,31 +14853,53 @@ $(document).ready(function(){
         elif isinstance(deck_info.get('cards'), list):
             for cid in deck_info['cards']:
                 new_card_ids.append(str(cid))
-        dom_id = str(deck_info.get('dominion_id') or '')
+        dom_id = str(deck_info.get('dominion_id') or 0)
 
         # ── PHASE 4: Commander swap ───────────────────────────────────────
         new_cmdr_id = orig_cmdr
         if ch['commander']:
-            cmdr_id = self._find_card_id_by_name(ch['commander'], card_data)
-            if not cmdr_id:
+            cmdr_base_id = self._find_card_id_by_name(ch['commander'], card_data)
+            if not cmdr_base_id:
                 reason = f"Commander not found in card data: {ch['commander']}"
                 print(f"  ✗ {reason}")
                 self._challenge_log_issue(nick, step, reason)
+                return None, None  # cannot proceed without commander
             else:
-                # Check if commander is owned; build if not
-                uc_cmdr = self.init_data.get('user_cards', {})
-                owned_cmdr = int((uc_cmdr.get(str(cmdr_id)) or {}).get('num_owned', 0))
-                if owned_cmdr > 0:
-                    new_cmdr_id = cmdr_id
-                    print(f"     Commander → {ch['commander']} (id={cmdr_id}, owned)")
+                cmdr_max_id = self._resolve_to_max_level_id(cmdr_base_id, card_data)
+
+                # Check ownership across ALL level variants (base → max).
+                # A simple user_cards[str(base_id)] miss would incorrectly trigger
+                # a build attempt even when a higher-level variant is already owned.
+                uc_cmdr   = self.init_data.get('user_cards', {})
+                owned_cmdr_id = None
+                for _cid in set(filter(None, [cmdr_base_id, cmdr_max_id])):
+                    if int((uc_cmdr.get(str(_cid)) or {}).get('num_owned', 0)) > 0:
+                        owned_cmdr_id = cmdr_max_id  # always use max-level variant
+                        break
+                # Also walk all variants for safety
+                if not owned_cmdr_id:
+                    _base_ref = (card_data.get(cmdr_base_id, {}) or {}).get('base_id', cmdr_base_id)
+                    for _cid, _cinfo in card_data.items():
+                        if not isinstance(_cinfo, dict):
+                            continue
+                        if _cinfo.get('base_id') != _base_ref:
+                            continue
+                        if int((uc_cmdr.get(str(_cid)) or {}).get('num_owned', 0)) > 0:
+                            owned_cmdr_id = cmdr_max_id
+                            break
+
+                if owned_cmdr_id:
+                    new_cmdr_id = owned_cmdr_id
+                    print(f"     Commander → {ch['commander']} (id={owned_cmdr_id}, owned)")
                 else:
                     print(f"     Commander {ch['commander']} not owned — attempting build...")
+                    _cmdr_built = False
                     try:
                         import builtins as _bi2
                         _orig_input2 = _bi2.input
                         _bi2.input = lambda _p='': 'yes'
                         try:
-                            _build_res = self.build_card(str(cmdr_id))
+                            _build_res = self.build_card(str(cmdr_base_id))
                         finally:
                             _bi2.input = _orig_input2
                         if _build_res is False:
@@ -14672,9 +14909,10 @@ $(document).ready(function(){
                         else:
                             self.initialize(verbose=False)
                             uc_cmdr2 = self.init_data.get('user_cards', {})
-                            if int((uc_cmdr2.get(str(cmdr_id)) or {}).get('num_owned', 0)) > 0:
-                                new_cmdr_id = cmdr_id
-                                print(f"     Commander → {ch['commander']} built and set (id={cmdr_id})")
+                            if int((uc_cmdr2.get(str(cmdr_max_id)) or {}).get('num_owned', 0)) > 0:
+                                new_cmdr_id = cmdr_max_id
+                                _cmdr_built = True
+                                print(f"     Commander → {ch['commander']} built and set (id={cmdr_max_id})")
                             else:
                                 reason = f"Commander {ch['commander']} build returned success but not in inventory"
                                 print(f"  ✗ {reason}")
@@ -14684,10 +14922,9 @@ $(document).ready(function(){
                         print(f"  ✗ {reason}")
                         self._challenge_log_issue(nick, step, reason)
 
-        # Pad deck to maximum size (10) before replacement so challenge cards
-        # don't reduce the deck size if the original had fewer than 10.
-        while len(new_card_ids) < 10 and new_card_ids:
-            new_card_ids.append(new_card_ids[0])
+                    if not _cmdr_built:
+                        # Commander unavailable — abort to avoid a doomed setDeckCards call
+                        return None, None
 
         # Deck order doesn't affect draw order (game randomises hand from full deck).
         # Just ensure required + pool cards are in the deck; TUO decides play order.
@@ -14721,17 +14958,27 @@ $(document).ready(function(){
                 commander_id=str(new_cmdr_id),
                 dominion_id=dom_id,
                 cards=cards_json,
-                activeYN='1',
+                activeYN='0',
             )
-            ok = result and (
-                result.get('result') in (True, 1, '1', 'true')
-                or 'user_decks' in result
-                or 'user_data' in result
+            # Strict success check: the API always includes 'user_decks' in every
+            # response, so 'user_decks' in result alone is not sufficient.
+            # Prefer result['result'] == True; fall back to checking whether the
+            # returned deck slot actually has the new commander.
+            _ret_result = result.get('result') if result else None
+            _ret_decks  = result.get('user_decks', {}) if result else {}
+            _ret_cmdr   = str((_ret_decks.get(str(deck_slot)) or {}).get('commander_id', ''))
+
+            ok = bool(
+                _ret_result in (True, 1, '1', 'true')
+                or (_ret_cmdr and _ret_cmdr == str(new_cmdr_id))
             )
             if ok:
-                print(f"  ✓ Deck slot {deck_slot} updated for step {step}")
+                print(f"  ✓ Deck slot {deck_slot} updated for step {step}"
+                      f" (commander_id={new_cmdr_id})")
             else:
-                reason = f"setDeckCards failed: {result}"
+                reason = (f"setDeckCards rejected: result={_ret_result!r}, "
+                          f"returned commander={_ret_cmdr!r} (expected {new_cmdr_id}), "
+                          f"full response={result!r}")
                 print(f"  ✗ {reason}")
                 self._challenge_log_issue(nick, step, reason)
                 return None, None
@@ -14740,6 +14987,23 @@ $(document).ready(function(){
             print(f"  ✗ {reason}")
             self._challenge_log_issue(nick, step, reason)
             return None, None
+
+        # Force re-activation of the slot so the server picks up the new cards.
+        # Without this, startHuntingBattle may use the previously-cached active deck
+        # content even though setDeckCards succeeded.
+        try:
+            _act_res = self.api.call('setActiveDeck', deck_id=str(deck_slot))
+            _act_ok = _act_res and (
+                _act_res.get('result') in (True, 1, '1', 'true')
+                or 'user_decks' in _act_res
+                or 'user_data' in _act_res
+            )
+            if _act_ok:
+                print(f"  ✓ Deck slot {deck_slot} re-activated with challenge cards")
+            else:
+                print(f"  ⚠ setActiveDeck after challenge update returned: {_act_res}")
+        except Exception as _ex_act:
+            print(f"  ⚠ setActiveDeck after challenge update failed: {_ex_act}")
 
         return (orig_card_ids, str(orig_cmdr_snap))
 
@@ -14754,26 +15018,141 @@ $(document).ready(function(){
                 {str(c): str(cnt) for c, cnt in _Counter(str(c) for c in orig_card_ids).items()}
             )
             # Retrieve dominion from current init_data
-            dom_id = str((self.init_data.get('user_decks', {}).get(str(deck_slot), {}) or {}).get('dominion_id') or '')
+            dom_id = str((self.init_data.get('user_decks', {}).get(str(deck_slot), {}) or {}).get('dominion_id') or 0)
             result = self.api.call(
                 'setDeckCards',
                 deck_id=str(deck_slot),
                 commander_id=str(orig_cmdr_id),
                 dominion_id=dom_id,
                 cards=cards_json,
-                activeYN='1',
+                activeYN='0',
             )
-            ok = result and (
-                result.get('result') in (True, 1, '1', 'true')
-                or 'user_decks' in result
-                or 'user_data' in result
+            _ret_result2 = result.get('result') if result else None
+            _ret_decks2  = result.get('user_decks', {}) if result else {}
+            _ret_cmdr2   = str((_ret_decks2.get(str(deck_slot)) or {}).get('commander_id', ''))
+            ok = bool(
+                _ret_result2 in (True, 1, '1', 'true')
+                or (_ret_cmdr2 and _ret_cmdr2 == str(orig_cmdr_id))
             )
             if ok:
                 print(f"  ✓ Deck slot {deck_slot} restored to original")
             else:
-                print(f"  ✗ Restore setDeckCards failed: {result}")
+                print(f"  ✗ Restore setDeckCards failed: result={_ret_result2!r}, "
+                      f"returned commander={_ret_cmdr2!r} (expected {orig_cmdr_id})")
         except Exception as ex:
             print(f"  ✗ Restore exception: {ex}")
+
+    def _verify_challenge_deck(self, step, card_data, deck_slot=1, challenge_table=None):
+        """Fetch a fresh server snapshot and confirm that the challenge deck for *step*
+        is actually set on *deck_slot*.
+
+        Checks:
+          - Commander matches ch['commander'] (if any)
+          - All ch['required'] cards are present in the deck
+
+        Returns True when everything looks correct, False otherwise.
+        On failure it prints a warning AND appends a line to
+        export/pvp_challenge_issues.txt via _challenge_log_issue.
+        """
+        import datetime as _dt
+
+        table = challenge_table if challenge_table is not None else self.LOYAL_CHALLENGES
+        if step < 1 or step > len(table):
+            return True  # nothing to check → don't block
+
+        ch = table[step - 1]
+        needs_check = bool(ch.get('commander') or ch.get('required'))
+        if not needs_check:
+            return True
+
+        nick = (self.api.settings.get('request_data', {}).get('kong_name', '')
+                or self.api.settings.get('kong_name', ''))
+
+        # Fetch fresh state from server
+        self.initialize(verbose=False)
+        deck_info = self.init_data.get('user_decks', {}).get(str(deck_slot), {})
+        if not isinstance(deck_info, dict):
+            reason = f"Verify: deck slot {deck_slot} missing from server response"
+            print(f"  ✗ {reason}")
+            self._challenge_log_issue(nick, step, reason)
+            return False
+
+        issues = []
+
+        # ── Check commander ──────────────────────────────────────────────
+        if ch.get('commander'):
+            expected_cmdr_id = self._find_card_id_by_name(ch['commander'], card_data)
+            actual_cmdr_id   = str(deck_info.get('commander_id', ''))
+            if expected_cmdr_id and str(expected_cmdr_id) != actual_cmdr_id:
+                cmdr_name = (card_data.get(int(actual_cmdr_id), {}) or {}).get('name', actual_cmdr_id) \
+                            if actual_cmdr_id.isdigit() else actual_cmdr_id
+                issues.append(
+                    f"Commander mismatch: expected '{ch['commander']}' (id={expected_cmdr_id}), "
+                    f"server has '{cmdr_name}' (id={actual_cmdr_id})"
+                )
+
+        # ── Check required cards ─────────────────────────────────────────
+        if ch.get('required'):
+            # Collect card IDs currently in deck (all levels / variants)
+            deck_cards_raw = deck_info.get('cards', {})
+            deck_card_ids  = set()
+            if isinstance(deck_cards_raw, dict):
+                deck_card_ids = set(str(k) for k in deck_cards_raw.keys())
+            elif isinstance(deck_cards_raw, list):
+                deck_card_ids = set(str(c) for c in deck_cards_raw)
+
+            # Build name→base_id map for fast lookup
+            deck_names_lower = set()
+            for cid_str in deck_card_ids:
+                try:
+                    info = card_data.get(int(cid_str), {}) or {}
+                    import re as _re2
+                    bname = _re2.sub(r'-\d+$', '', info.get('name', '').lower()).strip()
+                    if bname:
+                        deck_names_lower.add(bname)
+                except (ValueError, TypeError):
+                    pass
+
+            req_id_overrides = ch.get('required_id', [])
+
+            for idx, req in enumerate(ch['required']):
+                forced_id = (int(req_id_overrides[idx])
+                             if idx < len(req_id_overrides) and req_id_overrides[idx]
+                             else None)
+
+                # Primary check: forced ID (resolves to max-level variant)
+                if forced_id:
+                    req_max = self._resolve_to_max_level_id(forced_id, card_data)
+                    found_by_id = (
+                        str(forced_id) in deck_card_ids
+                        or (req_max and str(req_max) in deck_card_ids)
+                    )
+                    if found_by_id:
+                        continue
+                    # Fall through to name check as secondary
+                    req_base = forced_id
+                else:
+                    req_base = self._find_card_id_by_name(req, card_data)
+                    req_max  = self._resolve_to_max_level_id(req_base, card_data) if req_base else None
+                    found_by_id = (
+                        (req_base and str(req_base) in deck_card_ids)
+                        or (req_max  and str(req_max)  in deck_card_ids)
+                    )
+                    if found_by_id:
+                        continue
+
+                if req.lower() not in deck_names_lower and not found_by_id:
+                    id_hint = f", forced_id={forced_id}" if forced_id else ""
+                    issues.append(f"Required card missing from deck: '{req}'{id_hint}")
+
+        if issues:
+            for issue in issues:
+                print(f"  ✗ Challenge deck verify: {issue}")
+                self._challenge_log_issue(nick, step, f"[VERIFY] {issue}")
+            return False
+
+        print(f"  ✓ Challenge deck verified (step {step}: {ch['name']})")
+        return True
 
     def loyal_challenge_overview(self):
         """Lists all active accounts with their current PvP Challenge step
@@ -14818,40 +15197,18 @@ $(document).ready(function(){
 
                 achievements = tmp.init_data.get('user_achievements', {})
 
-                _now = int(_time.time())
-                meta_loyal = meta_loyal_exp = meta_extreme = None
-                for a in achievements.values():
-                    if int(a.get('type', 0)) != 12:
-                        continue
-                    nm    = a.get('name', '').lower()
-                    end_t = int(a.get('end_time', 0))
-                    if 'loyal' in nm or 'forever' in nm:
-                        if end_t > _now:
-                            if meta_loyal is None: meta_loyal = a
-                        elif meta_loyal_exp is None:
-                            meta_loyal_exp = a
-                    elif 'extreme' in nm:
-                        if meta_extreme is None: meta_extreme = a
+                # Use _detect_challenge_step as single source of truth
+                step_num, meta, table = tmp._detect_challenge_step()
 
-                candidates = []
-                if meta_loyal or meta_loyal_exp:
-                    candidates.append((meta_loyal or meta_loyal_exp, self.LOYAL_CHALLENGES))
-                if meta_extreme:
-                    candidates.append((meta_extreme, self.EXTREME_CHALLENGES))
-
-                meta = table = None
-                for _m, _t in candidates:
-                    _prog = int(_m.get('progress', 0))
-                    _max  = int(_m.get('max_progress', len(_t)))
-                    if _prog < _max:
-                        meta, table = _m, _t
-                        break
-
-                if not meta:
-                    _m = (meta_loyal or meta_loyal_exp or meta_extreme)
-                    if _m:
-                        meta_name = _m.get('name', 'PvP Challenge')
-                        meta_end  = int(_m.get('end_time', 0))
+                if not meta or not table or step_num is None:
+                    # No active challenge found — check whether any challenge exists at all
+                    # (to distinguish "all done" from "none registered")
+                    _any_meta = next(
+                        (a for a in achievements.values()
+                         if int(a.get('type', 0)) == 12), None)
+                    if _any_meta:
+                        meta_name = _any_meta.get('name', 'PvP Challenge')
+                        meta_end  = int(_any_meta.get('end_time', 0))
                         end_str   = _dt.datetime.fromtimestamp(meta_end).strftime('%d.%m.%y') if meta_end else '–'
                         print(f"  {nick:<22}  {'✓':>8}  {meta_name[:22]:<22}  {'All complete!':<22}  {'–':>14}  {end_str:>10}")
                         prev_state[nick] = {'step': 99, 'prog': 99}
@@ -14860,31 +15217,46 @@ $(document).ready(function(){
                     continue
 
                 meta_name = meta.get('name', 'PvP Challenge')
-                meta_prog = int(meta.get('progress', 0))
-                meta_max  = int(meta.get('max_progress', len(table)))
                 meta_end  = int(meta.get('end_time', 0))
+                meta_max  = int(meta.get('max_progress', len(table)))
                 end_str   = _dt.datetime.fromtimestamp(meta_end).strftime('%d.%m.%y') if meta_end else '–'
+                step = step_num
 
-                step = meta_prog + 1
-
-                # Use same logic as battle selection for consistency
+                # Sub-challenge name from table
                 sub_name = sub_prog = sub_max = None
-                _det_step, _det_meta, _det_table = tmp._detect_challenge_step()
-                if _det_step and _det_table and _det_step <= len(_det_table):
-                    _ch = _det_table[_det_step - 1]
+                if step <= len(table):
+                    _ch = table[step - 1]
                     sub_name = _ch.get('name', '')
-                    # Find matching type-9 achievement for progress
-                    _valid_sub_names = {sub_name.lower()}
+                    # Find matching achievement for progress.
+                    # Regular sub-challenges use type=9; PVP-challenge steps use the
+                    # type_id stored in the step's 'pvp' dict (e.g. type=6).
+                    _pvp_type_id = _ch.get('pvp', {}).get('type_id')
+                    _allowed_types = {9}
+                    if _pvp_type_id is not None:
+                        _allowed_types.add(int(_pvp_type_id))
                     for a in achievements.values():
-                        if int(a.get('type', 0)) == 9:
-                            if meta_end and int(a.get('end_time', 0)) != meta_end:
-                                continue
-                            sp = int(a.get('progress', 0))
-                            sm = int(a.get('max_progress', 1))
-                            if a.get('name', '').lower() in _valid_sub_names:
-                                sub_prog = sp
-                                sub_max  = sm
-                                break
+                        if int(a.get('type', 0)) not in _allowed_types:
+                            continue
+                        if meta_end and int(a.get('type', 0)) == 9 and int(a.get('end_time', 0)) != meta_end:
+                            continue
+                        sp = int(a.get('progress', 0))
+                        sm = int(a.get('max_progress', 1))
+                        _aname_lc = a.get('name', '').lower()
+                        _sname_lc = sub_name.lower()
+                        # API names may carry a rank suffix: "Name (Improve your Rank III)"
+                        if _aname_lc == _sname_lc or _aname_lc.startswith(_sname_lc + ' ('):
+                            sub_prog = sp
+                            sub_max  = sm
+                            break
+                    # If achievement not yet in API data (progress=0, never started),
+                    # derive max from the challenge table so we can show "0/N" instead of "–"
+                    if sub_prog is None and sub_name:
+                        _pvp = _ch.get('pvp', {})
+                        _tbl_max = (_pvp.get('wins') or _pvp.get('battles') or
+                                    _ch.get('wins') or _ch.get('battles'))
+                        if _tbl_max:
+                            sub_prog = 0
+                            sub_max  = int(_tbl_max)
 
                 prev      = prev_state.get(nick, {})
                 prev_step = prev.get('step')
@@ -14929,13 +15301,10 @@ $(document).ready(function(){
         step, meta, _ch_table = self._detect_challenge_step()
         if not step:
             ach = self.init_data.get('user_achievements', {})
-            has_any = any(
-                any(kw in a.get('name', '').lower() for kw in ('loyal', 'forever', 'extreme'))
-                for a in ach.values()
-                if int(a.get('type', 0)) == 12
-            )
+            # Any type-12 achievement present means a challenge exists (just completed)
+            has_any = any(int(a.get('type', 0)) == 12 for a in ach.values())
             if has_any:
-                print("  ✓ Active challenge already complete!")
+                print("  ✓ All active PvP challenges complete!")
             else:
                 print("  ✗ No active PvP challenge found in achievements.")
             return
@@ -24778,43 +25147,72 @@ def generate_settings_from_response():
 
 def _select_account_range(playable, mode_label):
     """
-    Show 6-option submenu for account range/loop selection.
-    Returns (accounts_subset, loop_mode) or (None, None) on cancel.
+    Show submenu for account range/loop selection (all / halves / quarters).
+    14 options (+ cancel).  Returns (accounts_subset, loop_mode) or (None, None) on cancel.
     accounts_subset: list of (nick, sf) to run
     loop_mode: bool – True = keep looping until KeyboardInterrupt
     """
     n = len(playable)
-    mid = n // 2
-    first_half  = playable[:mid if n % 2 == 0 else mid + 1]  # ceil for odd
-    second_half = playable[mid if n % 2 == 0 else mid + 1:]
 
-    # Show account split preview
-    fh_names = ', '.join(n_ for n_, _ in first_half)
-    sh_names = ', '.join(n_ for n_, _ in second_half)
+    # ── Quarters (round so every slice is non-empty even for small n) ──
+    q1_end = max(1, round(n * 0.25))
+    q2_end = max(q1_end + 1, round(n * 0.50))
+    q3_end = max(q2_end + 1, round(n * 0.75))
+
+    q1 = playable[:q1_end]
+    q2 = playable[q1_end:q2_end]
+    q3 = playable[q2_end:q3_end]
+    q4 = playable[q3_end:]
+
+    first_half  = playable[:q2_end]   # Q1 + Q2
+    second_half = playable[q2_end:]   # Q3 + Q4
+
+    def _names(lst):
+        return ', '.join(n_ for n_, _ in lst)
 
     print(f"\n  Accounts ({n} total):")
-    print(f"  1st half ({len(first_half)}): {fh_names}")
-    print(f"  2nd half ({len(second_half)}): {sh_names}")
+    print(f"  1st half  ({len(first_half):2d}): {_names(first_half)}")
+    print(f"  2nd half  ({len(second_half):2d}): {_names(second_half)}")
+    print(f"  Q1 ({len(q1):2d}): {_names(q1)}")
+    print(f"  Q2 ({len(q2):2d}): {_names(q2)}")
+    print(f"  Q3 ({len(q3):2d}): {_names(q3)}")
+    print(f"  Q4 ({len(q4):2d}): {_names(q4)}")
     print()
-    print(f"  1. All accounts – once")
-    print(f"  2. All accounts – loop (until ESC/Ctrl+C)")
-    print(f"  3. First half only – once")
-    print(f"  4. First half only – loop")
-    print(f"  5. Second half only – once")
-    print(f"  6. Second half only – loop")
-    print(f"  0. Cancel")
+    print(f"   1. All accounts          – once")
+    print(f"   2. All accounts          – loop (until ESC/Ctrl+C)")
+    print(f"   3. First half  (Q1+Q2)   – once")
+    print(f"   4. First half  (Q1+Q2)   – loop")
+    print(f"   5. Second half (Q3+Q4)   – once")
+    print(f"   6. Second half (Q3+Q4)   – loop")
+    print(f"   7. First quarter  (Q1)   – once")
+    print(f"   8. First quarter  (Q1)   – loop")
+    print(f"   9. Second quarter (Q2)   – once")
+    print(f"  10. Second quarter (Q2)   – loop")
+    print(f"  11. Third quarter  (Q3)   – once")
+    print(f"  12. Third quarter  (Q3)   – loop")
+    print(f"  13. Fourth quarter (Q4)   – once")
+    print(f"  14. Fourth quarter (Q4)   – loop")
+    print(f"   0. Cancel")
 
-    choice = input_with_esc("\n  Select (0-6): ")
+    choice = input_with_esc("\n  Select (0-14): ")
     if choice is None or choice.strip() == "0":
         return None, None
 
     mapping = {
-        "1": (playable,     False),
-        "2": (playable,     True),
-        "3": (first_half,   False),
-        "4": (first_half,   True),
-        "5": (second_half,  False),
-        "6": (second_half,  True),
+        "1":  (playable,     False),
+        "2":  (playable,     True),
+        "3":  (first_half,   False),
+        "4":  (first_half,   True),
+        "5":  (second_half,  False),
+        "6":  (second_half,  True),
+        "7":  (q1,           False),
+        "8":  (q1,           True),
+        "9":  (q2,           False),
+        "10": (q2,           True),
+        "11": (q3,           False),
+        "12": (q3,           True),
+        "13": (q4,           False),
+        "14": (q4,           True),
     }
     if choice.strip() not in mapping:
         print("  ✗ Invalid choice")
@@ -25889,18 +26287,18 @@ if __name__ == "__main__":
         print("-"*70)
         traceback.print_exc()
         print("-"*70)
-        
+
         print("\nDEBUG INFORMATION:")
         print(f"  Python Version: {sys.version}")
         print(f"  Platform: {sys.platform}")
         print(f"  Current Directory: {os.getcwd()}")
         print(f"  Script Location: {os.path.abspath(__file__)}")
-        
+
         print("\nPlease report this error with the above information.")
         print("="*70)
-        
+
         # On Windows, keep window open
         if sys.platform == 'win32':
             input("\nPress Enter to exit...")
-        
+
         sys.exit(1)
