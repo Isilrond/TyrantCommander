@@ -15837,7 +15837,8 @@ $(document).ready(function(){
             return True  # nothing to check → don't block
 
         ch = table[step - 1]
-        needs_check = bool(ch.get('commander') or ch.get('required'))
+        # FIX: pool-only steps (e.g. Extreme step 8) were skipped here, so the pool check below never ran
+        needs_check = bool(ch.get('commander') or ch.get('required') or int(ch.get('pool_min', 0) or 0) > 0)
         if not needs_check:
             return True
 

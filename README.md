@@ -3,7 +3,7 @@
 **Python-based automation tool for Tyrant Unleashed**  
 Communicates directly via the official game API — no game client required.
 
-> October 2026 — v5.7
+> October 2026 — v5.8
 
 ---
 
@@ -23,7 +23,7 @@ Communicates directly via the official game API — no game client required.
 | `items.xml` | Items database (`data/` folder) |
 | `battleground_effects.xml` | Global BGE definitions with active time windows (`data/` folder) |
 | `updates.xml` | Game news/event announcements (`data/` folder) |
-| `battleground_effects.xml` | Global BGE definitions with active time windows (`data/` folder) |
+| `events.xml` | Game event definitions (`data/` folder) |
 | `battle_events_h52.xml` | Brawl event schedule with start/end timestamps (`data/` folder) |
 | `raids_x42.xml` | Raid event schedule with start/end timestamps (`data/` folder) |
 | `faction_wars_fp3.xml` | Guild War schedule with start/end timestamps (`data/` folder) |
@@ -56,10 +56,14 @@ TUO-Live/
     ├── outdatedIDs.txt              ← Card IDs to salvage (shared)
     ├── import/                      ← Drop *.txt files here for D→18
     ├── ownedcards/                  ← Export target (all accounts)
-    ├── export/                      ← Gauntlet + challenge issue output
-    │   └── pvp_challenge_issues.txt   ← Challenge build failures (all types)
+    ├── export/                      ← Gauntlet + challenge output
+    │   ├── api_errors.log             ← Network/API errors per account (retries, init, mission failures)
+    │   ├── outdatedIDs_log.txt        ← Changes to outdatedIDs.txt (manual / auto)
+    │   ├── pvp_challenge_issues.txt   ← Challenge build/deck failures (all types)
+    │   └── challenge_analysis.txt     ← Per-battle challenge log + PROGRESS lines (for diagnosis)
     ├── combatlog/                   ← Combat logs per account (Arena + Brawl)
     │   └── suspicious/             ← Auto-copied suspicious loss logs
+    ├── guild_member_cache/          ← Name→ID cache per guild (6 h TTL)
     ├── energylog/                   ← Hourly energy snapshots
     ├── guildwar_stats/              ← Guild War JSON + HTML snapshots
     ├── missions.xml
@@ -67,6 +71,7 @@ TUO-Live/
     ├── items.xml
     ├── battleground_effects.xml
     ├── updates.xml
+    ├── events.xml
     ├── battle_events_h52.xml
     ├── raids_x42.xml
     ├── faction_wars_fp3.xml
@@ -168,35 +173,52 @@ All multi-account options offer 6 run modes:
 Automatically adapts Slot 1 deck for the active PvP Challenge step before arena battles, then restores the original deck. Runs fully unattended across all accounts.
 
 **Challenge priority:**
-1. Forever Loyal PVP Challenge *(LEGACY — Aug 2026 one-time event)*
-2. Extreme PVP Challenge (28 steps across 6 faction streams)
-3. Enter the Arena PVP Challenge (8 steps)
-4. Orbo Underground PVP Challenge (12 steps, Mythic Orbo required)
-5. Dominate the Arena PVP Challenge (9 steps)
-6. Progenitor Requiem PVP Challenge (13 steps)
-7. Master the Arena PVP Challenge (8 steps)
-8. Cutlass Unleashed PVP Challenge (4 steps)
+1. Living Mirrors PVP Challenge (15 steps, Oct 27 – Nov 24, 2026 — only while `end_time` is in the future; time-limited, always first)
+2. Forever Loyal PVP Challenge *(LEGACY — Aug 2026 one-time event)*
+3. Extreme PVP Challenge (28 steps across 6 faction streams)
+4. Enter the Arena PVP Challenge (8 steps)
+5. Orbo Underground PVP Challenge (12 steps, Mythic Orbo required)
+6. Dominate the Arena PVP Challenge (9 steps)
+7. Progenitor Requiem PVP Challenge (13 steps)
+8. Master the Arena PVP Challenge (8 steps)
+9. Cutlass Unleashed PVP Challenge (4 steps)
 
 **How it works:**
 
 1. Detects the current challenge step via `getPvpChallengeData`
 2. Checks if required commander is owned; auto-builds via `build_card(id)` if not
 3. Builds required cards (upgrades via `build_card` if needed; skips if insufficient SP — logs issue, deck unchanged)
-4. Builds pool cards from inventory (up to `pool_min` copies)
-5. Pads deck to 10 cards if original has fewer than 10
-6. Replaces last N slots with challenge cards via `setDeckCards`
-7. Runs arena battles (`live_sim_battle`)
-8. Restores original deck via `_restore_challenge_deck` (always, via `finally` block)
+4. Builds pool cards: pass 1 takes the per-type count from the pool list (inventory first, then build); pass 2 tops up with additional copies of pool cards until `pool_min` is reached
+5. Assembles the deck: copies of challenge cards already in the start deck are removed first, the challenge cards are added, and no card id is sent more often than `num_owned` (the server rejects the **whole** deck otherwise)
+6. Writes the deck via `setDeckCards` and compares the returned cards with what was sent — any difference aborts the challenge deck and writes `pvp_challenge_issues.txt` (including the server `result_message`)
+7. Re-activates the slot and prints a `[VERIFY]` line: commander and cards as actually stored on the server
+8. Runs arena battles (`live_sim_battle`); card order is decided by the TUO flexible sim only (`play_first` keys in the tables have no effect)
+9. Restores the original deck via `_restore_challenge_deck` (always, via `finally` block); the restore is verified the same way
 
 **Abort conditions** (deck left unchanged):
 - Required card cannot be built (SP/gold insufficient) → `return None, None` before any deck modification
-- Fewer than `pool_min` pool cards available
+- Server does not store the sent deck (card comparison fails) → issue logged, battles continue with the normal deck
+
+Fewer than `pool_min` pool cards available → logged as issue, proceeds with the cards that are available.
 
 **Extreme PVP Challenge:** parallel quest strands — sub-challenge detected by type-9 achievement name, not linear step counter. Only names from EXTREME_CHALLENGES table are accepted to avoid false matches with other challenge types.
 
-**Issues log:** `export/pvp_challenge_issues.txt`
+**Living Mirrors PVP Challenge (Oct 27 – Nov 24, 2026):** 15 steps (`LIVING_MIRRORS_CHALLENGES`), checked before all other challenges while active. Win steps (Mirror 25/50/75/100) use a wins counter; skill steps use support commanders/pools: Octane Optimized (Rally/Entrap), Daedalus Charged (Enrage), Malort Blightfather (Heal), Fortify pool (Arcadia Redeemed, Experiment Gasher, The Mass, Impurity Arrester, Restore Sequencer; 4 copies), Overload pool (2 copies), Progenitor pool for Mirror Vindicated (4 copies).
+
+**Issues log:** `export/pvp_challenge_issues.txt` — build failures, rejected decks (with server message), failed restores.
+
+**Challenge analysis log:** `export/challenge_analysis.txt` — one result line per arena battle (complete deck, played cards, verdict, skillcheck, enemy) plus an indented `detail:` line (`copies_in_deck`, `first_in_hand_turn`, `first_played_turn`, pool usage, kills, damage, flags, action tally) and a `PROGRESS` line comparing server-side sub-challenge progress before/after (COUNTED / NOT COUNTED). `first_in_hand_turn=never` means the card was not drawn before the battle ended; in hand but `first_played_turn=never` is a TUO sim decision.
 
 **Challenge Overview (F→24):** shows all accounts with step, sub-challenge name, progress, and end date. Highlights stagnating accounts (+0 between snapshots). Uses `_detect_loyal_challenge_step()` for consistency with battle selection.
+
+### Diagnostic Log Files (`export/`)
+
+| File | Content |
+|------|---------|
+| `pvp_challenge_issues.txt` | Challenge build/deck failures: missing cards, rejected decks (with server message), pool shortages, failed restores |
+| `challenge_analysis.txt` | Per-battle challenge log with PROGRESS lines |
+| `api_errors.log` | `timestamp \| account \| API call \| error type \| detail` — NetworkError, EmptyResponse, PleaseWait, InitIncomplete, InitFailed, MissionBlacklisted, MissionFallbackFailed, ArenaBattleFailed |
+| `outdatedIDs_log.txt` | Every change to `outdatedIDs.txt` (manually added / manually removed / auto-removed equipped card) |
 
 ### Auto GBGE Detection (B→16/17)
 
@@ -331,7 +353,32 @@ Generated by **B → 11 Sync All Guild Decks** (combined defense + attack pass).
 
 ## Changelog
 
-### v5.7 — October 2026 *(current)*
+### v5.8 — October 2026 *(current)*
+
+- **NEW** Living Mirrors PVP Challenge — `LIVING_MIRRORS_CHALLENGES` (15 steps, Oct 27 – Nov 24, 2026); checked first while `end_time` is in the future; support commanders/pools per skill; win steps via wins counter
+- **NEW** Challenge analysis log `export/challenge_analysis.txt` — complete deck, played cards, verdict, skillcheck, detail line (`copies_in_deck`, `first_in_hand_turn`, `first_played_turn`, pool, kills, damage, flags, action tally), PROGRESS lines (server progress before/after, COUNTED / NOT COUNTED)
+- **NEW** `[VERIFY]` console line after the deck update — commander and cards as stored on the server
+- **NEW** API error log `export/api_errors.log` (`_write_api_error_log`) — network errors (each retry + final), empty responses, "please wait", failed init, mission blacklist/fallback failures, failed arena battle start; format: `timestamp | account | API call | error type | detail`
+- **NEW** outdatedIDs change log `export/outdatedIDs_log.txt` — manual add/remove and automatic removal of equipped cards; `outdatedIDs.txt` is now written atomically (`.bak` backup, temp file + `os.replace`) via `_write_outdated_ids_safe`
+- **NEW** Arena guild fallback — if only own-guild members remain as targets, their live decks are fetched (`_fetch_enemy_deck_live`) and pre-simmed; best live-deck target is used unless a known-deck target scored higher
+- **NEW** Code map — section banners `[S01]`–`[S24]`, `[T01]`–`[T04]`, `[M01]`–`[M02]` and CODE MAP in the module docstring; `# FIX:` comments mark bug fixes
+- **FIX** `setDeckCards` success check — commander-only comparison counted a rejected deck as success whenever the commander was unchanged (e.g. Extreme step 8); now sent vs. returned cards are compared, `result_message` logged, challenge deck aborted on mismatch
+- **FIX** Challenge card already in the start deck (only 1 owned) was added twice → server answered "You do not have 2 of card X" and discarded the whole deck, so the challenge deck was never active (Rhilfen, Extreme step 8). Copies are now removed from the base deck first; no id is sent more often than `num_owned`
+- **FIX** Pool build — per-type copy count capped at the pool list count (previously the first card was taken up to `pool_min` times); second pass tops up additional copies when `pool_min` is not reached; new-copy detection via counter
+- **FIX** `_restore_challenge_deck` — success also requires matching cards; failed restore logged as "Deck RESTORE not applied"
+- **FIX** `_verify_challenge_deck` — pool-only steps (no commander/required card, e.g. Extreme step 8) were skipped, so the pool check never ran; `pool_min` steps are now included (warning + issue log)
+- **FIX** `initialize()` — a response without `user_data` (server overloaded, connection dropped) silently set energy/stamina to 0 and skipped all phases; now the account is skipped with an `InitIncomplete` entry in `api_errors.log`
+- **FIX** `_fetch_enemy_deck_live` — stale guild-member cache: on a name miss the roster is re-read once, cache rebuilt, lookup repeated before reporting "left guild"
+- **FIX** `play_highest_mission_loop` — fallback mission is never blacklisted; repeated failures stop the session (`MissionFallbackFailed`); blacklist output shortened to a count
+- **FIX** `interactive_menu` option 95 — local `import glob as _glob` made `_glob` local for the whole function (UnboundLocalError in settings search)
+- **FIX** `optimize_mission_deck` — NameError on auto-detected GBGE (check of a non-existent variable removed)
+- **FIX** `get_player_info` — "Account Age" never shown (`date.today()` NameError swallowed); now `datetime.now().date()`
+- **CHANGE** `PROGENITOR_REQUIEM_CHALLENGES` step 1 (Progenitor Reactor) — `pool_min` 6 → 4
+- **CHANGE** ~50 lines of unreachable dead code removed in `play_first_quest_mission_loop`; 9 bare `except` around `int()` narrowed to `(ValueError, TypeError)` (`show_events`, `_gw_in_active_phase`)
+- **CHANGE** `play_first` keys in challenge tables have no effect — card order is decided by the TUO flexible sim only
+- **CHANGE** README/documentation updated to v5.8 (duplicate `battleground_effects.xml` row removed, file structure and challenge chapter completed)
+
+### v5.7 — October 2026
 
 - **FIX** Arena auto-target: if no target reaches ≥30% pre-sim win rate, the target with the **highest pre-sim win rate** is now chosen as fallback (previously: first known target from list)
 - **FIX** Arena pre-sim threshold lowered from ≥50% to **≥30%** — better matches real performance when PvP Challenge deck (weaker cards) is active
@@ -441,4 +488,4 @@ Guild War Stats Tracker, Guild War Summary, Live Sim Guild War, Build Brawl Gaun
 
 ---
 
-*TyrantAPICommander — October 2026 — v5.7*
+*TyrantAPICommander — October 2026 — v5.8*
