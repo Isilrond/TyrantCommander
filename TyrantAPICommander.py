@@ -16,6 +16,13 @@ Main Features:
 Usage:
   python TyrantAPICommander.py          # Normal mode
   python TyrantAPICommander.py --debug  # Debug mode
+
+CODE MAP (grep for the tag, e.g. "[S14]"):
+  Module level : API session classes, config, Dominion data, fusion helpers
+  [S01]-[S24]  : sections inside class TyrantCommander (see banners "# ==== [Sxx] ... ====")
+  [T01]-[T04]  : PvP challenge subsystem (tables, engine, diagnostics, deck build)
+  [M01]-[M02]  : module-level UI helpers and interactive_menu (menu option numbers are stable)
+Conventions: "# FIX:" marks bug fixes with the reason; export/*.txt are diagnostic logs for Claude.
 """
 
 # ==================== DEBUG MODE ====================
@@ -160,6 +167,9 @@ import threading
 
 class RequestInfo:
     """Simple request info object"""
+    # ==================== [S01] CORE: CONSTRUCTOR, LOGIN (initialize), API ERROR HELPERS ====================
+    # TyrantCommander is one account (one settings_*.json). initialize() refreshes self.init_data (all game state).
+
     def __init__(self, method, url, body=None, headers=None):
         self.method = method
         self.url = url
@@ -442,8 +452,18 @@ class TyrantAPI:
                     logging.debug(f'Network error on {message} (attempt {_attempt}/{_MAX_RETRIES}): {_net_err} - retrying in {_wait}s')
                     print(f"\n  ⚠ Network error ({message}, attempt {_attempt}/{_MAX_RETRIES}): {_net_err}"
                           f" - retrying in {_wait}s...")
+                    _write_api_error_log(
+                        self.req.get('kong_name', '?'), message,
+                        'NetworkError',
+                        f"attempt {_attempt}/{_MAX_RETRIES}: {_net_err} – retrying in {_wait}s"
+                    )
                     time.sleep(_wait)
                     continue
+                _write_api_error_log(
+                    self.req.get('kong_name', '?'), message,
+                    'NetworkError',
+                    f"FINAL after {_MAX_RETRIES} retries: {_net_err}"
+                )
                 raise  # re-raise after all retries exhausted
 
             logging.debug(f'Request headers: {resp.request.headers}')
@@ -464,8 +484,18 @@ class TyrantAPI:
                 if _attempt <= _MAX_RETRIES:
                     _wait = 3 * _attempt
                     logging.debug(f'Empty response for {message} (attempt {_attempt}/{_MAX_RETRIES}) - retrying in {_wait}s')
+                    _write_api_error_log(
+                        self.req.get('kong_name', '?'), message,
+                        'EmptyResponse',
+                        f"attempt {_attempt}/{_MAX_RETRIES} – retrying in {_wait}s"
+                    )
                     time.sleep(_wait)
                     continue
+                _write_api_error_log(
+                    self.req.get('kong_name', '?'), message,
+                    'EmptyResponse',
+                    f"FINAL after {_MAX_RETRIES} retries – no content"
+                )
                 raise RuntimeError(
                     f"Empty response from server for '{message}' after {_MAX_RETRIES} retries"
                 )
@@ -475,7 +505,13 @@ class TyrantAPI:
             if isinstance(parsed, dict):
                 msg = str(parsed.get('message', '')).lower()
                 if 'please wait' in msg or 'wait a moment' in msg:
-                    raise PleaseWaitError(parsed.get('message', 'Please wait a moment'))
+                    _pw_msg = parsed.get('message', 'Please wait a moment')
+                    _write_api_error_log(
+                        self.req.get('kong_name', '?'), message,
+                        'PleaseWait',
+                        _pw_msg
+                    )
+                    raise PleaseWaitError(_pw_msg)
             return parsed
 
         # Should never reach here
@@ -1001,6 +1037,25 @@ class PleaseWaitError(Exception):
     pass
 
 
+def _write_api_error_log(kong_name: str, api_msg: str, error_type: str, detail: str) -> None:
+    """Append one line to export/api_errors.log.
+
+    Format:
+        2026-10-16 14:32:05 | AccountName | playCard | PleaseWait | Please wait a moment
+    """
+    import datetime as _dt
+    try:
+        log_dir = os.path.join(SCRIPT_DIR, 'export')
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'api_errors.log')
+        ts = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f"{ts} | {kong_name} | {api_msg} | {error_type} | {detail}\n"
+        with open(log_path, 'a', encoding='utf-8') as _f:
+            _f.write(line)
+    except Exception:
+        pass  # never let logging crash the main flow
+
+
 class TyrantCommander:
     """Main class for API operations - Standalone Version"""
 
@@ -1102,6 +1157,18 @@ $(document).ready(function(){
             if verbose:
                 print("⏳ Connecting to API...")
             self.init_data = self.api.call('init')
+            # Sanity-check: a valid init response must contain user_data.
+            # An empty / partial response (server overloaded, connection cut mid-transfer)
+            # would otherwise silently set energy=0, stamina=0 and skip all phases.
+            if not self.init_data or 'user_data' not in self.init_data:
+                _kn = self.api.req.get('kong_name', '?')
+                if verbose:
+                    print("✗ Init response missing user_data – server may be unavailable")
+                else:
+                    print("  ✗ Init incomplete (no user_data) – skipping account")
+                _write_api_error_log(_kn, 'init', 'InitIncomplete',
+                                     'response missing user_data – server overloaded or connection dropped')
+                return False
             if verbose:
                 print("✓ API connection successfully initialized")
                 print("✓ Login data is correct")
@@ -1128,14 +1195,17 @@ $(document).ready(function(){
             print(f"✗ Settings file error: {e}")
             return False
         except ConnectionError as e:
+            _kn = self.api.req.get('kong_name', '?')
             print(f"✗ Connection error: {e}")
             print("  -> Check your internet connection")
+            _write_api_error_log(_kn, 'init', 'InitFailed', f"ConnectionError: {e}")
             return False
         except RuntimeError as e:
             # API-error (e.g. 400, 403, etc.)
+            _kn = self.api.req.get('kong_name', '?')
             error_msg = str(e)
             print(f"✗ API error: {error_msg}")
-            
+
             if "403" in error_msg or "401" in error_msg:
                 print("  -> Login data is invalid or expired!")
                 print("  -> Create a new settings file with current data")
@@ -1145,11 +1215,13 @@ $(document).ready(function(){
             elif "500" in error_msg or "502" in error_msg or "503" in error_msg:
                 print("  -> Server error")
                 print("  -> Try again later")
-            
+            _write_api_error_log(_kn, 'init', 'InitFailed', f"RuntimeError: {error_msg}")
             return False
         except Exception as e:
+            _kn = self.api.req.get('kong_name', '?')
             print(f"✗ Unexpected error during initialization: {e}")
             print(f"  Error type: {type(e).__name__}")
+            _write_api_error_log(_kn, 'init', 'InitFailed', f"{type(e).__name__}: {e}")
             return False
     
     # ==================== ITEMS / SHARDS ====================
@@ -1161,6 +1233,9 @@ $(document).ready(function(){
         2001: ("Legendary Shard",  1000),
         2002: ("Vindicator Shard", 1000),
     }
+
+    # ==================== [S02] SHARDS, FUSION, SOLO MISSION LOOPS, QUESTS ====================
+    # use_shards / fuse_all_maxed_cards, play_highest_mission_loop, pity_the_fool_runner, quest-mission loops, show_quests.
 
     def use_shards(self, auto_confirm=False):
         """Use all available Epic / Legendary / Vindicator Shards until depleted"""
@@ -1670,7 +1745,7 @@ $(document).ready(function(){
             print(f"  PLAY HIGHEST MISSION (AUTO+SKIP, 3-STAR GRIND)")
             print(f"{'='*60}")
             if blacklist:
-                print(f"  ⚫ Blacklisted (skipped): {sorted(blacklist)}")
+                print(f"  ⚫ Blacklisted: {len(blacklist)} missions skipped")
             cands = build_candidates()
             not_done_sorted = sorted(cands.items(), reverse=True)
             if not_done_sorted:
@@ -1742,9 +1817,24 @@ $(document).ready(function(){
                             print(f"  [{run:>3}] ✗ M{mission_id} startMission failed ({_attempt}/{_BLACKLIST_THRESHOLD}) – retrying...")
                         time.sleep(2.0)
                 if not result or result.get('result') not in (True, 1, '1', 'true'):
+                    _kn_m = self.api.req.get('kong_name', '?')
+                    if mission_id == FALLBACK:
+                        # Fallback mission must never be blacklisted – it is always
+                        # the last resort. Treat repeated failures as a connection
+                        # issue and stop the session instead.
+                        if not silent:
+                            print(f"  [{run:>3}] ✗ M{mission_id} startMission failed "
+                                  f"{_BLACKLIST_THRESHOLD}x – stopping (fallback mission, not blacklisted)")
+                            self._print_api_error(result, 'startMission')
+                        _write_api_error_log(_kn_m, 'startMission', 'MissionFallbackFailed',
+                                             f"M{mission_id} failed {_BLACKLIST_THRESHOLD}x – session stopped")
+                        losses += 1
+                        break
                     if not silent:
                         print(f"  [{run:>3}] ✗ M{mission_id} startMission failed {_BLACKLIST_THRESHOLD}x – blacklisted")
                         self._print_api_error(result, 'startMission')
+                    _write_api_error_log(_kn_m, 'startMission', 'MissionBlacklisted',
+                                         f"M{mission_id} failed {_BLACKLIST_THRESHOLD}x – blacklisted")
                     blacklist.add(mission_id)
                     apply_blacklist()
                     self._save_mission_blacklist(blacklist)
@@ -2646,54 +2736,6 @@ $(document).ready(function(){
             self.api.call('setActiveDeck', deck_id=_prev_slot_m)
 
         return wins, losses, gold_total
-        settings_files = sorted({os.path.normpath(f): f for f in settings_files}.values())
-
-        if not settings_files:
-            print("  ✗ No settings_*.json files found")
-            return
-
-        playable = []
-        skipped  = []
-        for sf in settings_files:
-            nick = os.path.basename(sf).replace('settings_', '').replace('.json', '')
-            try:
-                with open(sf, 'r', encoding='utf-8') as fh:
-                    cfg = _json.load(fh)
-                if cfg.get('play_enabled', True):
-                    playable.append((nick, sf))
-                else:
-                    skipped.append(nick)
-            except Exception:
-                skipped.append(nick)
-
-        if skipped:
-            print(f"  ⏭  Skipped (play_enabled=false): {', '.join(skipped)}")
-        if not playable:
-            print("  ✗ No eligible accounts found")
-            return
-
-        total_w = total_l = total_g = 0
-        for nick, sf in playable:
-            print(f"\n{'─'*55}")
-            print(f"  ▶ {nick}")
-            print(f"{'─'*55}")
-            try:
-                tmp = TyrantCommander(sf)
-                if not tmp.initialize(verbose=False):
-                    print(f"  ✗ Login failed")
-                    continue
-                w, l, g = tmp.play_first_quest_mission_loop()
-                total_w += w; total_l += l; total_g += g
-            except PleaseWaitError as e:
-                print(f"  ✗ API busy: {e}")
-            except Exception as e:
-                print(f"  ✗ Error: {e}")
-                import traceback; traceback.print_exc()
-            sleep(1)
-
-        print(f"\n{'='*65}")
-        print(f"  ALL ACCOUNTS DONE  |  {total_w}W {total_l}L  |  Gold +{total_g:,}")
-        print(f"{'='*65}")
 
     def play_quest_missions(self):
         """
@@ -3071,6 +3113,9 @@ $(document).ready(function(){
 
     # ==================== PLAYER INFORMATION ====================
 
+    # ==================== [S03] PLAYER INFO, XML UPDATE, GUILD MEMBER LISTS ====================
+    # get_player_info (stats screen), calculate_max_packs, update_xmls (card/mission XML download), guild chat/member helpers.
+
     def get_player_info(self):
         """Shows own Player information"""
         # Refresh data to get current state
@@ -3248,7 +3293,7 @@ $(document).ready(function(){
         if install_date:
             try:
                 created_date = datetime.strptime(str(install_date), '%Y-%m-%d %H:%M:%S').date()
-                age_days = (date.today() - created_date).days
+                age_days = (datetime.now().date() - created_date).days  # FIX: 'date' was never imported (NameError swallowed -> age never shown)
                 years, remainder = divmod(age_days, 365)
                 months = remainder // 30
                 stats_lines.append(("Account Age", f"{years}y {months}m  (since {created_date.strftime('%Y-%m-%d')})"))
@@ -3735,6 +3780,9 @@ $(document).ready(function(){
     
     # ==================== DECK-MANAGEMENT ====================
     
+    # ==================== [S04] DECK UPDATE FROM TUO / CARD NAME RESOLUTION ====================
+    # update_deck + _resolve_missing_cards: turn TUO deck strings into card ids, build/fuse missing cards.
+
     def update_deck(self):
         """
         Updates a deck in einem bestimmten Slot
@@ -4892,6 +4940,9 @@ $(document).ready(function(){
 
     # ==================== LIVE SIM BATTLE ====================
 
+    # ==================== [S05] TUO (tyrant_optimize) HELPERS + STARTER DECK EXPORT ====================
+    # Paths to the TUO binary/database, card-id -> TUO name conversion, deck string builders.
+
     @property
     def _tuo_path(self):
         parent = os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
@@ -5076,6 +5127,8 @@ $(document).ready(function(){
             print(f"  🔓  {unlocked} slot(s) newly unlocked - run again after filling decks")
         print(f"  ->  export/starterdecks_{mode}.txt")
         print(f"{'='*60}")
+
+    # ==================== [S06] GUILD MANAGEMENT AND GUILD DECK SYNC ====================
 
     def guild_leave(self):
         """Leave the current guild after confirmation."""
@@ -5614,6 +5667,8 @@ $(document).ready(function(){
         print(f"\n  ✓ Sync complete:")
         print(f"    arenagauntlet.txt  — Added: {ga}  (replaced {_g_removed} old GUILD_ entries)")
         print(f"    attackdecks.txt    — Added: {aa}  (replaced {_a_removed} old ATTACK_ entries)")
+
+    # ==================== [S07] BRAWL GAUNTLET (attack deck building + gauntlet files) ====================
 
     def build_brawl_gauntlet_attack(self, mode='auto', _defense_file=None, _brawl_key=None, _card_data=None):
         """
@@ -6791,6 +6846,8 @@ $(document).ready(function(){
             _card_data=card_data,
         )
 
+    # ==================== [S08] COMBAT LOG TOOLS ====================
+
     def scan_combat_logs_for_unknown_flags(self):
         """
         Scans all JSON combat logs in data/combatlog/ for API state flags
@@ -6896,6 +6953,9 @@ $(document).ready(function(){
         print(f"{'='*60}")
         print(f"  Known flags (from sim.cpp) : {len(KNOWN)}")
         print(f"  Unknown flags found        : {len(unknown)}")
+
+    # ==================== [S09] GUILD WAR: TRACKER, PIPELINES (pvp/gw auto), WAR SUMMARY ====================
+    # pvp_auto_event_pipeline / gw_auto_pipeline orchestrate TUO + sim runs per event phase.
 
     def guild_war_tracker(self):
         """
@@ -8165,7 +8225,7 @@ $(document).ready(function(){
                 def _ts(n, f):
                     val = n.findtext(f) or n.get(f) or '0'
                     try: return int(val)
-                    except: return 0
+                    except (ValueError, TypeError): return 0
                 s = _ts(node, 'start_time')
                 e = _ts(node, 'end_time')
                 if s and e and s <= now < e:
@@ -8944,6 +9004,8 @@ $(document).ready(function(){
         print(f"  Output folder: {war_dir}")
         input("\n[ENTER] to continue...")
 
+    # ==================== [S10] GAUNTLET DATA MERGE AND LIVE ENEMY-DECK LOOKUP ====================
+
     def merge_arenagauntlet(self):
         """
         Merges arenagauntlet.txt files from SCRIPT_DIR/import/ into the main
@@ -9654,6 +9716,30 @@ $(document).ready(function(){
 
                 user_id = self._guild_member_name_cache[cache_key].get(name.lower())
                 if user_id is None:
+                    # Cache may be stale (member joined after last build).
+                    # Re-initialize the proxy to get a fresh faction.members list,
+                    # rebuild the name map once, then retry.
+                    try:
+                        commander.initialize(verbose=False)
+                        fresh_faction  = commander.init_data.get('faction') or {}
+                        fresh_members  = fresh_faction.get('members', [])
+                        fresh_name_map = {}
+                        for member_id in fresh_members:
+                            try:
+                                mprof = commander.api.call('getProfileData',
+                                                           target_user_id=str(member_id))
+                                mpi   = (mprof or {}).get('player_info', {})
+                                mname = mpi.get('name', '')
+                                if mname:
+                                    fresh_name_map[mname.lower()] = member_id
+                            except Exception:
+                                continue
+                        self._guild_member_name_cache[cache_key] = fresh_name_map
+                        _save_member_cache(guild_name, fresh_name_map)
+                        user_id = fresh_name_map.get(name.lower())
+                    except Exception:
+                        pass
+                if user_id is None:
                     return None, f"'{name}' not in {guild_name} roster (left guild?)"
 
                 prof = commander.api.call('getProfileData', target_user_id=str(user_id))
@@ -9930,6 +10016,9 @@ $(document).ready(function(){
 
         # Default: spaces -> hyphens
         return api_name.replace(' ', '-')
+
+    # ==================== [S11] TUO SIMULATION CALLS AND BATTLE-STATE PARSING ====================
+    # _run_tuo_sim/_run_tuo_reorder call TUO; _update_field_state/_extract_field_snapshot rebuild the field from battle_data.
 
     def _run_tuo_sim(self, my_deck, enemy_deck, bge_name=None,
                      sim_count=500, hand_card=None, ordered=False, surge=False, verbose=False, force_ordered=False, pvp_random=False):
@@ -10522,6 +10611,9 @@ $(document).ready(function(){
         else:
             print("  -> 🔴 Difficult matchup")
 
+    # ==================== [S12] LIVE SIM BATTLES (arena = live_sim_battle, brawl, guild war) ====================
+    # Main battle loops: pick card with TUO each turn -> playCard -> write combat log / challenge analysis.
+
     def live_sim_battle(self, skip_deck_select=False, combat_log=False, focus_unknown=False,
                         challenge_step=None, challenge_card_data=None, challenge_table=None):
         """Live Sim Battle with full debug output. Loops until stamina is empty."""
@@ -10665,8 +10757,10 @@ $(document).ready(function(){
                 target_list.append({'uid': uid, 'name': name, 'guild': guild,
                                     'gauntlet': gauntlet})
 
+            _from_guild_fallback = False
             if not target_list and guild_fallback:
                 target_list = guild_fallback
+                _from_guild_fallback = True
                 print(f"  ⚠ Only own-guild members available - using them as fallback")
             elif skipped_guild:
                 print(f"  (Skipped {skipped_guild} own-guild member(s))")
@@ -10777,8 +10871,59 @@ $(document).ready(function(){
 
                     # Priority 2: first unknown deck (all known sims < 30%)
                     if target is None and unknown_targets:
-                        target = unknown_targets[0]
-                        print(f"  -> All known decks <30% – using first unknown: {target['name']}")
+                        if _from_guild_fallback and my_deck_pre:
+                            # Own-guild fallback: fetch live decks for all candidates via
+                            # getProfileData (works for same-guild members) and pre-sim each.
+                            print(f"  Guild fallback: fetching live decks + pre-simming "
+                                  f"{len(unknown_targets)} member(s)...", flush=True)
+                            _gf_best_t   = None
+                            _gf_best_win = -1.0
+                            for _gft in unknown_targets:
+                                _gf_deck, _gf_status = self._fetch_enemy_deck_live(
+                                    _gft['name'], _gft['guild'], card_data=card_data)
+                                if not _gf_deck:
+                                    print(f"    {_gft['name']}: deck fetch failed ({_gf_status}) – skip")
+                                    continue
+                                print(f"  🎯 Pre-sim {_gft['name']} (live deck)...", end=' ', flush=True)
+                                _gf_win, _, _ = self._run_tuo_sim(
+                                    my_deck_pre, _gf_deck,
+                                    bge_name=bge_pre or None,
+                                    sim_count=50000,
+                                    pvp_random=True,
+                                )
+                                if _gf_win is None:
+                                    print("sim failed – skip", flush=True)
+                                    continue
+                                print(f"{_gf_win:.1f}%", flush=True)
+                                if _gf_win > _gf_best_win:
+                                    _gf_best_win = _gf_win
+                                    _gf_best_t   = dict(_gft)
+                                    _gf_best_t['gauntlet'] = ('LIVE', _gf_deck, _gft['guild'])
+                            if _gf_best_t is not None:
+                                # Compare live-sim winner against best known-deck result
+                                # (_best_t from Priority 1) – pick the higher win rate overall.
+                                if _best_t is not None and _best_win > _gf_best_win:
+                                    target = _best_t
+                                    print(f"  -> Guild fallback: known-deck result higher "
+                                          f"({_best_win:.1f}% > {_gf_best_win:.1f}%) – "
+                                          f"using {target['name']}", flush=True)
+                                else:
+                                    target = _gf_best_t
+                                    print(f"  -> Guild fallback best: {target['name']} "
+                                          f"({_gf_best_win:.1f}%)", flush=True)
+                            else:
+                                # All live fetches/sims failed – fall back to best known or first
+                                if _best_t is not None:
+                                    target = _best_t
+                                    print(f"  -> Guild fallback: live pre-sims failed – "
+                                          f"using best known: {target['name']} ({_best_win:.1f}%)")
+                                else:
+                                    target = unknown_targets[0]
+                                    print(f"  -> Guild fallback: all pre-sims failed – "
+                                          f"using first: {target['name']}")
+                        else:
+                            target = unknown_targets[0]
+                            print(f"  -> All known decks <30% – using first unknown: {target['name']}")
 
                     # Priority 3: highest pre-sim win rate among known decks
                     if target is None and _best_t is not None:
@@ -10870,6 +11015,11 @@ $(document).ready(function(){
             if not result or result.get('result') not in (True, 1, '1', 'true'):
                 print("✗ Failed to start battle")
                 self._print_api_error(result, "startHuntingBattle")
+                _write_api_error_log(
+                    self.api.req.get('kong_name', '?'), 'startHuntingBattle',
+                    'ArenaBattleFailed',
+                    f"vs {enemy_name} [{enemy_guild}] – "
+                    + (result.get('message', 'no message') if result else 'no response'))
                 break
 
             battle_data = result.get('battle_data', {})
@@ -10880,6 +11030,7 @@ $(document).ready(function(){
             # ── Combat log + field risk tracking for this battle ────
             _cl_card_states = {}   # cumulative field state (uid -> {flag: val})
             _cl_turns       = []   # per-turn log entries
+            self._ch_hand_first = {}   # card name (lower) -> own play number when first seen in hand (challenge log)
             _token_card_map = {}   # cumulative summon uid -> card_id (from tokens[])
 
 
@@ -10966,7 +11117,18 @@ $(document).ready(function(){
                                 enemy_name=enemy_name, enemy_guild=enemy_guild,
                                 winner=winner, battle_data=battle_data, silent=False,
                                 live_deck_str=_live_deck or None) if not (_cached_guild or enemy_guild or '').lower() in _guild_account_map else None
+                            if challenge_step and challenge_table:
+                                self._analyze_challenge_battle(
+                                    challenge_step, challenge_table,
+                                    play_order_names, winner,
+                                    account_nick=self.api.req.get('kong_name', '?'),
+                                    my_deck_str=my_deck_str or '',
+                                    battle_data=battle_data, card_data=card_data,
+                                    enemy_name=enemy_name)
                             self.initialize(verbose=False)
+                            if challenge_step and challenge_table:
+                                self._challenge_progress_check(challenge_step, challenge_table,
+                                    account_nick=self.api.req.get('kong_name', '?'))
                     break
 
                 print("  Hand:")
@@ -10995,6 +11157,9 @@ $(document).ready(function(){
                 # Reorder sim
                 hand_names     = [cname for (_, _, cname) in hand_display]
                 unique_names   = list(dict.fromkeys(hand_names))
+                for _hn in hand_names:  # challenge log: when did each card first appear in hand?
+                    if _hn:
+                        self._ch_hand_first.setdefault(str(_hn).lower(), len(play_order_names or []) + 1)
                 recommended_card = None
                 recommended_idx  = None
 
@@ -11240,7 +11405,18 @@ $(document).ready(function(){
                             'turns':       _cl_turns,
                         }, account_name=_cl_acct)
                         _cl_turns = []   # reset for next battle
+                    if challenge_step and challenge_table:
+                        self._analyze_challenge_battle(
+                            challenge_step, challenge_table,
+                            play_order_names, winner,
+                            account_nick=self.api.req.get('kong_name', '?'),
+                            my_deck_str=my_deck_str or '',
+                            battle_data=battle_data, card_data=card_data,
+                                    enemy_name=enemy_name)
                     self.initialize(verbose=False)
+                    if challenge_step and challenge_table:
+                        self._challenge_progress_check(challenge_step, challenge_table,
+                            account_nick=self.api.req.get('kong_name', '?'))
                     first_iteration = False
                     break  # inner turn loop -> outer battle loop continues
 
@@ -12500,6 +12676,8 @@ $(document).ready(function(){
     # RAID – auto+skip loop
     # ──────────────────────────────────────────────────────────────────────────
 
+    # ==================== [S13] RAIDS AND ATTACK LOOPS ====================
+
     def play_raid_loop(self, silent=False):
         """
         Plays Raid battles (auto+skip) until battle energy is empty.
@@ -13129,6 +13307,13 @@ $(document).ready(function(){
             print(f"\n✗ Error during arena farming: {e}")
             traceback.print_exc()
     
+    # ==================== [S14] PVP CHALLENGES (monthly + permanent): tables, detection, deck build, verification, log analysis ====================
+    # HOW TO ADD A NEW MONTHLY CHALLENGE:
+    #   1) add a *_CHALLENGES table (see LIVING_MIRRORS_CHALLENGES),
+    #   2) register it in _detect_challenge_step() - time-limited ones go FIRST (highest priority),
+    #   3) check name keywords against the achievement name returned by the server.
+    # Diagnostics: export/challenge_analysis.txt (one line per battle + PROGRESS lines) and export/pvp_challenge_issues.txt (deck-build issues).
+
     def pvp_challenge_fool(self):
         """
         Automates the 'Pity the Fool' PvP Challenge.
@@ -13707,6 +13892,101 @@ $(document).ready(function(){
     # FOREVER LOYAL PVP CHALLENGE AUTOMATION
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ==================== [T01] CHALLENGE TABLES (class attributes, newest first) - fields: name, desc, commander, required, pool, pool_min, pvp, wins ====================
+    # required = cards that must be in the deck AND played; pool/pool_min = N copies from a list of card names
+    # (duplicates in pool = copies wanted per type); commander = support commander that applies the needed skill.
+
+    # ── Living Mirrors PVP Challenge (Oct 27 – Nov 24, 2026) ────────────────────
+    LIVING_MIRRORS_CHALLENGES = [
+        # step 1 — Deal 30000 Damage
+        {'name': 'Mirror Damage',
+         'desc': 'Deal 30000 Damage in battles',
+         'pvp': {'type_id': 2, 'skill': 0, 'value': 30000},
+         'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 2 — Win 25 times
+        {'name': 'Mirror 25',
+         'desc': 'Win 25 times in battle', 'wins': 25,
+         'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 3 — Rally Axis Alias-6 in 25 battles and win
+        {'name': "Alias' Mirror",
+         'desc': 'Rally a Lv. 6 Axis Alias in 25 battles and win',
+         'pvp': {'type_id': 6, 'skill': 'rally', 'wins': 25},
+         'commander': 'Octane Optimized', 'required': ['Axis Alias'],
+         'pool': [], 'pool_min': 0},
+        # step 4 — Entrap Tygallius-6 in 25 battles and win
+        {'name': "Tygallius' Mirror",
+         'desc': 'Entrap a Lv. 6 Tygallius in 25 battles and win',
+         'pvp': {'type_id': 6, 'skill': 'entrap', 'wins': 25},
+         'commander': 'Octane Optimized', 'required': ['Tygallius'],
+         'pool': [], 'pool_min': 0},
+        # step 5 — Fortify Plutonium Ravager-6 in 25 battles and win
+        {'name': "Ravager's Mirror",
+         'desc': 'Fortify a Lv. 6 Plutonium Ravager in 25 battles and win',
+         'pvp': {'type_id': 6, 'skill': 'fortify', 'wins': 25},
+         'commander': None, 'required': ['Plutonium Ravager'],
+         'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+                  'Impurity Arrester', 'Restore Sequencer'], 'pool_min': 4},
+        # step 6 — Win 50 times
+        {'name': 'Mirror 50',
+         'desc': 'Win 50 times in battle', 'wins': 50,
+         'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 7 — Overload Abunisapphire-6 in 30 battles and win
+        {'name': "Abunisapphire's Mirror",
+         'desc': 'Overload a Lv. 6 Abunisapphire in 30 battles and win',
+         'pvp': {'type_id': 6, 'skill': 'overload', 'wins': 30},
+         'commander': None, 'required': ['Abunisapphire'],
+         'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Metro Monitor',
+                  'Veles Shapeshifter', "Yurich's Toeslasher", 'Tengri Godhammer'], 'pool_min': 2},
+        # step 8 — Fortify Tantzaeon-6 in 30 battles and win
+        {'name': "Tantzaeon's Mirror",
+         'desc': 'Fortify a Lv. 6 Tantzaeon in 30 battles and win',
+         'pvp': {'type_id': 6, 'skill': 'fortify', 'wins': 30},
+         'commander': None, 'required': ['Tantzaeon'],
+         'pool': ['Arcadia Redeemed', 'Experiment Gasher', 'The Mass',
+                  'Impurity Arrester', 'Restore Sequencer'], 'pool_min': 4},
+        # step 9 — Rally The Divine-6 in 30 battles and win
+        {'name': "Divine's Mirror",
+         'desc': 'Rally a Lv. 6 The Divine in 30 battles and win',
+         'pvp': {'type_id': 6, 'skill': 'rally', 'wins': 30},
+         'commander': 'Octane Optimized', 'required': ['The Divine'],
+         'pool': [], 'pool_min': 0},
+        # step 10 — Win 75 times
+        {'name': 'Mirror 75',
+         'desc': 'Win 75 times in battle', 'wins': 75,
+         'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 11 — Enrage Dartron-6 in 40 battles and win
+        {'name': "Dartron's Mirror",
+         'desc': 'Enrage a Lv. 6 Dartron in 40 battles and win',
+         'pvp': {'type_id': 6, 'skill': 'enrage', 'wins': 40},
+         'commander': 'Daedalus Charged', 'required': ['Dartron'],
+         'pool': [], 'pool_min': 0},
+        # step 12 — Heal Witness of the End-6 in 40 battles and win
+        {'name': "Witness' Mirror",
+         'desc': 'Heal a Lv. 6 Witness of the End in 40 battles and win',
+         'pvp': {'type_id': 6, 'skill': 'heal', 'wins': 40},
+         'commander': 'Malort Blightfather', 'required': ['Witness of the End'],
+         'pool': [], 'pool_min': 0,
+         'play_first': 'Witness of the End'},
+        # step 13 — Win 100 times
+        {'name': 'Mirror 100',
+         'desc': 'Win 100 times in battle', 'wins': 100,
+         'commander': None, 'required': [], 'pool': [], 'pool_min': 0},
+        # step 14 — Heal Ajaxion Tremendous-6 in 40 battles and win
+        {'name': "Ajaxion's Mirror",
+         'desc': 'Heal a Lv. 6 Ajaxion Tremendous in 40 battles and win',
+         'pvp': {'type_id': 6, 'skill': 'heal', 'wins': 40},
+         'commander': 'Malort Blightfather', 'required': ['Ajaxion Tremendous'],
+         'pool': [], 'pool_min': 0,
+         'play_first': 'Ajaxion Tremendous'},
+        # step 15 — Win 40 battles playing 4 Progenitor Assault cards each
+        {'name': 'Mirror Vindicated',
+         'desc': 'Win 40 battles after playing 4 Progenitor Assault cards in each',
+         'pvp': {'type_id': 3, 'faction': 6, 'wins': 40},
+         'commander': None, 'required': [],
+         'pool': ['Zashikinoz', 'The Mass', 'Primal Yeren', 'Leriax Putrefier'],
+         'pool_min': 4},
+    ]
+
     # LEGACY — Forever Loyal PVP Challenge table (Aug 2026 one-time event)
     # Functions _apply_challenge_deck/_restore_challenge_deck are still used for all PvP challenges
     LOYAL_CHALLENGES = [  # LEGACY (Aug 2026 one-time event)
@@ -14265,7 +14545,7 @@ $(document).ready(function(){
          'pvp': {'type_id': 3, 'faction': 6, 'wins': 25},
          'commander': None, 'required': [],
          'pool': ['Zashikinoz', 'The Mass', 'Primal Yeren', 'Leriax Putrefier'],
-         'pool_min': 6},
+         'pool_min': 4},
         # step 2 — Corrosive 300x
         {'name': 'Progenitor Winsalvo',
          'desc': 'Activate Corrosive 300 times in battles',
@@ -14352,6 +14632,9 @@ $(document).ready(function(){
          'pool': [], 'pool_min': 0},
     ]
 
+    # ==================== [T02] CHALLENGE ENGINE: detect active step, find/upgrade cards ====================
+    # Priority: Living Mirrors > Forever Loyal (legacy) > Extreme > other permanent challenges.
+
     def _detect_challenge_step(self):
         """Returns (step_number, meta_achievement, challenge_table) or (None, None, None).
         Prefers time-limited challenges (Forever Loyal); falls back to Extreme PVP Challenge,
@@ -14374,11 +14657,13 @@ $(document).ready(function(){
             for _ch in _tbl:
                 _step_name_to_table[_ch['name'].lower()] = _tbl
 
-        # 1st priority: time-limited type-12 with 'loyal'/'forever' in name
+        # 1st priority: Living Mirrors (Oct–Nov 2026) — 'mirror'/'living' in name
+        meta_mirror = None
+        # 2nd priority: time-limited type-12 with 'loyal'/'forever' in name (legacy)
         meta_loyal = meta_loyal_expired = None
-        # 2nd priority: Extreme PVP Challenge (no end_time, 'extreme' in name)
+        # 3rd priority: Extreme PVP Challenge (no end_time, 'extreme' in name)
         meta_extreme = None
-        # 3rd priority: other permanent challenges (Master the Arena, Cutlass Unleashed, …)
+        # 4th priority: other permanent challenges (Master the Arena, Cutlass Unleashed, …)
         meta_others = []
 
         for aid, a in achievements.items():
@@ -14386,7 +14671,10 @@ $(document).ready(function(){
                 continue
             nm    = a.get('name', '').lower()
             end_t = int(a.get('end_time', 0))
-            if 'loyal' in nm or 'forever' in nm:
+            if 'mirror' in nm or 'living' in nm:
+                if end_t > _now2:
+                    meta_mirror = a
+            elif 'loyal' in nm or 'forever' in nm:
                 if end_t > _now2:
                     meta_loyal = a
                 elif meta_loyal_expired is None:
@@ -14397,8 +14685,10 @@ $(document).ready(function(){
             else:
                 meta_others.append(a)
 
-        # Pick best candidate — try loyal first, fall back to extreme if completed/absent
+        # Pick best candidate — Living Mirrors first (time-limited, highest priority)
         candidates = []
+        if meta_mirror:   # only while active; expired Mirrors must not block other challenges
+            candidates.append((meta_mirror, self.LIVING_MIRRORS_CHALLENGES))
         if meta_loyal or meta_loyal_expired:
             candidates.append((meta_loyal or meta_loyal_expired, self.LOYAL_CHALLENGES))
         if meta_extreme:
@@ -14626,6 +14916,10 @@ $(document).ready(function(){
         print(f"  ✗ {name} still not at L{max_xml} after build_card")
         return None
 
+    # ==================== [T03] CHALLENGE DIAGNOSTICS: log writers + per-battle analysis (read by Claude, not by humans) ====================
+    # Line format in challenge_analysis.txt: ts | account | Step | desc | WIN/LOSS | deck | played | verdict | skillcheck | enemy
+    # followed by "detail:" line; PROGRESS lines compare server-side sub-challenge progress before/after the battle.
+
     def _challenge_log_issue(self, account_nick, step, reason):
         """Append an issue entry to export/pvp_challenge_issues.txt."""
         import datetime as _dt
@@ -14635,6 +14929,394 @@ $(document).ready(function(){
         with open(log_path, 'a', encoding='utf-8') as _f:
             _f.write(f"[{ts}]  Account: {account_nick}  Step {step}: {reason}\n")
         print(f"  ⚠  Logged issue to {log_path}")
+
+    def _challenge_battle_digest(self, battle_data, card_data, deck_str, required, pool,
+                                 play_order_names):
+        """Extra diagnostics for one battle: deck odds, play timing, kills, damage, action tally."""
+        from collections import Counter as _C
+        out = []
+        # -- deck odds / play timing
+        deck_list = [d.strip() for d in (deck_str or '').split(',') if d.strip()]
+        dl = [d.lower() for d in deck_list]
+        def _copies(nm):
+            n = nm.lower()
+            return sum(1 for d in dl if d == n or d.startswith(n + '-'))
+        def _first_turn(nm):
+            n = nm.lower()
+            for i, p in enumerate(play_order_names or []):
+                pl = p.lower()
+                if pl == n or pl.startswith(n + '-'):
+                    return i + 1
+            return None
+        if deck_list:
+            out.append(f'deck_size={len(deck_list)}')
+        for r in required:
+            _hf = getattr(self, '_ch_hand_first', {}) or {}
+            _in_hand = next((t for k, t in _hf.items() if k == r.lower() or k.startswith(r.lower() + '-')), None)
+            out.append(f'req[{r}]: copies_in_deck={_copies(r)} first_in_hand_turn={_in_hand or "never"} '
+                       f'first_played_turn={_first_turn(r) or "never"}')
+        if pool:
+            pc = _C(pool)
+            parts = []
+            for nm in dict.fromkeys(pool):
+                parts.append(f'{nm}(deck={_copies(nm)},turn={_first_turn(nm) or "-"})')
+            out.append('pool: ' + ', '.join(parts))
+        out.append(f'cards_played={len(play_order_names or [])}')
+        # -- battle_data based
+        try:
+            turns = (battle_data or {}).get('turn', {}) or {}
+            cmap = (battle_data or {}).get('card_map', {}) or {}
+            def _nm(uid):
+                cid = cmap.get(str(uid))
+                return (self._card_id_to_tuo_name(cid, card_data) if cid and card_data else None) or f'uid{uid}'
+            own_dead, enemy_dead = [], []
+            dmg_enemy = dmg_own = 0.0
+            last_h = {}
+            flags_own, flags_enemy = _C(), _C()
+            act_keys, act_vals = set(), _C()
+            for tk in sorted(turns.keys(), key=lambda x: int(x)):
+                tv = turns[tk]
+                if not isinstance(tv, dict):
+                    continue
+                for u in tv.get('attack_kill', []) or []:
+                    own_dead.append(_nm(u))
+                for u in tv.get('defend_kill', []) or []:
+                    enemy_dead.append(_nm(u))
+                items = list(tv.get('begin', []) or []) + list(tv.get('end', []) or [])
+                for act in tv.get('actions', []) or []:
+                    if isinstance(act, dict):
+                        act_keys.update(k for k in act.keys() if k != 'status')
+                        for k in ('skill', 'skill_id', 'action', 'type', 'action_type'):
+                            if k in act and isinstance(act[k], (str, int)):
+                                act_vals[f'{k}={act[k]}'] += 1
+                        items += list(act.get('status', []) or [])
+                for it in items:
+                    try:
+                        uid = int(it.get('card_uid'))
+                    except (TypeError, ValueError):
+                        continue
+                    fl, val = it.get('status_flag'), it.get('value')
+                    if fl is None or val is None:
+                        continue
+                    own = 1 <= uid <= 10 or uid == 0
+                    (flags_own if own else flags_enemy)[fl] += 1
+                    if fl == 'h':
+                        try: v = float(val)
+                        except (TypeError, ValueError): continue
+                        pv = last_h.get(uid)
+                        if pv is not None and v < pv:
+                            if own: dmg_own += pv - v
+                            else:   dmg_enemy += pv - v
+                        last_h[uid] = v
+            out.append(f'turns={len(turns)}')
+            out.append(f'kills_enemy({len(enemy_dead)}): ' + (', '.join(enemy_dead) or '-'))
+            out.append(f'kills_own({len(own_dead)}): ' + (', '.join(own_dead) or '-'))
+            out.append(f'dmg_enemy~{int(dmg_enemy)} dmg_own~{int(dmg_own)} (heuristic, from h-drops)')
+            if flags_own:
+                out.append('own_flags: ' + ' '.join(f'{k}x{v}' for k, v in flags_own.most_common(14)))
+            if flags_enemy:
+                out.append('enemy_flags: ' + ' '.join(f'{k}x{v}' for k, v in flags_enemy.most_common(10)))
+            if act_keys:
+                out.append('action_keys: ' + ','.join(sorted(act_keys)))
+            if act_vals:
+                out.append('action_vals: ' + ' '.join(f'{k}x{v}' for k, v in act_vals.most_common(14)))
+        except Exception as _dx:
+            out.append(f'digest_error={_dx}')
+        return ' | '.join(out)
+
+    def _challenge_sub_progress(self, ch):
+        """(progress, max) of the sub-achievement matching this table step, or None."""
+        ach = (self.init_data or {}).get('user_achievements', {}) or {}
+        pvp = ch.get('pvp') or {}
+        types = {9}
+        if pvp.get('type_id') is not None:
+            try: types.add(int(pvp['type_id']))
+            except (TypeError, ValueError): pass
+        nm = ch['name'].lower()
+        for a in ach.values():
+            try:
+                if int(a.get('type', 0)) not in types:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            an = a.get('name', '').lower()
+            if an == nm or an.startswith(nm + ' ('):
+                return int(a.get('progress', 0)), int(a.get('max_progress', 1))
+        return None
+
+    def _challenge_progress_check(self, challenge_step, challenge_table, account_nick='?'):
+        """Call AFTER self.initialize(): compares server-side sub-challenge progress with the
+        value before the battle and states whether the battle was actually counted."""
+        import datetime as _dt3
+        try:
+            if not challenge_table or not challenge_step:
+                return
+            idx = int(challenge_step) - 1
+            if idx < 0 or idx >= len(challenge_table):
+                return
+            ch = challenge_table[idx]
+            cur = self._challenge_sub_progress(ch)
+            store = self.__dict__.setdefault('_ch_prog', {})
+            key = (account_nick, int(challenge_step))
+            prev = store.get(key)
+            last = self.__dict__.get('_ch_last') or {}
+            if cur is None:
+                msg = 'sub-achievement NOT FOUND in user_achievements (name/type mismatch?)'
+            elif prev is None:
+                msg = f'baseline {cur[0]}/{cur[1]}'
+            else:
+                d = cur[0] - prev[0]
+                expected = bool(last.get('expected_count')) and last.get('step') == int(challenge_step)
+                if d > 0:
+                    msg = f'{prev[0]}/{prev[1]} -> {cur[0]}/{cur[1]} (+{d}) COUNTED'
+                elif expected:
+                    msg = (f'{prev[0]}/{prev[1]} -> {cur[0]}/{cur[1]} (+0) NOT COUNTED although '
+                           f'WIN + client-side conditions looked met -> server condition differs from our check')
+                else:
+                    msg = (f'{prev[0]}/{prev[1]} -> {cur[0]}/{cur[1]} (+0) not counted '
+                           f'(expected: {last.get("verdict", "?")})')
+            if cur is not None:
+                store[key] = cur
+            log_path = os.path.join(SCRIPT_DIR, 'export', 'challenge_analysis.txt')
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            ts = _dt3.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            with open(log_path, 'a', encoding='utf-8') as _lf:
+                _lf.write(f"{ts} | {account_nick} | PROGRESS Step {challenge_step}: {ch['name']} | {msg}\n")
+        except Exception:
+            pass
+
+    _SKILL_WORDS = [  # (regex on desc / pvp skill, canonical skill)
+        (r'rall', 'rally'), (r'fortif', 'fortify'), (r'heal', 'heal'),
+        (r'enrag', 'enrage'), (r'entrap', 'entrap'), (r'overload', 'overload'),
+        (r'protect', 'protect'),
+    ]
+
+    def _challenge_skill_condition(self, ch):
+        """Return (skill, needed_per_battle) for 'skill on required card' steps, else (None, 0)."""
+        import re as _re
+        if not ch.get('required'):
+            return None, 0
+        pvp = ch.get('pvp') or {}
+        skill = pvp.get('skill') if int(pvp.get('type_id', 0) or 0) == 6 else None
+        desc = (ch.get('desc') or '')
+        if not skill:
+            for rx, sk in self._SKILL_WORDS:
+                if _re.search(rx, desc, _re.I):
+                    skill = sk
+                    break
+        if not skill:
+            return None, 0
+        m = _re.search(r'(\d+)\s*times?\s+in each', desc, _re.I)
+        return skill, (int(m.group(1)) if m else 1)
+
+    def _challenge_card_timeline(self, battle_data, card_data, card_name):
+        """Collect status-flag changes of OUR copy of card_name from battle_data['turn'].
+        Returns (uids, events) with events = [(turn, flag, value)], consecutive duplicates removed.
+        Arena: own UIDs 1-10."""
+        cmap = (battle_data or {}).get('card_map', {}) or {}
+        want = card_name.lower()
+        uids = []
+        for k, cid in cmap.items():
+            if not str(k).isdigit() or not (1 <= int(k) <= 10):
+                continue
+            nm = (self._card_id_to_tuo_name(cid, card_data) or '').lower()
+            if nm == want or nm.startswith(want + '-'):
+                uids.append(str(k))
+        events, last = [], {}
+        turns = (battle_data or {}).get('turn', {}) or {}
+        for tk in sorted(turns.keys(), key=lambda x: int(x)):
+            tv = turns[tk]
+            if not isinstance(tv, dict):
+                continue
+            items = list(tv.get('begin', [])) + list(tv.get('end', []))
+            for act in tv.get('actions', []):
+                items += list(act.get('status', []))
+            for it in items:
+                uid = str(it.get('card_uid', ''))
+                if uid not in uids:
+                    continue
+                flag, val = it.get('status_flag'), it.get('value')
+                if flag is None or val is None:
+                    continue
+                if last.get((uid, flag)) == val:
+                    continue
+                last[(uid, flag)] = val
+                events.append((int(tk), uid, flag, val))
+        return uids, events
+
+    @staticmethod
+    def _count_skill_from_events(skill, events):
+        """Heuristic count of how often `skill` hit the tracked card (see _challenge_card_timeline)."""
+        def num(v):
+            try: return float(v)
+            except (TypeError, ValueError): return 0.0
+        flag_map = {'entrap': 'entrap', 'enrage': 'enrage', 'overload': 'overloaded',
+                    'protect': 'protect', 'rally': 'attack_boost', 'fortify': 'perm_max_health',
+                    'heal': 'h'}
+        fl = flag_map.get(skill)
+        prev, n = {}, 0
+        for _t, uid, flag, val in events:
+            if flag != fl:
+                continue
+            v = num(val); pv = prev.get(uid)
+            if skill == 'heal':
+                if pv is not None and v > pv: n += 1
+            elif skill in ('rally', 'fortify', 'protect'):
+                if v > (pv or 0): n += 1
+            else:  # entrap / enrage / overload: flag switches on
+                if v > 0 and not (pv or 0): n += 1
+            prev[uid] = v
+        return n
+
+    def _analyze_challenge_battle(self, challenge_step, challenge_table,
+                                   play_order_names, winner, account_nick='?',
+                                   my_deck_str='', battle_data=None, card_data=None, enemy_name=''):
+        """Analyze a completed arena battle against the active challenge condition.
+
+        Appends one line per battle to export/challenge_analysis.txt so that
+        accounts with no progress can be diagnosed without reading the full
+        console output.
+
+        What can be checked client-side:
+          - Win / loss
+          - Required cards present (required list) — distinguishes
+            "not in deck" from "in deck but not drawn in time"
+          - Pool card count (pool / pool_min — covers "play N Structure cards")
+        What cannot (logged as a note):
+          - Destroy-N-cards conditions (pvp type_id 4) — need kill list cross-ref
+          - Skill-use conditions (pvp type_id 6) — need combat-log detail
+        """
+        import datetime as _dt2
+        try:
+            if not challenge_table or not challenge_step:
+                return
+            idx = int(challenge_step) - 1
+            if idx < 0 or idx >= len(challenge_table):
+                return
+            ch = challenge_table[idx]
+            ch_name = ch.get('name', f'Step {challenge_step}')
+            ch_desc = ch.get('desc', '')
+            required = ch.get('required', [])
+            pool     = ch.get('pool', [])
+            pool_min = int(ch.get('pool_min', 0))
+            pvp      = ch.get('pvp') or {}
+            pvp_tid  = int(pvp.get('type_id', 0)) if pvp else 0
+
+            issues   = []
+            notes    = []
+
+            # Build deck name set from my_deck_str (comma-separated TUO names)
+            deck_lower = set()
+            if my_deck_str:
+                for _dn in my_deck_str.split(','):
+                    _dn = _dn.strip().lower()
+                    if _dn:
+                        deck_lower.add(_dn)
+
+            # ── 1. Win/loss ───────────────────────────────────────────
+            won = (winner == 1)
+            if not won:
+                issues.append('lost the fight')
+
+            # ── 2. Required cards ─────────────────────────────────────
+            played_lower = [n.lower() for n in play_order_names]
+            for req in required:
+                req_lc = req.lower()
+                played = any(p == req_lc or p.startswith(req_lc + '-') for p in played_lower)
+                if not played:
+                    # "not in deck" is already caught by _apply/_verify_challenge_deck
+                    # → pvp_challenge_issues.txt; only log the battle-level reason here
+                    in_deck = any(d == req_lc or d.startswith(req_lc + '-') for d in deck_lower)
+                    if in_deck:
+                        issues.append(f'required card not drawn in time: "{req}"')
+                    # else: deck-setup problem already logged in pvp_challenge_issues.txt
+
+            # ── 3. Pool card count (play-N-structures style) ──────────
+            if pool and pool_min > 0:
+                pool_played = []
+                for pcard in pool:
+                    pc_lc = pcard.lower()
+                    if any(p == pc_lc or p.startswith(pc_lc + '-') for p in played_lower):
+                        pool_played.append(pcard)
+                if len(pool_played) < pool_min:
+                    issues.append(
+                        f'only {len(pool_played)}/{pool_min} pool cards played'
+                        + (f' (played: {pool_played})' if pool_played else '')
+                    )
+
+            # ── 4. PvP condition notes (non-verifiable client-side) ───
+            if pvp_tid == 4:
+                target = pvp.get('target', '?')
+                value  = pvp.get('value', '?')
+                notes.append(f'requires destroying {value} {target} card(s) – check kill count')
+            elif pvp_tid == 6:
+                skill   = pvp.get('skill', '?')
+                card_id = pvp.get('card_id', '?')
+                w_req   = pvp.get('wins', '?')
+                notes.append(f'requires skill "{skill}" on card {card_id}, {w_req} win(s) – check combat log')
+
+            # ── 5. Skill condition (Heal/Rally/... on required card) ──
+            skill_info = ''
+            try:
+                sk, need = self._challenge_skill_condition(ch)
+                if sk and battle_data and card_data:
+                    uids, evs = self._challenge_card_timeline(battle_data, card_data, required[0])
+                    if not uids:
+                        skill_info = f'skillcheck: {sk} on {required[0]} - card never on field'
+                    else:
+                        got = self._count_skill_from_events(sk, evs)
+                        relevant = {'heal': 'h', 'rally': 'attack_boost', 'fortify': 'perm_max_health',
+                                    'entrap': 'entrap', 'enrage': 'enrage', 'overload': 'overloaded',
+                                    'protect': 'protect'}[sk]
+                        tl = ' '.join(f'T{t}:{f}={v}' for t, _u, f, v in evs if f == relevant)
+                        skill_info = (f'skillcheck: {sk} {got}/{need} on {required[0]} (heuristic)'
+                                      f' | timeline[{relevant}]: {tl or "-"}')
+                        if got < need:
+                            issues.append(f'skill condition likely unmet: {sk} {got}/{need} on "{required[0]}" (heuristic)')
+                    notes = [n for n in notes if not n.startswith('requires skill')]
+            except Exception as _sx:
+                skill_info = f'skillcheck: error {_sx}'
+
+            # ── 6. Extra diagnostics (deck odds, timing, kills, damage, flags) ──
+            try:
+                detail = self._challenge_battle_digest(battle_data, card_data, my_deck_str,
+                                                       required, pool, play_order_names)
+            except Exception as _ddx:
+                detail = f'digest_error={_ddx}'
+
+            # ── Build verdict ─────────────────────────────────────────
+            result_tag = 'WIN' if won else 'LOSS'
+            played_str = ', '.join(play_order_names) if play_order_names else '(none)'
+            if issues:
+                verdict = 'FAILED: ' + '; '.join(issues)
+            elif notes:
+                verdict = 'WIN – unverified: ' + '; '.join(notes)
+            else:
+                verdict = 'WIN – conditions met'
+
+            # ── Write log ─────────────────────────────────────────────
+            log_path = os.path.join(SCRIPT_DIR, 'export', 'challenge_analysis.txt')
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            ts = _dt2.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            deck_str = my_deck_str if my_deck_str else '(unknown)'
+            with open(log_path, 'a', encoding='utf-8') as _lf:
+                _lf.write(
+                    f"{ts} | {account_nick} | Step {challenge_step}: {ch_name}"
+                    f" | {ch_desc}"
+                    f" | {result_tag}"
+                    f" | deck: {deck_str}"
+                    f" | played: {played_str}"
+                    f" | {verdict}"
+                    + (f" | {skill_info}" if skill_info else "")
+                    + (f" | enemy: {enemy_name}" if enemy_name else "") + "\n"
+                    + f"    detail: {detail}\n"
+                )
+            self._ch_last = {'step': int(challenge_step), 'verdict': verdict,
+                             'expected_count': bool(won and not issues)}
+        except Exception:
+            pass  # analysis is best-effort, never break the battle loop
+
+    # ==================== [T04] CHALLENGE DECK BUILD / RESTORE / VERIFY ====================
 
     def _apply_challenge_deck(self, step, card_data, deck_slot=1, challenge_table=None):
         """Adjust slot-1 deck for the current challenge step.
@@ -14752,6 +15434,12 @@ $(document).ready(function(){
                 self._challenge_log_issue(nick, step, reason)
                 return None, None  # abort before modifying deck
 
+        # POOL BUILD: pool_min = minimum TOTAL copies wanted; each name in ch['pool'] counts as one wanted copy
+        # of that type, so duplicates in the list mean several copies. The server stores only ONE copy per
+        # card id in setDeckCards (see Counter note below), so 'want' is capped per type.
+        # FIX: pass 1 respects the per-type cap; pass 2 tops up missing copies with extra copies of the pool
+        # cards (e.g. 'play 5 Structure cards' is satisfied by 5 copies of one structure). Previously a pool
+        # listing each card once could never reach pool_min if only 1-2 types were available.
         pool_ids = []
         remaining = ch['pool_min']
 
@@ -14764,10 +15452,10 @@ $(document).ready(function(){
                 pool_order.append(card_name)
             seen_pool[card_name] += 1
 
-        for card_name in pool_order:
+        for _pass2, card_name in [(False, c) for c in pool_order] + [(True, c) for c in pool_order]:
             if remaining <= 0:
                 break
-            want = remaining  # use as many copies of this card as needed
+            want = remaining if _pass2 else min(remaining, seen_pool[card_name])  # pass 1: cap per type
 
             base   = self._find_card_id_by_name(card_name, card_data)
             if not base:
@@ -14779,12 +15467,14 @@ $(document).ready(function(){
             self.initialize(verbose=False)
             uc    = self.init_data.get('user_cards', {})
             owned = int((uc.get(str(max_id)) or {}).get('num_owned', 0))
-            equip_now = min(owned, want)
+            _used = pool_ids.count(str(max_id))  # copies of this id already in pool (pass 2)
+            equip_now = min(max(owned - _used, 0), want)
             for _ in range(equip_now):
                 pool_ids.append(str(max_id))
                 print(f"     Pool [{len(pool_ids)}]: {card_name} (from inventory, id={max_id})")
             remaining -= equip_now
             still_need = want - equip_now
+            _built = 0  # copies built for this card in this iteration
 
             # Step B: build missing copies one by one via build_card directly
             for i in range(still_need):
@@ -14819,7 +15509,8 @@ $(document).ready(function(){
                 self.initialize(verbose=False)
                 uc2    = self.init_data.get('user_cards', {})
                 owned2 = int((uc2.get(str(max_id)) or {}).get('num_owned', 0))
-                if owned2 > owned + len([p for p in pool_ids if p == str(max_id)]) - equip_now:
+                if owned2 > owned + _built:
+                    _built += 1
                     pool_ids.append(str(max_id))
                     remaining -= 1
                     print(f"     Pool [{len(pool_ids)}]: {card_name} built (id={max_id})")
@@ -14932,11 +15623,29 @@ $(document).ready(function(){
 
         if all_new:
             n = len(all_new)
-            if n > len(new_card_ids):
-                new_card_ids = all_new
+            # FIX: drop copies of the challenge cards that are already in the deck BEFORE adding them again.
+            # Otherwise e.g. Flourish Turbine (1 owned, 1 already in deck) was sent as 2x and the server
+            # rejected the WHOLE deck ("You do not have 2 of card ..."), so the challenge deck never applied.
+            _all_set = set(all_new)
+            _deck_size = len(new_card_ids)
+            _kept = [c for c in new_card_ids if c not in _all_set]
+            if n >= _deck_size:
+                new_card_ids = list(all_new)
             else:
-                new_card_ids[-n:] = all_new
-            print(f"     Replaced last {n} deck slot(s) with challenge cards")
+                new_card_ids = _kept[:_deck_size - n] + list(all_new)
+            # Safety: never send more copies of an id than the account owns
+            _uc_cap = self.init_data.get('user_cards', {})
+            _cnt_seen = {}
+            _capped = []
+            for c in new_card_ids:
+                _own = int((_uc_cap.get(str(c)) or {}).get('num_owned', 0))
+                _cnt_seen[c] = _cnt_seen.get(c, 0) + 1
+                if _own and _cnt_seen[c] > _own:
+                    print(f"  ⚠ Dropping surplus copy of id={c} (owned {_own})")
+                    continue
+                _capped.append(c)
+            new_card_ids = _capped
+            print(f"     Replaced {n} deck slot(s) with challenge cards")
 
         # Skip setDeckCards if nothing changed at all
         cmdr_changed  = str(new_cmdr_id) != str(orig_cmdr)
@@ -14947,6 +15656,8 @@ $(document).ready(function(){
 
         # ── PHASE 6: setDeckCards ─────────────────────────────────────────
         try:
+            # NOTE: setDeckCards takes {card_id: count}. Earlier assumption that counts > 1 are ignored is
+            # UNCONFIRMED (read decks do contain counts > 1); the check below compares sent vs. server deck.
             from collections import Counter as _Counter
             import json as _json2
             cards_json = _json2.dumps(
@@ -14972,13 +15683,33 @@ $(document).ready(function(){
                 _ret_result in (True, 1, '1', 'true')
                 or (_ret_cmdr and _ret_cmdr == str(new_cmdr_id))
             )
+            # FIX: the commander is often unchanged (e.g. Extreme step 8), so the commander check above
+            # passes even when the server REJECTED the cards. Compare the returned card list with what we sent.
+            try:
+                _sent = {str(k): int(v) for k, v in _json2.loads(cards_json).items()}
+                _ret_cards = (_ret_decks.get(str(deck_slot)) or {}).get('cards')
+                if isinstance(_ret_cards, dict):
+                    _got = {str(k): int(v) for k, v in _ret_cards.items()}
+                elif isinstance(_ret_cards, list):
+                    _got = dict(_Counter(str(c) for c in _ret_cards))
+                else:
+                    _got = None
+                if _got is not None and _got != _sent:
+                    _missing = {k: v - _got.get(k, 0) for k, v in _sent.items() if _got.get(k, 0) < v}
+                    reason = (f"setDeckCards did NOT apply all cards (result={_ret_result!r}); "
+                              f"missing on server: {_missing}; sent={cards_json}; "
+                              f"server={_json2.dumps(_got)}; response={str(result)[:300]}")
+                    print(f"  ✗ {reason}")
+                    self._challenge_log_issue(nick, step, reason)
+                    return None, None
+            except (ValueError, TypeError, AttributeError):
+                pass
             if ok:
                 print(f"  ✓ Deck slot {deck_slot} updated for step {step}"
                       f" (commander_id={new_cmdr_id})")
             else:
                 reason = (f"setDeckCards rejected: result={_ret_result!r}, "
-                          f"returned commander={_ret_cmdr!r} (expected {new_cmdr_id}), "
-                          f"full response={result!r}")
+                          f"returned commander={_ret_cmdr!r} (expected {new_cmdr_id})")
                 print(f"  ✗ {reason}")
                 self._challenge_log_issue(nick, step, reason)
                 return None, None
@@ -15004,6 +15735,34 @@ $(document).ready(function(){
                 print(f"  ⚠ setActiveDeck after challenge update returned: {_act_res}")
         except Exception as _ex_act:
             print(f"  ⚠ setActiveDeck after challenge update failed: {_ex_act}")
+
+        # FIX (diagnostic): re-read the deck from the server and report what is REALLY stored/active.
+        try:
+            self.initialize(verbose=False)
+            _srv = (self.init_data.get('user_decks', {}) or {}).get(str(deck_slot), {}) or {}
+            _srv_cards = _srv.get('cards')
+            _srv_map = ({str(k): int(v) for k, v in _srv_cards.items()} if isinstance(_srv_cards, dict)
+                        else dict(_Counter(str(c) for c in (_srv_cards or []))))
+            _srv_names = ', '.join(
+                f"{(card_data.get(int(k), {}) or {}).get('name', k)}x{v}" for k, v in _srv_map.items())
+            _srv_cmdr = str(_srv.get('commander_id', ''))
+            _cmdr_nm = ((card_data.get(int(_srv_cmdr), {}) or {}).get('name', _srv_cmdr)
+                        if _srv_cmdr.isdigit() else _srv_cmdr)
+            _cmdr_ok = (_srv_cmdr == str(new_cmdr_id))
+            print(f"  [VERIFY] server deck slot {deck_slot}: Commander {_cmdr_nm} "
+                  f"{'✓' if _cmdr_ok else '✗ expected id ' + str(new_cmdr_id)} | {_srv_names}")
+            if not _cmdr_ok:
+                _r = f"Server commander {_srv_cmdr} differs from intended {new_cmdr_id} after setDeckCards"
+                print(f"  ✗ {_r}")
+                self._challenge_log_issue(nick, step, _r)
+            _want = _Counter(str(c) for c in new_card_ids)
+            if any(_srv_map.get(k, 0) < v for k, v in _want.items()):
+                _r = (f"Server deck differs from intended deck after setDeckCards/setActiveDeck: "
+                      f"intended={dict(_want)} server={_srv_map} active_deck_id={self.init_data.get('active_deck', '?')}")
+                print(f"  ✗ {_r}")
+                self._challenge_log_issue(nick, step, _r)
+        except Exception as _exv:
+            print(f"  ⚠ post-update deck verify failed: {_exv}")
 
         return (orig_card_ids, str(orig_cmdr_snap))
 
@@ -15034,6 +15793,23 @@ $(document).ready(function(){
                 _ret_result2 in (True, 1, '1', 'true')
                 or (_ret_cmdr2 and _ret_cmdr2 == str(orig_cmdr_id))
             )
+            # FIX: commander-only success was a false positive when the server rejected the cards
+            # (same bug as in _apply_challenge_deck). Compare returned cards with what was sent.
+            if ok:
+                try:
+                    _sent2 = {str(k): int(v) for k, v in _json2.loads(cards_json).items()}
+                    _rc = (_ret_decks2.get(str(deck_slot)) or {}).get('cards')
+                    _got2 = ({str(k): int(v) for k, v in _rc.items()} if isinstance(_rc, dict)
+                             else dict(_Counter(str(c) for c in _rc)) if isinstance(_rc, list) else None)
+                    if _got2 is not None and _got2 != _sent2:
+                        ok = False
+                        _msg2 = str(result.get('result_message', ''))[:200] if isinstance(result, dict) else ''
+                        print(f"  ✗ Restore NOT applied: sent={_sent2} server={_got2} {_msg2}")
+                        self._challenge_log_issue(
+                            self.api.req.get('kong_name', '?'), 0,
+                            f"Deck RESTORE not applied: sent={_sent2} server={_got2} msg={_msg2}")
+                except (ValueError, TypeError, AttributeError):
+                    pass
             if ok:
                 print(f"  ✓ Deck slot {deck_slot} restored to original")
             else:
@@ -15144,6 +15920,42 @@ $(document).ready(function(){
                 if req.lower() not in deck_names_lower and not found_by_id:
                     id_hint = f", forced_id={forced_id}" if forced_id else ""
                     issues.append(f"Required card missing from deck: '{req}'{id_hint}")
+
+        # ── Check pool cards (warning only — partial pool already accepted upstream) ──
+        pool_min  = int(ch.get('pool_min', 0))
+        pool_list = ch.get('pool', [])
+        if pool_min > 0 and pool_list:
+            # Need per-card counts, not just presence — re-read deck_cards_raw
+            _dcr = deck_info.get('cards', {})
+            _deck_counts: dict = {}
+            if isinstance(_dcr, dict):
+                for _k, _v in _dcr.items():
+                    try:
+                        _deck_counts[str(_k)] = int(_v)
+                    except (ValueError, TypeError):
+                        _deck_counts[str(_k)] = 1
+            elif isinstance(_dcr, list):
+                from collections import Counter as _Ctr
+                for _k, _v in _Ctr(str(c) for c in _dcr).items():
+                    _deck_counts[_k] = _v
+
+            pool_in_deck = 0
+            for _pcard in pool_list:
+                _pb  = self._find_card_id_by_name(_pcard, card_data)
+                _pmax = self._resolve_to_max_level_id(_pb, card_data) if _pb else None
+                pool_in_deck += max(
+                    _deck_counts.get(str(_pb),   0) if _pb   else 0,
+                    _deck_counts.get(str(_pmax), 0) if _pmax else 0,
+                )
+
+            if pool_in_deck < pool_min:
+                _pool_warn = (
+                    f"[VERIFY] Only {pool_in_deck}/{pool_min} pool card copies verified in deck "
+                    f"(pool: {', '.join(dict.fromkeys(pool_list))})"
+                )
+                print(f"  ⚠ Challenge deck verify: {_pool_warn}")
+                self._challenge_log_issue(nick, step, _pool_warn)
+                # Not a hard failure — proceed; challenge_analysis.txt will diagnose per battle
 
         if issues:
             for issue in issues:
@@ -15330,6 +16142,8 @@ $(document).ready(function(){
                 self.multi_account_live_sim(mode='arena')
             finally:
                 self._restore_challenge_deck(orig_ids, orig_cmdr)
+
+    # ==================== [S15] ARENA OPPONENT EXPORT, GAUNTLET CLEANUP, DECK OPTIMIZATION ====================
 
     def _export_arena_opponent_deck(self, enemy_name, winner, battle_data, enemy_guild='', silent=False, brawl_mode=False, live_deck_str=None):
         """
@@ -16048,6 +16862,8 @@ $(document).ready(function(){
             print("✗ Failed to save deck")
             self._print_api_error(result, 'setDeckCards')
     # ==================== MULTI-ACCOUNT LIVE SIM ====================
+
+    # ==================== [S16] ENERGY TRACKER, EVENT REWARDS, MULTI-ACCOUNT RUNNERS ====================
 
     def energy_tracker_loop(self):
         """
@@ -17232,6 +18048,8 @@ $(document).ready(function(){
         print(f"{'='*65}")
 
 
+    # ==================== [S17] MISSION DECK OPTIMIZER, DECK IMPORT, ATTACK/DEFENSE DECK SETTERS ====================
+
     def optimize_mission_deck(self, instance=None):
         """
         Finds the first active Quest Mission (same logic as play_first_quest_mission_loop),
@@ -17398,8 +18216,8 @@ $(document).ready(function(){
             if _auto_gbge:
                 print(f"  🌐 Active GBGE: {_auto_gbge} (auto)")
                 import time as _t2; _t2.sleep(5)
-                if _gbge_in is None:
-                    _gbge = ''
+                # FIX: removed leftover 'if _gbge_in is None' check - _gbge_in no longer exists
+                # (manual BGE prompt was removed) and raised NameError whenever a GBGE was auto-detected.
         if not _gbge:
             _gbge = getattr(_self, '_gbge_override', '')
         if _gbge:
@@ -18058,6 +18876,8 @@ $(document).ready(function(){
     # ==================== CARDN-MANAGEMENT ====================
     
     # ---------- Card-Data from tyrattonline load ----------
+
+    # ==================== [S18] DATA LOADERS (missions, cards) AND CARD LOOKUP HELPERS ====================
 
     def _load_mission_data(self):
         """
@@ -18800,6 +19620,8 @@ $(document).ready(function(){
 
     # ---------- Events & Activities ----------
 
+    # ==================== [S19] EVENTS DISPLAY AND INVENTORY ====================
+
     def show_events(self):
         """
         Shows detailed information about current events (Brawl, Raids, Conquest, etc.)
@@ -18927,7 +19749,7 @@ $(document).ready(function(){
                                 pts        = entry.get('points', '0')
                                 faction_id = str(entry.get('faction_id', ''))
                                 try:    pts_fmt = f"{int(pts):,}"
-                                except: pts_fmt = pts
+                                except (ValueError, TypeError): pts_fmt = pts
                                 if len(name) > 20: name = name[:17] + "..."
                                 star = " ⭐" if faction_id == user_faction_id else ""
                                 print(f"│  │  {rank_num:>2}. {name:<20} {pts_fmt:>10}{star}")
@@ -18943,7 +19765,7 @@ $(document).ready(function(){
                                         if str(entry.get('faction_id','')) == user_faction_id:
                                             rn = entry.get('rank','?')
                                             try:    pf = f"{int(entry.get('points','0')):,}"
-                                            except: pf = entry.get('points','?')
+                                            except (ValueError, TypeError): pf = entry.get('points','?')
                                             print(f"│  │")
                                             print(f"│  │  Your guild ({user_faction_name}): Rank #{rn} – {pf} pts")
                                             break
@@ -18965,7 +19787,7 @@ $(document).ready(function(){
                                 pts      = entry.get('points', '0')
                                 uid      = str(entry.get('user_id',''))
                                 try:    pts_fmt = f"{int(pts):,}"
-                                except: pts_fmt = pts
+                                except (ValueError, TypeError): pts_fmt = pts
                                 if len(name) > 22: name = name[:19] + "..."
                                 star = " ◀ YOU" if uid == user_id_str else ""
                                 print(f"│  │  {rank_num:>3}. {name:<22} {pts_fmt:>8}{star}")
@@ -19001,7 +19823,7 @@ $(document).ready(function(){
                             pts        = entry.get('points', '0')
                             faction_id = str(entry.get('faction_id', ''))
                             try:    pts_fmt = f"{int(pts):,}"
-                            except: pts_fmt = pts
+                            except (ValueError, TypeError): pts_fmt = pts
                             if len(name) > 20: name = name[:17] + "..."
                             star = " ⭐" if faction_id == user_faction_id else ""
                             _prev_brawl_lines.append(f"│  │  {rank_num:>2}. {name:<20} {pts_fmt:>10}{star}")
@@ -19013,7 +19835,7 @@ $(document).ready(function(){
                                     if str(entry.get('faction_id','')) == user_faction_id:
                                         rn = entry.get('rank', entry.get('points_rank','?'))
                                         try:    pf = f"{int(entry.get('points','0')):,}"
-                                        except: pf = entry.get('points','?')
+                                        except (ValueError, TypeError): pf = entry.get('points','?')
                                         _prev_brawl_lines.append(f"│  │")
                                         _prev_brawl_lines.append(f"│  │  Your guild ({user_faction_name}): Rank #{rn} – {pf} pts")
                                         break
@@ -19024,7 +19846,7 @@ $(document).ready(function(){
                             pts      = entry.get('points', '0')
                             uid      = str(entry.get('user_id',''))
                             try:    pts_fmt = f"{int(pts):,}"
-                            except: pts_fmt = pts
+                            except (ValueError, TypeError): pts_fmt = pts
                             if len(name) > 22: name = name[:19] + "..."
                             star = " ◀ YOU" if uid == user_id_str else ""
                             _prev_brawl_lines.append(f"│  │  {rank_num:>3}. {name:<22} {pts_fmt:>8}{star}")
@@ -19294,7 +20116,7 @@ $(document).ready(function(){
                     pts  = entry.get('faction_war_points', entry.get('points', 0))
                     fid  = str(entry.get('faction_id', ''))
                     try: pts_fmt = f"{int(pts):,}"
-                    except: pts_fmt = str(pts)
+                    except (ValueError, TypeError): pts_fmt = str(pts)
                     if len(str(name)) > 20: name = str(name)[:17] + "..."
                     star = " ⭐" if fid == own_fid else ""
                     print(f"│  │  {rn:>3}. {name:<20} {pts_fmt:>10}{star}")
@@ -19306,7 +20128,7 @@ $(document).ready(function(){
                             if str(entry.get('faction_id','')) == own_fid:
                                 rn  = entry.get('rank', fwei.get('our_rank', '?'))
                                 try: pf = f"{int(entry.get('faction_war_points', total_pts)):,}"
-                                except: pf = str(total_pts)
+                                except (ValueError, TypeError): pf = str(total_pts)
                                 print(f"│  │")
                                 print(f"│  │  Your guild ({own_guild}): Rank #{rn} – {pf} pts")
                                 break
@@ -19762,6 +20584,8 @@ $(document).ready(function(){
         
         return None
     
+    # ==================== [S20] SHOP: GOLD/SALVAGE/SP, PACKS, SALVAGE WORKFLOWS, DAILY CLAIMS ====================
+
     def get_gold(self):
         """Returns current Gold from init_data"""
         # Refresh data to get current state
@@ -20396,6 +21220,8 @@ $(document).ready(function(){
             # Silent error handling - should not block startup
             return False
     
+    # ==================== [S21] CARD UNLOCKING AND OUTDATED-CARD LIST HANDLING ====================
+
     def _unlock_locked_cards(self, card_ids):
         """
         Unlocks all locked cards from the given card_ids list (silent, with progress).
@@ -20625,6 +21451,56 @@ $(document).ready(function(){
               + (f"  |  {len(failed)} failed" if failed else ''))
         print(f"{'='*55}")
 
+    @staticmethod
+    def _log_outdated_ids_change(action: str, ids, detail: str = '') -> None:
+        """Append a change entry to export/outdatedIDs_log.txt.
+
+        action examples:
+          'manually added'           – via _add_card_to_outdated_list
+          'manually removed'         – via _remove_card_from_outdated_list
+          'auto-removed (equipped)'  – card is in active deck, skipped salvage
+        """
+        try:
+            log_path = os.path.join('export', 'outdatedIDs_log.txt')
+            os.makedirs('export', exist_ok=True)
+            ts = __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            ids_sorted = sorted(ids)
+            id_str = ', '.join(str(i) for i in ids_sorted)
+            detail_part = f' | {detail}' if detail else ''
+            line = f"{ts} | {action} | {len(ids_sorted)} ID(s): {id_str}{detail_part}\n"
+            with open(log_path, 'a', encoding='utf-8') as _lf:
+                _lf.write(line)
+        except Exception:
+            pass  # logging is best-effort
+
+    @staticmethod
+    def _write_outdated_ids_safe(outdated_file: str, ids) -> None:
+        """Atomically overwrite outdatedIDs.txt.
+
+        - Creates a .bak backup of the current file before touching it.
+        - Writes to a sibling .tmp file first, then os.replace() so a crash
+          or connection drop during the write never leaves a truncated file.
+        """
+        import tempfile as _tf, shutil as _sh
+        ids_sorted = sorted(ids)
+        dir_ = os.path.dirname(outdated_file) or '.'
+        # Backup current file before overwriting
+        if os.path.isfile(outdated_file):
+            _sh.copy2(outdated_file, outdated_file + '.bak')
+        # Atomic write via temp file in same directory (guarantees same filesystem)
+        fd, tmp_path = _tf.mkstemp(dir=dir_, suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as _f:
+                for _id in ids_sorted:
+                    _f.write(f"{_id}\n")
+            os.replace(tmp_path, outdated_file)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
     def salvage_outdated_all_accounts(self):
         """
         Runs _salvage_outdated_cards for all play_enabled accounts silently.
@@ -20815,11 +21691,11 @@ $(document).ready(function(){
                     new_ids.append(card_id)
                     existing_ids.add(card_id)
             
-            # Write all IDs back to file (sorted)
-            with open(outdated_file, 'w') as f:
-                for card_id in sorted(existing_ids):
-                    f.write(f"{card_id}\n")
-            
+            # Write all IDs back to file (sorted, atomic)
+            self._write_outdated_ids_safe(outdated_file, existing_ids)
+            if new_ids:
+                self._log_outdated_ids_change('manually added', new_ids, card_display_name)
+
             if new_ids:
                 print(f"\n✓ Added {len(new_ids)} IDs to outdatedIDs.txt")
                 print(f"   File: {outdated_file}")
@@ -20912,11 +21788,13 @@ $(document).ready(function(){
                 print(f"\n✓ '{card_display_name}' was not in outdatedIDs.txt")
                 return
             
-            # Write remaining IDs back to file
-            with open(outdated_file, 'w') as f:
-                for card_id in sorted(existing_ids):
-                    f.write(f"{card_id}\n")
-            
+            # Write remaining IDs back to file (atomic)
+            self._write_outdated_ids_safe(outdated_file, existing_ids)
+            self._log_outdated_ids_change(
+                'manually removed',
+                [cid for cid, _ in removed_ids],
+                card_display_name)
+
             print(f"\n✓ Removed {len(removed_ids)} IDs from outdatedIDs.txt:")
             for card_id, level in sorted(removed_ids, key=lambda x: x[1]):
                 print(f"   Level {level}: ID {card_id}")
@@ -21077,9 +21955,10 @@ $(document).ready(function(){
                                 _orig_ids.add(int(_l))
                     _cleaned = _orig_ids & outdated_ids
                     if len(_cleaned) < len(_orig_ids):
-                        with open(outdated_file, 'w') as _f:
-                            for _id in sorted(_cleaned):
-                                _f.write(f"{_id}\n")
+                        _removed_eq = _orig_ids - _cleaned
+                        self._write_outdated_ids_safe(outdated_file, _cleaned)
+                        self._log_outdated_ids_change('auto-removed (equipped)', _removed_eq,
+                                                      'card in active deck – salvage skipped')
                         print(f"   ✓ Removed {len(_orig_ids) - len(_cleaned)} ID(s) from outdatedIDs.txt")
                 return
             
@@ -21102,9 +21981,10 @@ $(document).ready(function(){
                             _orig_ids2.add(int(_l2))
                 _cleaned2 = _orig_ids2 & outdated_ids
                 if len(_cleaned2) < len(_orig_ids2):
-                    with open(outdated_file, 'w') as _f2:
-                        for _id2 in sorted(_cleaned2):
-                            _f2.write(f"{_id2}\n")
+                    _removed_eq2 = _orig_ids2 - _cleaned2
+                    self._write_outdated_ids_safe(outdated_file, _cleaned2)
+                    self._log_outdated_ids_change('auto-removed (equipped)', _removed_eq2,
+                                                  'card in active deck – salvage skipped')
                     print(f"   ✓ Removed {len(_orig_ids2) - len(_cleaned2)} ID(s) from outdatedIDs.txt")
             
             # Show expected SP
@@ -21203,6 +22083,8 @@ $(document).ready(function(){
             print(f"✗ Error salvaging outdated cards: {e}")
             traceback.print_exc()
     
+    # ==================== [S22] STAMINA, DAILY BONUS, REWARD CLAIMING, GUILD DECK EXPORT ====================
+
     def refill_arena_stamina(self):
         """Refill Arena stamina using buyStaminaRefillTokens."""
         self.initialize(verbose=False)
@@ -21659,6 +22541,8 @@ $(document).ready(function(){
     
     # ==================== INVENTORY - BUILD CARDS ====================
     
+    # ==================== [S23] CARD BUILDING (recursive fusion/upgrade planning + execution) ====================
+
     def build_card(self, card_name_or_id=None):
         """
         Builds one or more Cards - shows recipe, costs, inventory
@@ -23548,6 +24432,8 @@ $(document).ready(function(){
     #   show_dominion_fusions()    - removed (unused)
     # ==============================================================
     
+    # ==================== [S24] DOMINION (reset, upgrade, autobuild) ====================
+
     def reset_dominion(self, dominion_card_id=None):
         """
         [LEGACY FUNCTION - No longer in menu]
@@ -24496,6 +25382,8 @@ $(document).ready(function(){
     
 # ==================== HELPER FUNCTIONS ====================
 
+# ==================== [M01] MODULE-LEVEL UI HELPERS (prompts, settings help, bulk account checks, settings generator) ====================
+
 def confirm_action(prompt):
     """
     Asks user for confirmation with Enter/ESC
@@ -25220,6 +26108,9 @@ def _select_account_range(playable, mode_label):
     return mapping[choice.strip()]
 
 
+# ==================== [M02] MAIN MENU - option numbers are part of the user interface, do NOT renumber ====================
+# Each elif choice == "NN" block calls a TyrantCommander method.
+
 def interactive_menu():
     """Interactive main menu"""
 
@@ -25859,7 +26750,8 @@ def interactive_menu():
                 ki = input_with_esc("Base Epics to keep per card (default=10, ESC=Cancel): ", allow_empty=True)
                 if ki is None: return
                 _keep_ma = int(ki.strip()) if ki.strip() else 10
-                import glob as _glob
+                # FIX: no local 'import glob as _glob' here - it made _glob a local variable of the
+                # whole interactive_menu() and caused UnboundLocalError at menu start (module-level import is used)
                 _sdirs = [SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'settings'),
                           os.path.join(SCRIPT_DIR, 'data', 'settings')]
                 _sfiles = []
