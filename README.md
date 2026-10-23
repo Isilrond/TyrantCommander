@@ -34,7 +34,7 @@ Communicates directly via the official game API — no game client required.
 | `assetbundles4_6.xml` | Asset bundle index legacy (`data/` folder) |
 | `database.yml` | TUO database file (auto-managed, max ~310 MB) |
 
-> **Important:** All XML files must be kept up to date using **F→1 (Download Game Data)**. The event XMLs (`battle_events_h52.xml`, `raids_x42.xml`, `faction_wars_fp3.xml`) are read by F→28/29 for automatic event detection — they typically contain future events, so a single download suffices until a new event cycle begins.
+> **Important:** All XML files must be kept up to date using **F→1 (Update XML Files)**. The event XMLs (`battle_events_h52.xml`, `raids_x42.xml`, `faction_wars_fp3.xml`) are read by D→28/29 for automatic event detection — they typically contain future events, so a single download suffices until a new event cycle begins.
 
 ---
 
@@ -66,6 +66,8 @@ TUO-Live/
     ├── guild_member_cache/          ← Name→ID cache per guild (6 h TTL)
     ├── energylog/                   ← Hourly energy snapshots
     ├── guildwar_stats/              ← Guild War JSON + HTML snapshots
+    ├── logo/                        ← Optional logos for GW HTML snapshots
+    ├── gw_bges_<Guild>.txt          ← BGE per match for GW Auto-Pipeline (one name per line)
     ├── missions.xml
     ├── achievements.xml
     ├── items.xml
@@ -89,52 +91,133 @@ TUO-Live/
 
 ## Menu Structure
 
-| Submenu | Category | Key Features |
-|---------|----------|--------------|
-| **A** | Info & Events | Player info, active events, XML update, deck editor, guild members, quests |
-| **B** | Inventory & Export | Export decks (slots 1–6), gauntlet management, sync guild defense + attack decks, Build Brawl Gauntlet |
-| **C** | Guild Management | Sync decks, leave/invite/accept, Build Brawl Gauntlet |
-| **D** | Economy | Buy, salvage, build card/dominion, optimize mission, update from import, use shards (all accounts) |
-| **E** | Events & Rewards | Claim rewards, play missions/quests/raid (single & all accounts) |
-| **F** | Automation & Battle | Live Sim, multi-account pipelines, energy tracker, Guild War, Loyal Challenge PvP, claim daily reward |
+Main menu: **A–F** submenus, `99` = back to account selection, `0` = exit. At account selection: `997` Check API for all accounts, `998` Settings Generator, `999` Settings Help. References in this document use the form **Submenu→Option** (e.g. D→28).
 
-Settings (`91`/`92`) accessible from main menu at any time.
+| Submenu | Category | Options |
+|---------|----------|---------|
+| **A** | Information | 7 |
+| **B** | Inventory & Card Management | 24 |
+| **C** | Sim Preparation & Export | 14 |
+| **D** | Automation & Battle | 29 |
+| **E** | Guild Management | 4 |
+| **F** | Settings & Maintenance | 5 |
 
----
+Options marked *multi* are only shown when more than one account is configured.
 
-## Automation & Battle (F)
+### A – Information
 
 | # | Name | Description |
 |---|------|-------------|
-| 1 | Claim Rewards | Auto-detects and claims current event reward |
-| 2 | Claim Rewards – All Accounts | For all `play_enabled` accounts |
-| 3 | Attack Next Free Player | Arena attack without TUO; skip-guild filter |
-| 4 | Play Highest Mission (loop) | 3-star grind until energy empty |
-| 5 | Play Highest Mission – All Accounts | Same for account range |
-| 6 | ↳ Clear Mission Blacklist | Clears skipped mission IDs for all accounts |
-| 7 | Play Quest Missions (loop) | Quest-linked missions until energy depleted |
-| 8 | Play First Quest Mission – All Accounts | Per account: first quest mission until energy=0 |
-| 9 | Play Raid (auto+skip, loop) | Raid battles until battle energy empty; auto Slot 5 |
-| 10 | Play Raid – All Accounts | Same for account range |
-| 11 | Live Sim Battle (Arena) | TUO reorder; flexible auto; `effect` for global BGE |
-| 12 | Live Sim Battle (Brawl) | TUO `brawl` mode; `effect` for global BGE |
-| 13 | Live Sim Battle (Guild War) | TUO `surge` mode; `yeffect`/`eeffect`/`effect` for BGE |
-| 14 | Optimize Deck vs Guild Defense | TUO anneal (500 iter) vs all guild defenses |
-| 15 | Multi-Account: Arena | Live Sim Arena; Loyal Challenge deck applied + restored per account |
-| 16 | Multi-Account: Brawl | Live Sim Brawl for account range |
-| 17 | Multi-Account: Guild War | Live Sim Guild War for account range; GW prep-phase guard |
-| 18 | Multi-Account: Raid + Quest Mission + Arena | Raid → Quest → Arena; Loyal Challenge deck applied + restored |
-| 19 | Multi-Account: Quest Mission + Arena | Quest → Arena; Loyal Challenge deck applied + restored |
-| 20 | Multi-Account: Brawl + Quest Mission + Arena | Brawl → Quest → Arena; Loyal Challenge deck applied + restored |
-| 21 | Energy Tracker (hourly log) | Auto-detects Raid/Brawl/Guild Brawl; logs to `energylog/` |
-| 22 | Guild War Stats Tracker | Polls every 30 min; JSON + HTML snapshot |
-| 23 | Guild War Summary from JSON files | Generates summary HTML per guild+event group |
-| 24 | PvP Challenge Overview – All Accounts | Progress table; all challenge types; detects stagnation |
-| 25 | Claim Daily Reward | Claims daily bonus for current account |
-| 26 | Claim Daily Reward – All Accounts | Claims for all `play_enabled` accounts |
-| 27 | Refill Arena Stamina | Buys stamina refill token for current account |
-| 28 | Auto: Event + Quest Mission + Arena | Auto-detects Raid/Brawl from XML per loop pass; Brawl always logged; PvP Challenge deck for Arena; GW prep-phase guard |
-| 29 | Auto: Event + Quest Mission + Arena (GW Pipeline) | GW phase prepended when `_gw_in_active_phase()` is True; then delegates to F→28 |
+| A→1 | Player Info | Account overview |
+| A→2 | Active Events & Activities 🎯 | Active events incl. Guild War section |
+| A→3 | Guild Members with Rating |  |
+| A→4 | Energy Overview – All Accounts |  |
+| A→5 | Energy Tracker (hourly log – Brawl/Mission/Arena) | Auto-detects Raid/Brawl/Guild Brawl; logs to `energylog/` |
+| A→6 | Quests & Achievements |  |
+| A→7 | PvP Challenge Overview (All Accounts) | Progress table; all challenge types; detects stagnation |
+
+### B – Inventory & Card Management
+
+| # | Name | Description |
+|---|------|-------------|
+| B→1 | Update Deck (Edit slot + Set Attack/Defense) |  |
+| B→2 | Buy Packages |  |
+| B→3 | Salvage All Commons |  |
+| B→4 | Salvage All Rares |  |
+| B→5 | Salvage Base Epics (keep X) |  |
+| B→6 | Workflow: Buy + Commons + Rares + Base Epics |  |
+| B→7 | Buy Back Card |  |
+| B→8 | Build Card (Fusion Recipe & SP-Costs) |  |
+| B→9 | Build Dominion (Auto-Build) |  |
+| B→10 | Salvage Outdated (Manage outdated cards) |  |
+| B→11 | Unlock All Cards | Unlocks all locked cards |
+| B→12 | Unlock Commander | Unlocks the commander |
+| B→13 | Use Shards (Epic / Legendary / Vindicator) |  |
+| B→14 | Salvage Base Epics (keep X) – All Accounts |  |
+| B→15 | Change Attack/Defense Deck – All Accounts |  |
+| B→16 | Optimize Mission Deck -> Slot 6 (this account) |  |
+| B→17 | Optimize Mission Deck -> Slot 6 – All Accounts |  |
+| B→18 | Update Deck from Import File (TUO result → all accounts) |  |
+| B→19 | Salvage Outdated – All Accounts |  |
+| B→20 | Use Shards – All Accounts |  |
+| B→21 | Fuse All Maxed Cards (Epic+, Tier 0/1, Level 6) | Fuses all maxed Epic+ cards (Tier 0/1, Level 6) |
+| B→22 | Fuse All Maxed Cards – All Accounts |  |
+| B→23 | Fill SP to Cap (Buy + Salvage loop) | Buy + Salvage loop until SP cap reached |
+| B→24 | Fill SP to Cap – All Accounts |  |
+
+### C – Sim Preparation & Export
+
+| # | Name | Description |
+|---|------|-------------|
+| C→1 | Export Starterdecks Arena (Slot 1, active accounts) |  |
+| C→2 | Export Starterdecks Brawl (Slot 2, active accounts) |  |
+| C→3 | Export Starterdecks Arena Defense (Slot 3, active accounts) - unlock costs 100 WB | Unlock costs 100 WB |
+| C→4 | Export Starterdecks Brawl Defense (Slot 4, active accounts) - unlock costs 150 WB | Unlock costs 150 WB |
+| C→5 | Export Starterdecks Raid (Slot 5, active accounts) |  |
+| C→6 | Export Starterdecks Mission (Slot 6, active accounts) |  |
+| C→7 | Export Inventory (NAME.txt / currentdecks_NAME.txt) |  |
+| C→8 | Export Inventory – All Accounts -> ownedcards/ |  |
+| C→9 | Export Guild Decks |  |
+| C→10 | Export Specific Guild Decks (from arenagauntlet.txt) |  |
+| C→11 | Sync All Guild Decks (defense + attack → arenagauntlet.txt + attackdecks.txt) |  |
+| C→12 | Merge arenagauntlet.txt (from import folder) |  |
+| C→13 | Build Brawl Gauntlet – last brawl  (defense + attack) |  |
+| C→14 | Build Brawl Gauntlet – current brawl  (defense + attack) |  |
+
+### D – Automation & Battle
+
+| # | Name | Description |
+|---|------|-------------|
+| D→1 | Claim Rewards | Auto-detects and claims current event reward |
+| D→2 | Attack Next Free Player (Arena, no TUO) | Arena attack without TUO; skip-guild filter |
+| D→3 | Play Highest Mission (auto+skip, loop) | 3-star grind until energy empty |
+| D→4 | Play Quest Missions (loop until energy empty) | Quest-linked missions until energy depleted |
+| D→5 | Play Raid (auto+skip, loop) | Raid battles until battle energy empty; auto Slot 5 |
+| D→6 | Live Sim Battle (Arena) | TUO reorder; flexible auto; `effect` for global BGE |
+| D→7 | Live Sim Battle (Brawl) | TUO `brawl` mode; `effect` for global BGE |
+| D→8 | Live Sim Battle (Guild War) | TUO `surge` mode; `yeffect`/`eeffect`/`effect` for BGE |
+| D→9 | Optimize Deck vs Guild Defense (TUO) | TUO anneal (500 iter) vs all guild defenses |
+| D→10 | Guild War Stats Tracker | Polls every 30 min; JSON + HTML snapshot |
+| D→11 | Guild War Summary from JSON files | Generates summary HTML per guild+event group |
+| D→12 | Guild War Auto-Pipeline 🚀 | Unattended GW run: 15-min countdown + Sync All Guild Decks; Q1 = TUO anneal vs own-guild gauntlet (one account at a time, all TUO threads); Q2+Q3 = build missing cards, set Slot 2, Live Sim GW (background, overlaps next Q1). BGEs activated at T-2:00 from `gw_bges_<Guild>.txt` |
+| D→13 | Claim Daily Reward | Claims daily bonus for current account |
+| D→14 | Claim Rewards – All Accounts | For all `play_enabled` accounts |
+| D→15 | Play Highest Mission – All Accounts | Same for account range |
+| D→16 | ↳ Clear Mission Blacklist (all accounts) | Clears skipped mission IDs for all accounts |
+| D→17 | Play First Quest Mission – All Accounts | Per account: first quest mission until energy=0 |
+| D→18 | Play Raid – All Accounts | Same for account range |
+| D→19 | Multi-Account: Arena | Live Sim Arena; Loyal Challenge deck applied + restored per account |
+| D→20 | Multi-Account: Brawl | Live Sim Brawl for account range |
+| D→21 | Multi-Account: Guild War | Live Sim Guild War for account range; GW prep-phase guard |
+| D→22 | Multi-Account: Raid + Quest Mission + Arena | Raid → Quest → Arena; Loyal Challenge deck applied + restored |
+| D→23 | Multi-Account: Quest Mission + Arena | Quest → Arena; Loyal Challenge deck applied + restored |
+| D→24 | Multi-Account: Brawl + Quest Mission + Arena | Brawl → Quest → Arena; Loyal Challenge deck applied + restored |
+| D→25 | Energy Tracker (hourly log – Brawl/Mission/Arena) | Auto-detects Raid/Brawl/Guild Brawl; logs to `energylog/` |
+| D→26 | Claim Daily Reward – All Accounts | Claims for all `play_enabled` accounts |
+| D→27 | Refill Arena Stamina | Buys stamina refill token for current account |
+| D→28 | Auto: Event + Quest Mission + Arena | Auto-detects Raid/Brawl from XML per loop pass; Brawl always logged; PvP Challenge deck for Arena; GW prep-phase guard |
+| D→29 | Auto: Event + Quest Mission + Arena  (GW Pipeline) | GW phase prepended when `_gw_in_active_phase()` is True; then delegates to F→28 |
+
+### E – Guild Management
+
+| # | Name | Description |
+|---|------|-------------|
+| E→1 | Send Guild Message | Sends a message to the guild chat |
+| E→2 | Leave Guild | Leaves the current guild |
+| E→3 | Invite Player to Guild | Invites a player by name |
+| E→4 | Accept Guild Invite | Accepts a pending guild invite |
+
+### F – Settings & Maintenance
+
+| # | Name | Description |
+|---|------|-------------|
+| F→1 | Update XML Files | Downloads all game XMLs (cards, missions, events, raids, …) and bges.txt |
+| F→2 | TUO Threads |  |
+| F→3 | database.yml |  |
+| F→4 | Clear Old Gauntlet Entries (>7 days) | Removes arenagauntlet entries older than 7 days |
+| F→5 | Scan Combat Logs for Unknown sim.cpp Flags | Scans combat logs for flags unknown to sim.cpp |
+
+Settings (`F`) are part of the main menu; all submenus return with `0`.
 
 ---
 
@@ -153,22 +236,30 @@ Settings (`91`/`92`) accessible from main menu at any time.
 
 ## Multi-Account Range & Loop Selection
 
-All multi-account options offer 6 run modes:
+All multi-account options offer 14 run modes (plus 0 = cancel). The account list is split into halves and quarters (rounded so every slice is non-empty); the menu prints the accounts of each slice before you choose.
 
 | Choice | Behaviour |
 |--------|-----------|
 | 1 | All accounts, once |
-| 2 | All accounts, loop |
-| 3 | Select range, once |
-| 4 | Select range, loop |
-| 5 | Single account, once |
-| 6 | Single account, loop |
+| 2 | All accounts, loop (until ESC/Ctrl+C) |
+| 3 | First half (Q1+Q2), once |
+| 4 | First half (Q1+Q2), loop (until ESC/Ctrl+C) |
+| 5 | Second half (Q3+Q4), once |
+| 6 | Second half (Q3+Q4), loop (until ESC/Ctrl+C) |
+| 7 | First quarter (Q1), once |
+| 8 | First quarter (Q1), loop (until ESC/Ctrl+C) |
+| 9 | Second quarter (Q2), once |
+| 10 | Second quarter (Q2), loop (until ESC/Ctrl+C) |
+| 11 | Third quarter (Q3), once |
+| 12 | Third quarter (Q3), loop (until ESC/Ctrl+C) |
+| 13 | Fourth quarter (Q4), once |
+| 14 | Fourth quarter (Q4), loop (until ESC/Ctrl+C) |
 
 ---
 
 ## Key Features
 
-### PvP Challenge System (F→15/18/19/20/24/28/29)
+### PvP Challenge System (D→19/22/23/24/28/29, A→7)
 
 Automatically adapts Slot 1 deck for the active PvP Challenge step before arena battles, then restores the original deck. Runs fully unattended across all accounts.
 
