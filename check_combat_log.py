@@ -33,7 +33,7 @@ INT_FLAGS  = {
     'enhance_counter', 'enhance_disease', 'enhance_drain', 'enhance_evade',
     'enhance_fortify', 'enhance_hunt', 'enhance_inhibit', 'enhance_leech',
     'enhance_legion', 'enhance_mark', 'enhance_poison', 'enhance_stasis',
-    'enhance_swipe', 'enhance_tribute', 'enhance_venom',
+    'enhance_swipe', 'enhance_tribute', 'enhance_venom', 'enhance_refresh',
 }
 BOOL_FLAGS = {'jammed', 'overloaded', 'sunder', 'enrage'}
 
@@ -155,7 +155,7 @@ def compare_hs(expected_list, actual_list, side, issues):
             issues.append(f"  {side} EXTRA card '{name}' (dead or wrong UID range)")
 
 
-def detect_ranges(tuo_cmd, acs, name_map=None, cached_own_101=None):
+def detect_ranges(tuo_cmd, acs, name_map=None, cached_own_101=None, file_mode=None):
     # Correct UID schema (empirically verified from GW combat logs):
     # own dominion ALWAYS = UID 51, enemy dominion ALWAYS = UID 151
     # Forts occupy first slots in 52-range (enemy) and 152-range (own):
@@ -214,6 +214,20 @@ def detect_ranges(tuo_cmd, acs, name_map=None, cached_own_101=None):
                 if not found_in_1_10:
                     pass  # no assault match at all → fall through
 
+            # Fallback B: yfort card UIDs (GW only) — HIGHEST PRIORITY FALLBACK
+            # yfort names appearing at UID 152+ in name_map → own forts are at 152+ → own assault at 101-110
+            # This check runs BEFORE deck-name fallback because Pragmatic Zirconix (own card)
+            # appears at UID 1 (enemy assault in GW-attack) and would fool the deck-name heuristic.
+            yf = _re.search(r"yfort\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", tuo_cmd)
+            yfort_str = next((g for g in (yf.groups() if yf else []) if g), '') or ''
+            if yfort_str:
+                yfort_names = {n.strip().rsplit('-', 1)[0].strip().lower()
+                               for n in yfort_str.split(',')}
+                for uid, nm in name_map.items():
+                    base = nm.rsplit('-', 1)[0].strip().lower() if nm else ''
+                    if base in yfort_names and uid.isdigit():
+                        return int(uid) >= 152
+
             # Fallback A: match own AND enemy deck against name_map assault UIDs
             # Use first arg (own deck) and second arg (enemy deck) from TUO command
             deck_m = _re.match(r'''\S+\s+(?:'([^']*)'|"([^"]*)")\s+(?:'([^']*)'|"([^"]*)")''', tuo_cmd)
@@ -241,25 +255,25 @@ def detect_ranges(tuo_cmd, acs, name_map=None, cached_own_101=None):
                 if score_1 > score_101:
                     return False
 
-            # Fallback B: check yfort card UIDs (GW only)
-            yf = _re.search(r"yfort\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", tuo_cmd)
-            yfort_str = next((g for g in (yf.groups() if yf else []) if g), '') or ''
-            if yfort_str:
-                yfort_names = {n.strip().rsplit('-', 1)[0].strip().lower()
-                               for n in yfort_str.split(',')}
-                for uid, nm in name_map.items():
-                    base = nm.rsplit('-', 1)[0].strip().lower() if nm else ''
-                    if base in yfort_names and uid.isdigit():
-                        return int(uid) >= 152
-
         # Fallback D: h>0 heuristic (last resort, no cache available)
         result = any(100 < int(k) < 111 and isinstance(v, dict) and v.get('h', 0) > 0
                      for k, v in acs.items() if k.isdigit())
         return result
 
     cmd_lower = tuo_cmd.lower()
-    if ' brawl ' in cmd_lower or ' gw ' in cmd_lower:
-        mode = 'brawl' if ' brawl ' in cmd_lower else 'gw'
+    # Treat as brawl/gw when:
+    #  1. The command explicitly contains ' brawl ' or ' gw ', OR
+    #  2. The file's top-level mode is brawl/gw AND the command does NOT explicitly
+    #     say ' pvp ' or ' arena ' (handles surge-mode and any future mode aliases,
+    #     including the case where _last_tuo_cmd retains an old pvp command).
+    _treat_as_brawl = (' brawl ' in cmd_lower or ' gw ' in cmd_lower or
+                       (file_mode in ('brawl', 'gw')
+                        and ' pvp ' not in cmd_lower
+                        and ' arena ' not in cmd_lower))
+    if _treat_as_brawl:
+        mode = ('brawl' if ' brawl ' in cmd_lower
+                else ('gw' if ' gw ' in cmd_lower
+                      else file_mode))  # surge / unknown mode alias: trust file_mode
         # Parse fort counts first
         yf_m = _re.search(r"yfort\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", tuo_cmd)
         ef_m = _re.search(r"efort\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", tuo_cmd)
@@ -273,8 +287,9 @@ def detect_ranges(tuo_cmd, acs, name_map=None, cached_own_101=None):
         if mode == 'brawl':
             own_101 = _own_is_101(tuo_cmd, acs, name_map, cached_own_101)
             if own_101:
-                return (list(range(101, 111)) + [50] + [51] + list(range(152, 200)),
-                        list(range(1, 11)) + [150] + [151] + list(range(52, 100)), mode)
+                # Brawl defender: own commander/dominion = 150/151, enemy = 50/51
+                return (list(range(101, 111)) + [150] + [151] + list(range(152, 200)),
+                        list(range(1, 11)) + [50] + [51] + list(range(52, 100)), mode)
             else:
                 return (list(range(1, 11)) + [50] + [51] + list(range(52, 100)),
                         list(range(101, 111)) + [150] + [151] + list(range(152, 200)), mode)
@@ -313,6 +328,7 @@ def check_log(path):
         return 0, 0
 
     has_name_map = any('card_name_map' in t for t in turns)
+    file_mode    = data.get('mode', '')   # top-level battle mode (brawl/gw/arena)
 
     print(f"\n{'='*70}")
     print(f"  {os.path.basename(path)}")
@@ -353,7 +369,7 @@ def check_log(path):
         actual_hs  = parse_hand_state_str(hs_str)
         actual_ehs = parse_hand_state_str(ehs_str)
 
-        own_range, enemy_range, mode = detect_ranges(tuo_cmd, acs, name_map, cached_own_101)
+        own_range, enemy_range, mode = detect_ranges(tuo_cmd, acs, name_map, cached_own_101, file_mode=file_mode)
         # Cache first reliable detection within a battle
         if mode in ('brawl', 'gw') and cached_own_101 is None:
             cached_own_101 = (own_range[0] == 101)  # True if own assault starts at 101
@@ -378,7 +394,7 @@ def check_log(path):
                         if k == 'mimic_skill' and isinstance(v, dict):
                             skill_id = v.get('id', '')
                             skill_val = v.get('x') or v.get('n') or '1'
-                            if skill_id and not v.get('trigger'):
+                            if skill_id:
                                 try:
                                     out[skill_id] = int(skill_val)
                                 except (TypeError, ValueError):
@@ -440,29 +456,6 @@ def check_log(path):
             assigned = set()
             own_summon_range   = []
             enemy_summon_range = []
-
-            def _best_uid(entries_for_name, flag_set):
-                """Find best unassigned UID matching this hand-state entry."""
-                best_uid_i = best_score = None
-                for uid_i, (base, ufs) in summon_candidates.items():
-                    if uid_i in assigned or base != entries_for_name:
-                        continue
-                    score = _match_score(ufs, {})  # placeholder
-                    # compute proper score
-                    hs_set = frozenset((k, v) for k, v in {}.items())
-                    s = _match_score(flag_set, {})
-                    # Use direct computation
-                    hs_items = frozenset((k, int(v)) for k, v in {}.items()
-                                        if isinstance(v, (int, float)) and int(v) != 0)
-                    match_count = len(flag_set & hs_items)
-                    uid_d  = dict(flag_set)
-                    hs_d   = {}
-                    pen    = sum(2 for k in uid_d if k in hs_d and uid_d[k] != hs_d[k])
-                    s      = match_count - pen
-                    if best_score is None or s > best_score:
-                        best_score = s
-                        best_uid_i = uid_i
-                return best_uid_i
 
             # Process in hand-state order: match each entry to the best unassigned UID
             def _assign_entries(hs_entries, result_list, skip_counts=None):
@@ -564,6 +557,20 @@ def check_log(path):
 
 
 def main():
+    try:
+        _main()
+    except Exception as _e:
+        import traceback as _tb
+        print("\n" + "="*70)
+        print("FEHLER")
+        print("="*70)
+        _tb.print_exc()
+        print("="*70)
+    finally:
+        input("\nEnter zum Schließen...")
+
+
+def _main():
     files = []
     if len(sys.argv) > 1:
         for arg in sys.argv[1:]:
@@ -585,7 +592,7 @@ def main():
                             files.append(os.path.join(root, fn))
     if not files:
         print("Usage: python check_combat_log.py <logfile.json> [...]")
-        sys.exit(1)
+        return
 
     # ── Issues folder setup ──────────────────────────────────────────────
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -651,8 +658,6 @@ def main():
         # Remove empty Issues folder if no issues found
         import shutil as _shutil
         _shutil.rmtree(issues_dir)
-
-    input("\nEnter zum Schließen...")
 
 
 if __name__ == '__main__':

@@ -605,6 +605,8 @@ void Hand::reset(std::mt19937& re)
                     status->m_enhanced_value[Skill::sabotage] = f.at("enhance_sabotage");
                 if (f.count("enhance_besiege"))
                     status->m_enhanced_value[Skill::mortar] = f.at("enhance_besiege");
+                if (f.count("enhance_refresh"))
+                    status->m_enhanced_value[Skill::refresh] = f.at("enhance_refresh");
                 // Disease
                 if (f.count("disease"))
                     status->m_diseased = f.at("disease");

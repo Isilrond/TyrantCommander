@@ -10434,6 +10434,7 @@ $(document).ready(function(){
             'enhance_besiege', 'enhance_fortify', 'enhance_hunt', 'enhance_inhibit', 'enhance_leech',
             'enhance_legion', 'enhance_mark', 'enhance_poison', 'enhance_sabotage',
             'enhance_stasis', 'enhance_swipe', 'enhance_tribute', 'enhance_venom',
+            'enhance_refresh',
         }
         BOOL_FLAGS = {'jammed', 'overloaded', 'sunder', 'enrage'}
 
@@ -11772,8 +11773,10 @@ $(document).ready(function(){
                             _enemy_struct_uids.add(_uid_i)
                         else:
                             _own_struct_uids.add(_uid_i)
-                    _own_range   = list(range(101, 111)) + [50, 51] + sorted(_own_struct_uids)
-                    _enemy_range = list(range(1, 11))   + [150, 151] + sorted(_enemy_struct_uids)
+                    # Brawl (we are defender): own commander/dominion = 150/151, enemy = 50/51
+                    # (verified in combat log: card_map 150 = own commander, 50 = enemy commander)
+                    _own_range   = list(range(101, 111)) + [150, 151] + sorted(_own_struct_uids)
+                    _enemy_range = list(range(1, 11))   + [50, 51] + sorted(_enemy_struct_uids)
                     _token_card_map.update(self._extract_token_card_map(battle_data))
                     _card_map    = {**battle_data.get('card_map', {}), **_token_card_map}
                     # Brawl: own commander=UID 150, enemy commander=UID 50
@@ -15259,7 +15262,17 @@ $(document).ready(function(){
             skill_info = ''
             try:
                 sk, need = self._challenge_skill_condition(ch)
-                if sk and battle_data and card_data:
+                if sk == 'heal':
+                    # Heal leaves no marker on the target and only counts if the card had lost
+                    # health -> not reliably trackable from the battle data. Log facts only.
+                    _rq = required[0].lower()
+                    _pl = any(p == _rq or p.startswith(_rq + '-') for p in played_lower)
+                    skill_info = (f'skillcheck: heal not trackable (required card played: '
+                                  f'{"yes" if _pl else "no"})')
+                    if _pl:
+                        notes.append('heal count not verifiable client-side')
+                    notes = [n for n in notes if not n.startswith('requires skill')]
+                elif sk and battle_data and card_data:
                     uids, evs = self._challenge_card_timeline(battle_data, card_data, required[0])
                     if not uids:
                         skill_info = f'skillcheck: {sk} on {required[0]} - card never on field'
