@@ -10324,7 +10324,16 @@ $(document).ready(function(){
         Returns a set of int UIDs.
         """
         kill_key = 'attack_kill' if brawl_mode else 'defend_kill'
-        killed = set()
+        # battle_data['turn'] only holds the latest response's turns, so accumulate
+        # kills across calls; reset when the turn counter restarts (new battle).
+        _tk = [int(k) for k in (battle_data.get('turn') or {}) if str(k).isdigit()]
+        _cur = max(_tk) if _tk else 0
+        if (_cur < getattr(self, '_kill_last_turn', 0)
+                or getattr(self, '_kill_cum_key', None) != kill_key):
+            self._kill_cum = set()
+        self._kill_last_turn = _cur
+        self._kill_cum_key = kill_key
+        killed = self._kill_cum
         turns_with_kills = {}
         for turn_key, turn_data in battle_data.get('turn', {}).items():
             if not isinstance(turn_data, dict):
@@ -10337,7 +10346,7 @@ $(document).ready(function(){
                     pass
             if turn_kills:
                 turns_with_kills[turn_key] = [int(u) for u in turn_kills if str(u).lstrip('-').isdigit()]
-        return killed
+        return set(killed)
 
     def _extract_token_card_map(self, battle_data):
         """
@@ -11266,7 +11275,7 @@ $(document).ready(function(){
                     _enemy_states = _states_for_range(_enemy_range)
 
                     win_pct, recommended_card, raw_out = self._run_tuo_reorder(
-                        my_deck_str, sim_deck, unique_names,
+                        my_deck_str, sim_deck, [_n for _n in hand_names if _n],
                         bge_name=bge_name or None,
                         reorder_n=10000,
                         played_cards=play_order_names if play_order_names else None,
@@ -11738,6 +11747,9 @@ $(document).ready(function(){
                     # against own_states/enemy_states from the API turn data
                     _own_struct_uids   = set()
                     _enemy_struct_uids = set()
+                    # tokens of the latest round must be known BEFORE classifying summon UIDs,
+                    # otherwise freshly summoned units are dropped from hand-state for one turn
+                    _token_card_map.update(self._extract_token_card_map(battle_data))
                     _combined_map = {**battle_data.get('card_map', {}), **_token_card_map}
                     _own_state_names   = {s[0].lower() for s in battle_data.get('own_states', [])}
                     _enemy_state_names = {s[0].lower() for s in battle_data.get('enemy_states', [])}
@@ -11851,7 +11863,7 @@ $(document).ready(function(){
                     _enemy_states = _brawl_states_for_range(_enemy_range)
 
                     win_pct, recommended_card, raw_out = self._run_tuo_reorder(
-                        my_deck_str, sim_deck, unique_names,
+                        my_deck_str, sim_deck, [_n for _n in hand_names if _n],
                         bge_name=bge_name or None,
                         reorder_n=10000,
                         played_cards=play_order_names if play_order_names else None,
@@ -12477,7 +12489,7 @@ $(document).ready(function(){
                     _gw_enemy_states = _gw_states_for_range(_gw_enemy_range)
 
                     win_pct, recommended_card, _ = self._run_tuo_reorder(
-                        my_deck_str, sim_deck, unique_names,
+                        my_deck_str, sim_deck, [_n for _n in hand_names if _n],
                         bge_name=None,
                         yeffect=my_bge or None,
                         reorder_n=10000,
@@ -16463,6 +16475,18 @@ $(document).ready(function(){
         except Exception as e:
             if not silent:
                 print(f"\n⚠ Failed to export opponent deck: {e}")
+            # Always log the failure to export/export_errors.log (also when silent)
+            try:
+                import datetime as _dt_el
+                _el_dir = os.path.join(SCRIPT_DIR, 'export')
+                os.makedirs(_el_dir, exist_ok=True)
+                _el_enemy = locals().get('enemy_name', '?')
+                _el_file  = locals().get('output_file', '?')
+                with open(os.path.join(_el_dir, 'export_errors.log'), 'a', encoding='utf-8') as _elf:
+                    _elf.write(f"{_dt_el.datetime.now():%Y-%m-%d %H:%M:%S} | opponent deck export | "
+                               f"enemy={_el_enemy} | file={_el_file} | {type(e).__name__}: {e}\n")
+            except Exception:
+                pass
     
 
     # ==================== GAUNTLET MANAGEMENT ====================

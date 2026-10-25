@@ -1,7 +1,9 @@
 """
-check_combat_log.py  —  v2
+check_combat_log.py  —  v3
 Validates combat log JSON files: checks whether api_card_states match
 the hand-state / enemy:hand-state values passed to TUO.
+v3 adds sim-input checks: hand multiplicity, enemy:hand vs previous field (kill list),
+freeze/deck-prefix, mode, BGE, agreed flag, win% jumps (warning).
 
 Requires logs produced by TyrantAPICommander v4.9+
 (api_card_states = pre-sim, card_name_map stored per turn).
@@ -315,6 +317,192 @@ def detect_ranges(tuo_cmd, acs, name_map=None, cached_own_101=None, file_mode=No
                 list(range(101, 111)) + [150] + [151] + list(range(152, 200)), 'arena')
 
 
+
+# ─────────────────────────────────────────────────────────────────────────
+# Sim-input checks (v3): validate everything handed to TUO, not only hand-state
+# ─────────────────────────────────────────────────────────────────────────
+import shlex as _shlex
+from collections import Counter as _Counter
+
+def _norm_name(n):
+    n = str(n or '').strip().lower()
+    n = re.sub(r'-\d+$', '', n)          # TUO level suffix "-6"
+    n = re.sub(r'#\d+$', '', n).strip()  # "#2" multiplier
+    return n
+
+def _split_cmd(cmd):
+    """Tokenise the logged TUO command. Falls back to None on parse errors."""
+    try:
+        return _shlex.split(cmd, posix=True)
+    except Exception:
+        return None
+
+def _arg_after(tokens, key, start=0):
+    for i in range(start, len(tokens) - 1):
+        if tokens[i] == key:
+            return tokens[i + 1]
+    return None
+
+def _names(s):
+    return [_norm_name(x) for x in (s or '').split(',') if x.strip()]
+
+def _fmt_diff(exp, act):
+    """Readable multiset difference."""
+    miss = list((exp - act).elements())
+    extra = list((act - exp).elements())
+    out = []
+    if miss:  out.append("missing in cmd: " + ", ".join(sorted(miss)))
+    if extra: out.append("extra in cmd: " + ", ".join(sorted(extra)))
+    return "; ".join(out)
+
+def check_sim_inputs(data, file_mode):
+    """Returns (issues_by_turn, warnings_by_turn): {turn_num: [str, ...]}."""
+    turns = data.get('turns', [])
+    issues, warns = {}, {}
+    def add(d, tn, msg):
+        d.setdefault(tn, []).append("  " + msg)
+
+    my_deck_ref = _Counter(_names(data.get('my_deck', '')))
+    log_bge = re.sub(r'[\s_]+', '-', str(data.get('bge', '') or '').strip().lower())
+    played_hist = []          # own card names played in earlier turns (order)
+    prev_win = None
+
+    for idx, t in enumerate(turns):
+        tn = t.get('turn', idx + 1)
+        cmd = t.get('tuo_cmd', '')
+        played_now = _norm_name(t.get('card_played')) if t.get('card_played') else None
+        log_hand = [_norm_name(h) for h in (t.get('hand') or []) if h]
+        win = t.get('tuo_win_pct')
+
+        # ── always-available log consistency ─────────────────────────
+        if len(log_hand) > 3:
+            add(issues, tn, f"HAND SIZE: log hand has {len(log_hand)} cards: {log_hand}")
+        if played_now and log_hand and played_now not in log_hand:
+            add(issues, tn, f"PLAYED NOT IN HAND: '{played_now}' not in hand {log_hand}")
+        rec = t.get('tuo_recommended')
+        if rec is not None and t.get('card_played') and 'tuo_agreed' in t:
+            agreed_calc = (_norm_name(rec) == played_now)
+            if bool(t.get('tuo_agreed')) != agreed_calc:
+                add(issues, tn, f"AGREED FLAG: tuo_agreed={t.get('tuo_agreed')} but recommended='{rec}' played='{t.get('card_played')}'")
+        if rec is not None and log_hand and _norm_name(rec) not in log_hand:
+            add(issues, tn, f"RECOMMENDED NOT IN HAND: '{rec}' not in hand {log_hand}")
+
+        # win% volatility (warning only - may be legit)
+        if isinstance(win, (int, float)) and isinstance(prev_win, (int, float)):
+            if abs(win - prev_win) >= 35:
+                add(warns, tn, f"WIN% JUMP: {prev_win:.1f} -> {win:.1f} (Δ{win - prev_win:+.1f})")
+        if isinstance(win, (int, float)):
+            prev_win = win
+
+        tokens = _split_cmd(cmd) if cmd else None
+        if tokens and len(tokens) >= 4:
+            my_deck_s, en_deck_s, mode_tok = tokens[1], tokens[2], tokens[3]
+
+            # mode keyword vs file mode
+            exp_mode = {'arena': 'pvp', 'brawl': 'surge'}.get(file_mode)
+            if exp_mode and mode_tok != exp_mode:
+                add(issues, tn, f"MODE: file mode '{file_mode}' expects '{exp_mode}' but cmd uses '{mode_tok}'")
+
+            # BGE
+            eff = _arg_after(tokens, 'effect', 4)
+            if log_bge and eff and re.sub(r'[\s_]+', '-', eff.lower()) != log_bge:
+                add(issues, tn, f"BGE: log bge '{data.get('bge')}' vs cmd effect '{eff}'")
+            if log_bge and not eff:
+                add(issues, tn, f"BGE: log bge '{data.get('bge')}' but cmd has no effect")
+
+            # hand multiset
+            hand_arg = _arg_after(tokens, 'hand', 4)
+            if hand_arg is not None and log_hand:
+                exp_h, act_h = _Counter(log_hand), _Counter(_names(hand_arg))
+                if exp_h != act_h:
+                    add(issues, tn, f"HAND MISMATCH: log hand {sorted(log_hand)} vs cmd hand {sorted(act_h.elements())} -> {_fmt_diff(exp_h, act_h)}")
+
+            # freeze + deck prefix
+            deck_names = _names(my_deck_s)
+            if deck_names:
+                if _Counter(deck_names) != my_deck_ref and my_deck_ref:
+                    add(issues, tn, f"DECK CONTENT: cmd deck differs from log my_deck -> {_fmt_diff(my_deck_ref, _Counter(deck_names))}")
+                fr = _arg_after(tokens, 'freeze', 4)
+                has_dom = len(deck_names) > 1 and (not played_hist or deck_names[1] not in set(played_hist))
+                exp_fr = 1 if not played_hist else 1 + (1 if has_dom else 0) + len(played_hist)
+                if fr is not None and fr.isdigit() and int(fr) != exp_fr:
+                    add(issues, tn, f"FREEZE: cmd freeze {fr}, expected {exp_fr} ({len(played_hist)} cards played so far)")
+                if played_hist:
+                    pre = deck_names[(2 if has_dom else 1):(2 if has_dom else 1) + len(played_hist)]
+                    if pre != played_hist:
+                        add(issues, tn, f"PLAYED PREFIX: deck prefix {pre} != played history {played_hist}")
+                # hand cards must still be available in the remaining deck
+                remaining = _Counter(deck_names[(2 if has_dom else 1) + len(played_hist):]) if played_hist else _Counter(deck_names[1:])
+                if hand_arg is not None:
+                    over = _Counter(_names(hand_arg)) - remaining
+                    if over:
+                        add(issues, tn, f"HAND NOT IN REMAINING DECK: {sorted(over.elements())}")
+
+            # enemy:hand vs previous round's enemy field
+            eh_arg = _arg_after(tokens, 'enemy:hand', 4)
+            act_eh = _Counter(_names(eh_arg)) if eh_arg else _Counter()
+            if idx == 0:
+                if file_mode == 'arena' and act_eh:
+                    add(issues, tn, f"ENEMY:HAND T1: arena T1 should have no enemy:hand, got {sorted(act_eh.elements())}")
+            else:
+                pf = (turns[idx - 1].get('field') or {}).get('enemy') or []
+                exp_eh = _Counter(
+                    _norm_name(e.get('name')) for e in pf
+                    if isinstance(e, dict)
+                    and ((1 <= int(e.get('uid', 0)) <= 10) or (101 <= int(e.get('uid', 0)) <= 110))
+                    and e.get('name') and not re.match(r'^UID\d+$', str(e.get('name'))))
+                if exp_eh != act_eh:
+                    add(issues, tn, f"ENEMY:HAND MISMATCH vs field of previous round -> {_fmt_diff(exp_eh, act_eh)}")
+
+            # alive summons/structures (UID 52-99, 152-199) from api_card_states must
+            # appear in hand-state (own or enemy) - catches summons dropped for a turn
+            acs_t = t.get('api_card_states') or {}
+            nm_t  = t.get('card_name_map') or {}
+            hs_all = _Counter()
+            for key in ('hand-state', 'enemy:hand-state'):
+                for nme, _fl in parse_hand_state_str(_arg_after(tokens, key, 4) or ''):
+                    hs_all[_norm_name(nme.split('#')[0])] += 1
+            need = _Counter()
+            for uid_s, fl in acs_t.items():
+                if not (uid_s.isdigit() and (52 <= int(uid_s) <= 99 or 152 <= int(uid_s) <= 199)):
+                    continue
+                if not isinstance(fl, dict) or not fl:
+                    continue
+                hh = fl.get('h')
+                if hh is not None and int(hh) <= 0:
+                    continue
+                # stateless summons (only zero-valued flags) are intentionally not listed in
+                # hand-state: TUO recreates them itself while replaying the frozen prefix
+                _nontriv = False
+                for _fk, _fv in fl.items():
+                    if _fk in ('poisoner', 'mimic_skill', 'corroder'):
+                        continue
+                    try:
+                        if int(_fv) != 0:
+                            _nontriv = True
+                            break
+                    except (TypeError, ValueError):
+                        continue
+                if not _nontriv:
+                    continue
+                nme = nm_t.get(uid_s)
+                if nme:
+                    need[_norm_name(nme.split('#')[0])] += 1
+            for nme, cnt in need.items():
+                # side-agnostic lower bound: name must appear at least as often as alive flagged summons
+                if hs_all[nme] < cnt:
+                    add(issues, tn, f"SUMMON DROPPED: '{nme}' alive in api_card_states x{cnt} but only x{hs_all[nme]} in hand-state/enemy:hand-state")
+
+            # enemy deck string must be present and non-empty
+            if not _names(en_deck_s):
+                add(issues, tn, "ENEMY DECK: empty enemy deck in cmd")
+        elif cmd:
+            add(warns, tn, "CMD PARSE: could not tokenise tuo_cmd - sim-input checks skipped")
+
+        if played_now:
+            played_hist.append(played_now)
+    return issues, warns
+
 def check_log(path):
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -550,6 +738,25 @@ def check_log(path):
                 print(issue)
         else:
             print(f"  Turn {turn_num} | win%={win_pct} | ✓ OK")
+
+    # ── Sim-input checks (hand multiplicity, enemy:hand kills, freeze, ...) ──
+    try:
+        si_issues, si_warns = check_sim_inputs(data, file_mode)
+    except Exception as _e:
+        si_issues, si_warns = {}, {}
+        print(f"\n  ⚠ sim-input checks crashed: {_e!r}")
+    if si_issues:
+        print("\n  ── Sim-input issues ──")
+        for tn in sorted(si_issues, key=lambda x: (str(type(x)), x)):
+            print(f"  Turn {tn}:")
+            for m in si_issues[tn]:
+                print(m)
+                total_issues += 1
+    if si_warns:
+        print("\n  ── Warnings (not counted) ──")
+        for tn in sorted(si_warns, key=lambda x: (str(type(x)), x)):
+            for m in si_warns[tn]:
+                print(f"  Turn {tn}:{m[1:]}")
 
     summary = "✓ CLEAN" if total_issues == 0 else f"✗ {total_issues} issue(s)"
     print(f"\n  {summary} — {turns_checked} turns checked")
