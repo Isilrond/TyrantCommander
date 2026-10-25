@@ -1,9 +1,10 @@
 """
-check_combat_log.py  —  v3
+check_combat_log.py  —  v3.1
 Validates combat log JSON files: checks whether api_card_states match
 the hand-state / enemy:hand-state values passed to TUO.
 v3 adds sim-input checks: hand multiplicity, enemy:hand vs previous field (kill list),
-freeze/deck-prefix, mode, BGE, agreed flag, win% jumps (warning).
+freeze/deck-prefix, mode, BGE, agreed flag, SUMMON DROPPED (alive summon missing
+in hand-state), win% jumps (warning).
 
 Requires logs produced by TyrantAPICommander v4.9+
 (api_card_states = pre-sim, card_name_map stored per turn).
