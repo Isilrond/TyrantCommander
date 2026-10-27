@@ -3,7 +3,7 @@
 **Python-based automation tool for Tyrant Unleashed**  
 Communicates directly via the official game API — no game client required.
 
-> October 2026 — v5.9
+> October 2026 — v6.0
 
 ---
 
@@ -216,6 +216,7 @@ Options marked *multi* are only shown when more than one account is configured.
 | F→3 | database.yml |  |
 | F→4 | Clear Old Gauntlet Entries (>7 days) | Removes arenagauntlet entries older than 7 days |
 | F→5 | Scan Combat Logs for Unknown sim.cpp Flags | Scans combat logs for flags unknown to sim.cpp |
+| F→6 | Check Suspicious Combat Logs | LOSS with TUO win% ≥ 99 % or WIN with TUO win% ≤ 1 % in any turn; copies hits to `combatlog/suspicious/` |
 
 Settings (`F`) are part of the main menu; all submenus return with `0`.
 
@@ -279,7 +280,7 @@ Automatically adapts Slot 1 deck for the active PvP Challenge step before arena 
 1. Detects the current challenge step via `getPvpChallengeData`
 2. Checks if required commander is owned; auto-builds via `build_card(id)` if not
 3. Builds required cards (upgrades via `build_card` if needed; skips if insufficient SP — logs issue, deck unchanged)
-4. Builds pool cards: pass 1 takes the per-type count from the pool list (inventory first, then build); pass 2 tops up with additional copies of pool cards until `pool_min` is reached
+4. Builds pool cards in **priority order** (the pool list is sorted by importance): all missing copies of the first card are taken first (inventory first, then build / buyback of materials via `build_card`); only when no further copy of it is possible does the next card follow, until `pool_min` is reached
 5. Assembles the deck: copies of challenge cards already in the start deck are removed first, the challenge cards are added, and no card id is sent more often than `num_owned` (the server rejects the **whole** deck otherwise)
 6. Writes the deck via `setDeckCards` and compares the returned cards with what was sent — any difference aborts the challenge deck and writes `pvp_challenge_issues.txt` (including the server `result_message`)
 7. Re-activates the slot and prints a `[VERIFY]` line: commander and cards as actually stored on the server
@@ -292,9 +293,11 @@ Automatically adapts Slot 1 deck for the active PvP Challenge step before arena 
 
 Fewer than `pool_min` pool cards available → logged as issue, proceeds with the cards that are available.
 
+**Skill must sit on the played card:** for "Activate Overload / Leech … N times" challenges only cards that carry the skill themselves count. Skills of summoned units do not (Pragmatic Zirconix → Pragmatic Ally carries Overload; Nexor's Throne → Nexor's Eye carries Leech) — such cards were removed from the pools (Overload pools in Abunisapphire's Mirror, Extreme – Raider step 15 and Progenitor Prophet; Leech pool in Progenitor Omnipulse). Overload additionally needs a valid target on your side: an active assault that has not acted yet, has no Overload and owns Enfeeble, Jam, Siege, Mortar, Strike or Weaken (Heal, Protect, Enrage and Rally only if an ally is Inhibited).
+
 **Extreme PVP Challenge:** parallel quest strands — sub-challenge detected by type-9 achievement name, not linear step counter. Only names from EXTREME_CHALLENGES table are accepted to avoid false matches with other challenge types.
 
-**Living Mirrors PVP Challenge (Oct 27 – Nov 24, 2026):** 15 steps (`LIVING_MIRRORS_CHALLENGES`), checked before all other challenges while active. Win steps (Mirror 25/50/75/100) use a wins counter; skill steps use support commanders/pools: Octane Optimized (Rally/Entrap), Daedalus Charged (Enrage), Malort Blightfather (Heal), Fortify pool (Arcadia Redeemed, Experiment Gasher, The Mass, Impurity Arrester, Restore Sequencer; 4 copies), Overload pool (2 copies), Progenitor pool for Mirror Vindicated (4 copies).
+**Living Mirrors PVP Challenge (Oct 27 – Nov 24, 2026):** 15 steps (`LIVING_MIRRORS_CHALLENGES`), checked before all other challenges while active. Win steps (Mirror 25/50/75/100) use a wins counter; skill steps use support commanders/pools: Octane Optimized (Rally/Entrap), Daedalus Charged (Enrage), Malort Blightfather (Heal), Fortify pool (Experiment Gasher, Gulthrax Scourge, Vitruvian Pioneer, Arcadia Redeemed; 4 copies), Overload pool (Enyo Ruinmaker, Yurich's Observatory, Veles Shapeshifter, Metro Monitor; 3 copies), Progenitor pool for Mirror Vindicated (Pragmatic Zirconix, Zashikinoz, The Mass, Primal Yeren, Leriax Putrefier; 4 copies).
 
 **Issues log:** `export/pvp_challenge_issues.txt` — build failures, rejected decks (with server message), failed restores.
 
@@ -323,6 +326,13 @@ Guild Brawls are treated identically to regular Brawls for energy tracking and s
 
 **Structure/Summon UID assignment:** Own and enemy structures (uid 52-99, 152-199) are assigned dynamically by matching card names against `own_states`/`enemy_states` from the API turn data. This correctly handles infinite summon chains (e.g., Kozel the Deathless, Industry of Eden). Ambiguous cases fall back to convention (52-99 = enemy, 152-199 = own).
 
+### Hand-State Content (v6.0)
+
+- **Order:** commander (own UID 50 / enemy 150), dominion (51 / 151), then the field cards (assaults, summons, structures). In Brawl Live Sim the own side uses UIDs 150 / 151 (assaults 101–110), the enemy 50 / 51 (assaults 1–10).
+- **Commander HP:** the API reports no commander HP, only hits (`skill_id 0`, targets `-1` = attacker commander, `-2` = defender commander). The commander cannot be healed and has no damage-negating buffs, so HP = max HP − sum of hits. Max HP comes from `cards_section_N.xml` (`_get_card_max_hp`; 150 for every commander in `cards_section_1.xml`). Hits are keyed per battle / turn / action (re-reading a turn is idempotent). A commander at full HP has no state and is not listed.
+- **Commander states:** runtime states such as `jam_countdown` sit under the internal API UIDs `-1` / `-2` and are merged into UID 50 / 150 (Arena, Brawl, Guild War); the derived commander HP is not overwritten.
+- **Permanent values:** `h`, `perm_max_health` and `avenge_attack` are only reported when they change. They are carried over when a later turn mentions the card without them; dead cards (h ≤ 0) are not carried.
+
 ### Live Sim Battle
 
 - **Arena** — flexible mode automatic; own-guild + skip-guild filter (`Predacons` excluded by default); Loyal Challenge deck applied and restored per session
@@ -341,17 +351,14 @@ Guild Brawls are treated identically to regular Brawls for energy tracking and s
 
 Active deck saved before Phase 1 and restored after Arena completes for each account. Loyal Challenge deck applied and restored within the Arena phase. Each phase pre-checks energy and skips gracefully if zero. Quest Mission always uses Slot 6.
 
-### Suspicious Loss Filter (`check_suspicious_losses.py`)
+### Suspicious Combat Log Filter (F → 6)
 
-Standalone script — scans `combatlog/` for battles where TUO predicted ≥ threshold% win but result was LOSS.
+Built into the script (Settings & Maintenance, option 6). Recursively scans `combatlog/` (the `suspicious/` folder itself is skipped) and flags:
 
-```
-python check_suspicious_losses.py                  # auto-scan combatlog/
-python check_suspicious_losses.py <folder/file>    # specific path
-python check_suspicious_losses.py --threshold 95   # custom threshold (default: 99.5%)
-```
+- **LOSS** where TUO predicted a win% ≥ **99 %** in any turn (`SUSPICIOUS_LOSS_MIN_PCT`)
+- **WIN** where TUO predicted a win% ≤ **1 %** in any turn (`SUSPICIOUS_WIN_MAX_PCT`)
 
-Matching files are auto-copied to `combatlog/suspicious/`.
+Per hit it prints account/file, mode, enemy, BGE, max/min win% and the flagged turns with the card played. Hits are copied to `combatlog/suspicious/` (on a name collision with different content the account name is prefixed). The standalone `check_suspicious_losses.py` is unchanged (loss only, threshold 99.5 %).
 
 ### Combat Log Validator (`check_combat_log.py`)
 
@@ -457,7 +464,21 @@ Generated by **B → 11 Sync All Guild Decks** (combined defense + attack pass).
 
 ## Changelog
 
-### v5.9 — October 2026 *(current)*
+### v6.0 — October 2026 *(current)*
+
+- **NEW** Check Suspicious Combat Logs (F→6) — integrated filter: LOSS with TUO win% ≥ 99 % and WIN with TUO win% ≤ 1 %; hits copied to `combatlog/suspicious/`
+
+- **NEW** Commander HP in `hand-state` / `enemy:hand-state` — the API reports no commander HP, only hits (`skill_id 0`, targets `-1` / `-2`); HP = max HP − accumulated hits, max HP from `cards_section_N.xml` (`_get_card_max_hp`; 150 for all commanders). Hits are keyed per battle / turn / action (idempotent)
+- **CHANGE** Hand-state order — commander (50 / 150) first, then dominion (51 / 151), then the field cards (Arena, Brawl, Guild War)
+- **FIX** Permanent values (`h`, `perm_max_health`, `avenge_attack`) are only reported when they change; they are now carried over when a later turn mentions the card without them — previously e.g. a damaged dominion or an avenge-buffed card reached the sim as fresh. Dead cards (h ≤ 0) are not carried
+- **FIX** Commander runtime states (internal API UIDs `-1` / `-2`, e.g. `jam_countdown` of Razogoth Immortal) are merged into UID 50 / 150 for Arena and Brawl as well (Guild War already did); the derived commander HP is not overwritten (found by `check_combat_log.py`: `ENEMY MISSING card`)
+- **CHANGE** Challenge pool build is strictly priority-ordered: all missing copies of the first pool card (inventory → build / buyback of materials), next card only when no further copy is possible. Pools with repeated names behave as before
+- **CHANGE** Overload pools (Abunisapphire's Mirror, Extreme – Raider step 15, Progenitor Prophet): Pragmatic Zirconix removed (its Overload sits on the summoned Pragmatic Ally and is not counted), Veles Shapeshifter added, `pool_min` 2 → 3. Pool: Enyo Ruinmaker, Yurich's Observatory, Veles Shapeshifter, Metro Monitor
+- **CHANGE** Progenitor Omnipulse (Leech): Nexor's Throne removed (Leech sits on the summoned Nexor's Eye); pool: Ravenous Scamper, Kraken of Terror, `pool_min` 3
+- **CHANGE** Temporary commander debug dump removed
+- **CHANGE** Documentation aligned with the script: Living Mirrors Fortify pool, Overload pool, Mirror Vindicated pool; README/documentation updated to v6.0
+
+### v5.9 — October 2026
 
 - **FIX** Hand-state kill list — UIDs can be reused within a battle (a killed enemy card's UID is later assigned to a newly played card); the cumulative killed-UID set wrongly excluded such cards for the rest of the battle. The current field snapshot of the round is now authoritative over the historical kill list (Arena, Brawl, Guild War)
 - **FIX** Duplicate card names in `hand-state` / `enemy:hand-state` — built from the ordered field list, so the `#N` index of identical cards follows field position and matches the `sim.cpp` `name_encounter` counter
@@ -603,4 +624,4 @@ Guild War Stats Tracker, Guild War Summary, Live Sim Guild War, Build Brawl Gaun
 
 ---
 
-*TyrantAPICommander — October 2026 — v5.9*
+*TyrantAPICommander — October 2026 — v6.0*

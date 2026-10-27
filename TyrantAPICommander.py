@@ -6848,6 +6848,113 @@ $(document).ready(function(){
 
     # ==================== [S08] COMBAT LOG TOOLS ====================
 
+    # Suspicious combat-log filter (F -> 6): thresholds on the TUO win % shown during the battle
+    SUSPICIOUS_LOSS_MIN_PCT = 99.0   # LOSS although TUO showed >= this win % in any turn
+    SUSPICIOUS_WIN_MAX_PCT  = 1.0    # WIN although TUO showed <= this win % in any turn
+
+    def check_suspicious_combat_logs(self):
+        """
+        Scans combatlog/ (all accounts) for suspicious battles and copies them to combatlog/suspicious/:
+          - LOSS where TUO showed a win % >= SUSPICIOUS_LOSS_MIN_PCT in at least one turn
+          - WIN  where TUO showed a win % <= SUSPICIOUS_WIN_MAX_PCT in at least one turn
+        The suspicious/ folder itself is never scanned (no re-copying onto itself).
+        (Integrated version of the former standalone check_suspicious_losses.py.)
+        """
+        import json as _json
+        import shutil as _shutil
+
+        log_base = os.path.join(SCRIPT_DIR, 'combatlog')
+        if not os.path.isdir(log_base):
+            print(f"\n  ✗ No combatlog/ directory found at {log_base}")
+            return
+
+        out_dir = os.path.join(log_base, 'suspicious')
+        files = []
+        for root, dirs, fnames in os.walk(log_base):
+            dirs[:] = [d for d in dirs if d != 'suspicious']
+            for fn in sorted(fnames):
+                if fn.endswith('.json'):
+                    files.append(os.path.join(root, fn))
+        if not files:
+            print("\n  ✗ No combat log files found in combatlog/")
+            return
+
+        loss_min = self.SUSPICIOUS_LOSS_MIN_PCT
+        win_max  = self.SUSPICIOUS_WIN_MAX_PCT
+        print(f"\n{'='*70}")
+        print(f"  SUSPICIOUS COMBAT LOGS")
+        print(f"  LOSS with TUO win% >= {loss_min:g}%   |   WIN with TUO win% <= {win_max:g}%")
+        print(f"  Files checked: {len(files)}")
+        print(f"{'='*70}")
+
+        hits = []
+        for path in sorted(files):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = _json.load(f)
+            except Exception:
+                continue
+            result = data.get('result', '')
+            if result not in ('LOSS', 'WIN'):
+                continue
+            turns = data.get('turns', []) or []
+            pcts = [(t.get('turn'), t.get('tuo_win_pct'), t.get('card_played'))
+                    for t in turns if t.get('tuo_win_pct') is not None]
+            if not pcts:
+                continue
+            if result == 'LOSS':
+                flagged = [x for x in pcts if x[1] >= loss_min]
+                extreme = max(x[1] for x in pcts)
+            else:
+                flagged = [x for x in pcts if x[1] <= win_max]
+                extreme = min(x[1] for x in pcts)
+            if not flagged:
+                continue
+            hits.append({
+                'path': path, 'file': os.path.basename(path), 'result': result,
+                'account': os.path.basename(os.path.dirname(path)),
+                'enemy': data.get('enemy_name', '?'), 'mode': data.get('mode', '?'),
+                'bge': data.get('bge'), 'extreme': extreme, 'flagged': flagged,
+                'total_turns': len(turns),
+            })
+
+        if not hits:
+            print(f"\n  ✓ No suspicious battles found")
+            return
+
+        n_loss = sum(1 for h in hits if h['result'] == 'LOSS')
+        n_win  = len(hits) - n_loss
+        print(f"\n  ✗ {len(hits)} suspicious battle(s): {n_loss} loss(es), {n_win} win(s)\n")
+        for h in hits:
+            bge_str = f"  BGE: {h['bge']}" if h['bge'] else ""
+            label = (f"LOSS despite win% >= {loss_min:g}%" if h['result'] == 'LOSS'
+                     else f"WIN despite win% <= {win_max:g}%")
+            ext_name = 'Max' if h['result'] == 'LOSS' else 'Min'
+            print(f"  {'─'*66}")
+            print(f"  📄 {h['account']}/{h['file']}")
+            print(f"     {label}")
+            print(f"     Mode: {h['mode']}  |  Enemy: {h['enemy']}{bge_str}")
+            print(f"     {ext_name} win%: {h['extreme']:.1f}%  |  Turns total: {h['total_turns']}")
+            for (turn, pct, card) in h['flagged']:
+                card_str = f"  -> played: {card}" if card else ""
+                print(f"       Turn {turn!s:>2}: {pct:5.1f}%{card_str}")
+
+        os.makedirs(out_dir, exist_ok=True)
+        copied = 0
+        for h in hits:
+            dst = os.path.join(out_dir, h['file'])
+            try:
+                if os.path.exists(dst) and os.path.getsize(dst) != os.path.getsize(h['path']):
+                    dst = os.path.join(out_dir, f"{h['account']}_{h['file']}")   # same name, other content
+                _shutil.copy2(h['path'], dst)
+                copied += 1
+            except Exception as ex:
+                print(f"  ⚠ Could not copy {h['file']}: {ex}")
+        print(f"\n{'='*70}")
+        print(f"  TOTAL: {len(hits)} suspicious battle(s) out of {len(files)} logs")
+        print(f"{'='*70}")
+        print(f"\n  📁 {copied} file(s) copied to: {out_dir}")
+
     def scan_combat_logs_for_unknown_flags(self):
         """
         Scans all JSON combat logs in data/combatlog/ for API state flags
@@ -10397,8 +10504,46 @@ $(document).ready(function(){
                     if uid and flag is not None and val is not None:
                         this_turn.setdefault(uid, {})[flag] = val
         # Replace state for cards mentioned this turn; keep others unchanged
+        # Permanent values (current HP, permanent max-HP/avenge buffs) are only reported
+        # when they change. They never expire, so carry them over from the previous state
+        # if this turn mentions the card without them (otherwise the sim sees e.g. a
+        # damaged dominion or an avenge-buffed card as fresh). Dead cards (h<=0) are not
+        # carried, so a reused UID never inherits stale values.
+        _PERSIST = ('h', 'perm_max_health', 'avenge_attack')
         for uid, flags in this_turn.items():
+            old = card_states.get(uid)
+            if old and old.get('h', 1) is not None and int(old.get('h', 1)) > 0:
+                for _k in _PERSIST:
+                    if _k in old and _k not in flags:
+                        flags[_k] = old[_k]
             card_states[uid] = flags
+        # Commander HP: the API never reports it, only attack hits (skill_id 0) with
+        # targets [-1] (attacker's commander = UID 50) / [-2] (defender's = UID 150).
+        # Commander cannot be healed or shielded -> HP = max HP - sum of hits.
+        # Hits are keyed (turn, action idx, side) so re-seeing a turn is idempotent.
+        try:
+            _bid = battle_data.get('battle_id')
+            _cd = getattr(self, '_cmd_dmg', None)
+            if not _cd or _cd.get('bid') != _bid:
+                _cd = self._cmd_dmg = {'bid': _bid, 'hits': {}}
+            for tk, tv in turn.items():
+                if not isinstance(tv, dict):
+                    continue
+                for ai, action in enumerate(tv.get('actions', [])):
+                    if str(action.get('skill_id')) != '0':
+                        continue
+                    for tg in action.get('targets', []):
+                        if str(tg) in ('-1', '-2'):
+                            _cd['hits'][(str(tk), ai, str(tg))] = int(action.get('value', 0) or 0)
+            for _side, _uid, _ckey in (('-1', '50', 'attack_commander'),
+                                       ('-2', '150', 'defend_commander')):
+                _dmg = sum(v for (_t, _a, sd), v in _cd['hits'].items() if sd == _side)
+                if _dmg > 0:
+                    _mhp = self._get_card_max_hp(battle_data.get(_ckey))
+                    if _mhp:
+                        card_states[_uid] = {'h': max(_mhp - _dmg, 0)}
+        except Exception:
+            pass
         # Mark killed cards with h=0 — clears stale flags but keeps the UID
         # visible so the h<=0 dead-check in _states_for_range excludes them.
         # (Deleting the entry would leave h=None → bypass the check.)
@@ -11186,8 +11331,8 @@ $(document).ready(function(){
                     # UID schema (empirically verified):
                     # own assault=1-10, own dominion=51, own summons=52+
                     # enemy assault=101-110, enemy dominion=151, enemy summons=152+
-                    _own_range   = list(range(1, 11))   + [50] + [51] + list(range(52, 100))
-                    _enemy_range = list(range(101, 111)) + [150] + [151] + list(range(152, 200))
+                    _own_range   = [50] + [51] + list(range(1, 11))   + list(range(52, 100))
+                    _enemy_range = [150] + [151] + list(range(101, 111)) + list(range(152, 200))
                     _token_card_map.update(self._extract_token_card_map(battle_data))
                     _card_map    = {**battle_data.get('card_map', {}), **_token_card_map}
                     # Add commander card_ids (API gives them separately, not in card_map)
@@ -11260,11 +11405,18 @@ $(document).ready(function(){
                                 if ev_h is not None and int(ev_h) <= 0:
                                     continue
                             s = dict(_cl_card_states.get(uid, {}))
-                            # For commanders (uid 50/150), merge API internal states (-1/-2)
-                            if uid_i == 150:
-                                s.update(_cl_card_states.get('-2', {}))
-                            elif uid_i == 50:
-                                s.update(_cl_card_states.get('-1', {}))
+                            # Commanders (50/150): API keeps their runtime states (e.g.
+                            # jam_countdown) under internal UIDs -1/-2. Merge them, but keep
+                            # the derived commander HP ('h') untouched.
+                            if uid_i in (50, 150):
+                                _cx = _cl_card_states.get('-1' if uid_i == 50 else '-2')
+                                if isinstance(_cx, dict):
+                                    _ch = s.get('h')
+                                    s.update(_cx)
+                                    if _ch is not None:
+                                        s['h'] = _ch
+                                    else:
+                                        s.pop('h', None)
                             name = self._card_id_to_tuo_name(cid, card_data)
                             # Include even if s is empty (card on field with full HP, no effects)
                             if name and cid:
@@ -11787,8 +11939,8 @@ $(document).ready(function(){
                             _own_struct_uids.add(_uid_i)
                     # Brawl (we are defender): own commander/dominion = 150/151, enemy = 50/51
                     # (verified in combat log: card_map 150 = own commander, 50 = enemy commander)
-                    _own_range   = list(range(101, 111)) + [150, 151] + sorted(_own_struct_uids)
-                    _enemy_range = list(range(1, 11))   + [50, 51] + sorted(_enemy_struct_uids)
+                    _own_range   = [150, 151] + list(range(101, 111)) + sorted(_own_struct_uids)
+                    _enemy_range = [50, 51] + list(range(1, 11))   + sorted(_enemy_struct_uids)
                     _token_card_map.update(self._extract_token_card_map(battle_data))
                     _card_map    = {**battle_data.get('card_map', {}), **_token_card_map}
                     # Brawl: own commander=UID 150, enemy commander=UID 50
@@ -11849,11 +12001,17 @@ $(document).ready(function(){
                                 if ev_h is not None and int(ev_h) <= 0:
                                     continue
                             s = dict(_cl_card_states.get(uid, {}))
-                            # For commanders (uid 50/150), merge API internal states (-1/-2)
-                            if uid_i == 150:
-                                s.update(_cl_card_states.get('-2', {}))
-                            elif uid_i == 50:
-                                s.update(_cl_card_states.get('-1', {}))
+                            # Commander runtime states live under internal UIDs -1/-2
+                            # (see arena _states_for_range); keep derived 'h' untouched.
+                            if uid_i in (50, 150):
+                                _cx = _cl_card_states.get('-1' if uid_i == 50 else '-2')
+                                if isinstance(_cx, dict):
+                                    _ch = s.get('h')
+                                    s.update(_cx)
+                                    if _ch is not None:
+                                        s['h'] = _ch
+                                    else:
+                                        s.pop('h', None)
                             name = self._card_id_to_tuo_name(cid, card_data)
                             if name and cid:
                                 result.append((name, s))
@@ -12410,17 +12568,17 @@ $(document).ready(function(){
                     _n_own_forts   = sum(1 for u in my_fort_uids if card_map.get(u))
                     _n_enemy_forts = sum(1 for u in en_fort_uids if card_map.get(u))
                     if brawl_mode_uids:  # own=101-110
-                        _gw_own_range   = (list(range(101, 111)) + [50] + [51] +
+                        _gw_own_range   = ([50] + [51] + list(range(101, 111)) +
                                            list(range(52 + _n_enemy_forts, 100)) +
                                            list(range(152, 152 + _n_own_forts)))
-                        _gw_enemy_range = (list(range(1, 11)) + [150] + [151] +
+                        _gw_enemy_range = ([150] + [151] + list(range(1, 11)) +
                                            list(range(52, 52 + _n_enemy_forts)) +
                                            list(range(152 + _n_own_forts, 200)))
                     else:  # own=1-10
-                        _gw_own_range   = (list(range(1, 11)) + [50] + [51] +
+                        _gw_own_range   = ([50] + [51] + list(range(1, 11)) +
                                            list(range(152 + _n_enemy_forts, 200)) +
                                            list(range(52, 52 + _n_own_forts)))
-                        _gw_enemy_range = (list(range(101, 111)) + [150] + [151] +
+                        _gw_enemy_range = ([150] + [151] + list(range(101, 111)) +
                                            list(range(152, 152 + _n_enemy_forts)) +
                                            list(range(52 + _n_own_forts, 100)))
                     _gw_killed      = self._collect_killed_uids(battle_data, brawl_mode=brawl_mode_uids)
@@ -13950,8 +14108,8 @@ $(document).ready(function(){
          'desc': 'Overload a Lv. 6 Abunisapphire in 30 battles and win',
          'pvp': {'type_id': 6, 'skill': 'overload', 'wins': 30},
          'commander': None, 'required': ['Abunisapphire'],
-         'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Pragmatic Zirconix',
-                  'Metro Monitor'], 'pool_min': 2},
+         'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Veles Shapeshifter',
+                  'Metro Monitor'], 'pool_min': 3},
         # step 8 — Fortify Tantzaeon-6 in 30 battles and win
         {'name': "Tantzaeon's Mirror",
          'desc': 'Fortify a Lv. 6 Tantzaeon in 30 battles and win',
@@ -14180,9 +14338,9 @@ $(document).ready(function(){
          'desc': 'Win 30 battles after Overloading a Lv.6 Lead Dozer 3 times in each',
          'commander': None,
          'required': ['Lead Dozer'],
-         'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Pragmatic Zirconix',
+         'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Veles Shapeshifter',
                   'Metro Monitor'],
-         'pool_min': 2},
+         'pool_min': 3},
         # step 16 — Enrage Havoc Alpha-6 4x in 40 battles and win
         {'name': 'Mega Extreme - Raider',
          'desc': 'Win 40 battles after Enraging a Lv.6 Havoc Alpha 4 times in each',
@@ -14626,16 +14784,16 @@ $(document).ready(function(){
          'desc': 'Activate Leech 500 times in battles',
          'pvp': {'type_id': 1, 'skill': 'leech', 'value': 500},
          'commander': None, 'required': [],
-         'pool': ['Ravenous Scamper', 'Kraken of Terror', "Nexor's Throne"],
+         'pool': ['Ravenous Scamper', 'Kraken of Terror'],
          'pool_min': 3},
         # step 10 — Overload 300x
         {'name': 'Progenitor Prophet',
          'desc': 'Activate Overload 300 times in battles',
          'pvp': {'type_id': 1, 'skill': 'overload', 'value': 300},
          'commander': None, 'required': [],
-         'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Pragmatic Zirconix',
+         'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Veles Shapeshifter',
                   'Metro Monitor'],
-         'pool_min': 2},
+         'pool_min': 3},
         # step 11 — Mimic 375x
         {'name': 'Progenitor Ra',
          'desc': 'Activate Mimic 375 times in battles',
@@ -15475,9 +15633,8 @@ $(document).ready(function(){
         # POOL BUILD: pool_min = minimum TOTAL copies wanted; each name in ch['pool'] counts as one wanted copy
         # of that type, so duplicates in the list mean several copies. The server stores only ONE copy per
         # card id in setDeckCards (see Counter note below), so 'want' is capped per type.
-        # FIX: pass 1 respects the per-type cap; pass 2 tops up missing copies with extra copies of the pool
-        # cards (e.g. 'play 5 Structure cards' is satisfied by 5 copies of one structure). Previously a pool
-        # listing each card once could never reach pool_min if only 1-2 types were available.
+        # NOTE: the loop below is now strictly priority-ordered (see comment at the loop): all copies of the
+        # first card, then the next one. Several copies of one card satisfy e.g. 'play 5 Structure cards'.
         pool_ids = []
         remaining = ch['pool_min']
 
@@ -15490,7 +15647,10 @@ $(document).ready(function(){
                 pool_order.append(card_name)
             seen_pool[card_name] += 1
 
-        for _pass2, card_name in [(False, c) for c in pool_order] + [(True, c) for c in pool_order]:
+        # Priority order: the pool is sorted by importance. Take ALL missing copies from the first card
+        # (inventory first, then build) and only move on to the next card once no further copy of the
+        # current one is possible. (Previously: one copy of each card first, extras in a second pass.)
+        for _pass2, card_name in [(True, c) for c in pool_order]:
             if remaining <= 0:
                 break
             want = remaining if _pass2 else min(remaining, seen_pool[card_name])  # pass 1: cap per type
@@ -19170,6 +19330,49 @@ $(document).ready(function(){
                 print(f"   ✗ {msg}")
 
         return card_data
+
+    def _get_card_max_hp(self, card_id):
+        """Max HP of a card id (base or upgrade) from cards_section_*.xml, or None.
+        Upgrades without their own <health> inherit the previous level's value.
+        Built once, lazily (local XML first, same source order as _load_card_data)."""
+        cache = getattr(self, '_card_hp_cache', None)
+        if cache is None:
+            cache = {}
+            for section in range(1, 23):
+                filename = f"cards_section_{section}.xml"
+                local_path = os.path.join(SCRIPT_DIR, filename)
+                try:
+                    if os.path.isfile(local_path):
+                        with open(local_path, 'rb') as fh:
+                            xml_bytes = fh.read()
+                    else:
+                        xml_bytes = urlopen(f"{CARDS_BASE_URL}{filename}", timeout=15).read()
+                    root = ET.fromstring(xml_bytes)
+                except Exception:
+                    continue
+                for unit in root.findall('.//unit'):
+                    cur = None
+                    id_el = unit.find('id')
+                    hp_el = unit.find('health')
+                    if hp_el is not None and hp_el.text:
+                        try:
+                            cur = int(hp_el.text)
+                        except ValueError:
+                            cur = None
+                    if id_el is not None and id_el.text and cur is not None:
+                        cache[str(int(id_el.text))] = cur
+                    for upg in unit.findall('upgrade'):
+                        cid_el = upg.find('card_id')
+                        uh_el = upg.find('health')
+                        if uh_el is not None and uh_el.text:
+                            try:
+                                cur = int(uh_el.text)
+                            except ValueError:
+                                pass
+                        if cid_el is not None and cid_el.text and cur is not None:
+                            cache[str(int(cid_el.text))] = cur
+            self._card_hp_cache = cache
+        return cache.get(str(card_id))
 
     def _get_card_info(self, card_data, card_id, default_name=None):
         """Universal function to get card_info (Dict and String compatible)"""
@@ -26845,6 +27048,8 @@ def interactive_menu():
             input("\n[ENTER] to continue...")
         elif choice == "scan_flags":
             commander.scan_combat_logs_for_unknown_flags(); input("\n[ENTER] to continue...")
+        elif choice == "suspicious_logs":
+            commander.check_suspicious_combat_logs(); input("\n[ENTER] to continue...")
         elif choice == "92":
             db_mb = commander._tuo_database_size_mb()
             print(f"\n  database.yml: {db_mb:.1f} MB  ({commander._tuo_database_path()})")
@@ -27139,7 +27344,7 @@ def interactive_menu():
     # ── Submenu: Settings ─────────────────────────────────────────────────────
 
     def _menu_settings():
-        _map = {'1': '3', '2': '91', '3': '92', '4': '37', '5': 'scan_flags'}
+        _map = {'1': '3', '2': '91', '3': '92', '4': '37', '5': 'scan_flags', '6': 'suspicious_logs'}
         while True:
             t_val  = commander.tuo_threads
             _db_mb = commander._tuo_database_size_mb()
@@ -27152,6 +27357,7 @@ def interactive_menu():
             print(f"  3.   database.yml ({db_str})")
             print("  4.   Clear Old Gauntlet Entries (>7 days)")
             print("  5.   Scan Combat Logs for Unknown sim.cpp Flags")
+            print("  6.   Check Suspicious Combat Logs (Loss ≥99% / Win ≤1%)")
             print("─"*52)
             print("  0.   ← Back to Main Menu")
             print("="*52)
