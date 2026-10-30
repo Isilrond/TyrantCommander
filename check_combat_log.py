@@ -147,12 +147,22 @@ def build_expected(acs, uid_range, name_map):
 SCRIPT_CARRIED_FLAGS = {'stasis', 'berserk_attack', 'dead'}  # berserk_attack is summed up by the script from the berserk events
 
 
+# Script versions before 2026.10.30-7 deliberately dropped a positive attack_boost (Rally); from -7 on it is sent.
+_DROPS_POSITIVE_RALLY = False
+
+def _set_rally_mode(script_version):
+    """Set _DROPS_POSITIVE_RALLY for the log being checked from its script_version."""
+    global _DROPS_POSITIVE_RALLY
+    m = re.match(r'^(\d+)\.(\d+)\.(\d+)-(\d+)$', str(script_version or ''))
+    _DROPS_POSITIVE_RALLY = (not m) or (tuple(int(x) for x in m.groups()) < (2026, 10, 30, 7))
+
+
 def _fit_score(exp_flags, act_flags):
     """How well an actual hand-state entry fits an expected one (higher = better)."""
     sc = 0
     for k, v in exp_flags.items():
-        if k == 'attack_boost' and isinstance(v, (int, float)) and v > 0:
-            continue  # positive Rally is never sent
+        if _DROPS_POSITIVE_RALLY and k == 'attack_boost' and isinstance(v, (int, float)) and v > 0:
+            continue  # positive Rally is not sent (script before 2026.10.30-7)
         if k in act_flags:
             sc += 2 if act_flags[k] == v else -1
         else:
@@ -169,8 +179,8 @@ def compare_hs(expected_list, actual_list, side, issues):
 
     for exp_name, exp_flags in expected_list:
         base = exp_name.split('#')[0]
-        if exp_flags and all(f == 'attack_boost' and isinstance(v, (int, float)) and v > 0
-                             for f, v in exp_flags.items()):
+        if _DROPS_POSITIVE_RALLY and exp_flags and all(f == 'attack_boost' and isinstance(v, (int, float)) and v > 0
+                                                        for f, v in exp_flags.items()):
             continue  # only a positive Rally, which the script deliberately drops: nothing to pair
                       # (pairing it would take the hand-state entry of another card with the same name)
         if base not in actual_by_base or not actual_by_base[base]:
@@ -181,8 +191,8 @@ def compare_hs(expected_list, actual_list, side, issues):
         best_i = max(range(len(cands)), key=lambda i: _fit_score(exp_flags, cands[i][1]))
         _, act_flags = cands.pop(best_i)
         for flag, exp_val in exp_flags.items():
-            if flag == 'attack_boost' and isinstance(exp_val, (int, float)) and exp_val > 0:
-                continue  # the script deliberately drops a positive Rally (expires at end of turn)
+            if _DROPS_POSITIVE_RALLY and flag == 'attack_boost' and isinstance(exp_val, (int, float)) and exp_val > 0:
+                continue  # script before 2026.10.30-7 drops a positive Rally
             if flag not in act_flags:
                 issues.append(f"  {side} MISSING flag '{flag}'={exp_val} on {exp_name}")
             elif act_flags[flag] != exp_val:
@@ -376,7 +386,13 @@ def _norm_name(n):
 def _split_cmd(cmd):
     """Tokenise the logged TUO command. Falls back to None on parse errors."""
     try:
-        return _shlex.split(cmd, posix=True)
+        # cmd.exe semantics: only double quotes group; ' is a normal char (Yaw'oth'rugo), no backslash escapes
+        _lx = _shlex.shlex(cmd, posix=True)
+        _lx.whitespace_split = True
+        _lx.quotes = '"'
+        _lx.escape = ''
+        _lx.commenters = ''
+        return list(_lx)
     except Exception:
         return None
 
@@ -527,8 +543,11 @@ def check_sim_inputs(data, file_mode):
             nm_t  = t.get('card_name_map') or {}
             hs_all = _Counter()
             for key in ('hand-state', 'enemy:hand-state'):
-                for nme, _fl in parse_hand_state_str(_arg_after(tokens, key, 4) or ''):
-                    hs_all[_norm_name(nme.split('#')[0])] += 1
+                # raw entries: the parser drops hint-only entries (summon_turns/summon_src), which still count here
+                for _ent in (_arg_after(tokens, key, 4) or '').split(','):
+                    _nm = _ent.split(':')[0].strip()
+                    if _nm:
+                        hs_all[_norm_name(_nm.split('#')[0])] += 1
             need = _Counter()
             for uid_s, fl in acs_t.items():
                 if not (uid_s.isdigit() and (52 <= int(uid_s) <= 99 or 152 <= int(uid_s) <= 199)):
@@ -584,6 +603,7 @@ def check_log(path):
 
     has_name_map = any('card_name_map' in t for t in turns)
     file_mode    = data.get('mode', '')   # top-level battle mode (brawl/gw/arena)
+    _set_rally_mode(data.get('script_version'))
 
     print(f"\n{'='*70}")
     print(f"  {os.path.basename(path)}")
@@ -628,7 +648,7 @@ def check_log(path):
         own_range, enemy_range, mode = detect_ranges(tuo_cmd, acs, name_map, cached_own_101, file_mode=file_mode)
         # Cache first reliable detection within a battle
         if mode in ('brawl', 'gw') and cached_own_101 is None:
-            cached_own_101 = (own_range[0] == 101)  # True if own assault starts at 101
+            cached_own_101 = (101 in own_range)  # True if own assault is at 101-110 (brawl defender: range starts at 150)
 
         # For Brawl: summon UIDs (52-99 and 152-199) are assigned sequentially regardless
         # of which side summoned the card. Use state-matching against hand-states to assign
@@ -744,8 +764,10 @@ def check_log(path):
                     _uid_flags = acs.get(str(_u), {})
                     if isinstance(_uid_flags, dict) and _uid_flags.get('h', 1) == 0:
                         continue  # dead card — don't count as covered
-                    if not _uid_flags:
-                        continue  # stateless card can't own a hand-state entry (summon-loop case)
+                    if not _uid_flags or not any(
+                            (bool(_v) if not isinstance(_v, (int, float)) else _v != 0)
+                            for _v in _uid_flags.values()):
+                        continue  # stateless card (no flags or only zero flags) can't own a hand-state entry (summon-loop case)
                     _nm = name_map.get(str(_u), '').rsplit('-', 1)[0].strip().lower()
                     if _nm: _dom_own_counts[_nm] += 1
             for _u in enemy_range:
@@ -753,8 +775,10 @@ def check_log(path):
                     _uid_flags = acs.get(str(_u), {})
                     if isinstance(_uid_flags, dict) and _uid_flags.get('h', 1) == 0:
                         continue  # dead card — don't count as covered
-                    if not _uid_flags:
-                        continue  # stateless card can't own a hand-state entry (summon-loop case)
+                    if not _uid_flags or not any(
+                            (bool(_v) if not isinstance(_v, (int, float)) else _v != 0)
+                            for _v in _uid_flags.values()):
+                        continue  # stateless card (no flags or only zero flags) can't own a hand-state entry (summon-loop case)
                     _nm = name_map.get(str(_u), '').rsplit('-', 1)[0].strip().lower()
                     if _nm: _dom_enemy_counts[_nm] += 1
 

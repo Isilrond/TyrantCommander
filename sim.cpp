@@ -256,11 +256,13 @@ inline void CardStatus::set(const Card& card)
     m_sundered = false;
     //APN
     m_summoned = false;
+    m_skills_modified = false;
 
-    std::memset(m_primary_skill_offset, 0, sizeof m_primary_skill_offset);
-    std::memset(m_evolved_skill_offset, 0, sizeof m_evolved_skill_offset);
-    std::memset(m_enhanced_value, 0, sizeof m_enhanced_value);
-    std::memset(m_skill_cd, 0, sizeof m_skill_cd);
+    // the four skill arrays are adjacent members: one memset is much cheaper than four
+    static_assert(offsetof(CardStatus, m_skill_cd) + sizeof m_skill_cd - offsetof(CardStatus, m_primary_skill_offset)
+            == sizeof m_primary_skill_offset + sizeof m_evolved_skill_offset + sizeof m_enhanced_value + sizeof m_skill_cd,
+            "CardStatus skill arrays must be adjacent");
+    std::memset(m_primary_skill_offset, 0, offsetof(CardStatus, m_skill_cd) + sizeof m_skill_cd - offsetof(CardStatus, m_primary_skill_offset));
 }
 //------------------------------------------------------------------------------
 /**
@@ -452,6 +454,9 @@ std::string CardStatus::description() const
 // Live state overrides (hand-state / enemy:hand-state): apply one flag set to one card.
 static void apply_live_state(CardStatus* status, const std::map<std::string, int>& f)
 {
+    // The live values below are written straight into the skill arrays; make sure the turn end clears them
+    // like any other enhance/evolve (the sim only clears the arrays of cards flagged as modified).
+    status->m_skills_modified = true;
     // remaining turns until the card may act (0 = active)
     if (f.count("delay"))
         status->m_delay = f.at("delay");
@@ -465,12 +470,10 @@ static void apply_live_state(CardStatus* status, const std::map<std::string, int
     // Attack modifier (Weaken=negative, Rally/Enrage=positive)
     if (f.count("attack_boost"))
     {
-        // A negative value is a Weaken that is active at the start of the turn: it ends with the owner's
-        // turn, so it goes into the temporary slot. A positive value stays permanent (Enrage-like).
-        if (f.at("attack_boost") < 0)
-            status->m_temp_attack_buff = f.at("attack_boost");
-        else
-            status->m_perm_attack_buff = f.at("attack_boost");
+        // Weaken (negative) and Rally (positive) that are active at the start of the turn both end with the
+        // owner's turn (a Rally cast by the opponent's On Attacked skill lasts through the owner's next turn),
+        // so both go into the temporary slot.
+        status->m_temp_attack_buff = f.at("attack_boost");
     }
     // Avenge accumulated ATK (additive)
     if (f.count("avenge_attack"))
@@ -823,7 +826,25 @@ static bool apply_live_field(Field* fd)
                                                  : sim_delay(base, age);
                 status->m_summoned = true;
             }
+            // Unit the owner played itself: exact age from the play turn (played_turns = owner turn
+            // starts since the play + 1). The played list alone cannot tell which copy of a card died.
+            else if (fl.count("played_turns") && fl.at("played_turns") >= 1 && status != &h->commander)
+            {
+                const unsigned age = static_cast<unsigned>(fl.at("played_turns") - 1);
+                status->m_delay = (h->side == 0) ? sim_delay(status->m_card->m_delay, age > 0 ? age - 1 : 0)
+                                                 : sim_delay(status->m_card->m_delay, age);
+            }
             apply_live_state(status, fl);
+            // Skill timers (Jam/Flurry) of my own cards: the snapshot is taken during my turn, i.e. after the
+            // game already counted this turn's timer down, while the sim counts down again at the start of
+            // this turn -> add the missing step back. Enemy timers are end-of-its-turn values and fit as is.
+            if (h->side == 0)
+            {
+                if (fl.count("jam_countdown") && fl.at("jam_countdown") > 0)
+                    ++status->m_skill_cd[Skill::jam];
+                if (fl.count("flurry_countdown") && fl.at("flurry_countdown") > 0)
+                    ++status->m_skill_cd[Skill::flurry];
+            }
             // Commander: the API never reports its HP; the tool sums up the damage it has taken
             if (status == &h->commander && fl.count("cmd_damage") && fl.at("cmd_damage") > 0)
             {
@@ -1836,9 +1857,13 @@ void turn_end_phase(Field* fd)
             }
             status.m_enfeebled = 0;
             status.m_protected = 0;
-            std::memset(status.m_primary_skill_offset, 0, sizeof status.m_primary_skill_offset);
-            std::memset(status.m_evolved_skill_offset, 0, sizeof status.m_evolved_skill_offset);
-            std::memset(status.m_enhanced_value, 0, sizeof status.m_enhanced_value);
+            if (status.m_skills_modified)
+            {
+                std::memset(status.m_primary_skill_offset, 0, sizeof status.m_primary_skill_offset);
+                std::memset(status.m_evolved_skill_offset, 0, sizeof status.m_evolved_skill_offset);
+                std::memset(status.m_enhanced_value, 0, sizeof status.m_enhanced_value);
+                status.m_skills_modified = false;
+            }
             status.m_evaded = 0;  // so far only useful in Inactive turn
             status.m_paybacked = 0;  // ditto
             status.m_entrapped = 0;
@@ -2670,6 +2695,7 @@ inline void perform_skill<Skill::enfeeble>(Field* fd, CardStatus* src, CardStatu
 inline void perform_skill<Skill::enhance>(Field* fd, CardStatus* src, CardStatus* dst, const SkillSpec& s)
 {
     dst->m_enhanced_value[s.s + dst->m_primary_skill_offset[s.s]] += s.x;
+    dst->m_skills_modified = true;
 }
 
     template<>
@@ -2681,6 +2707,7 @@ inline void perform_skill<Skill::evolve>(Field* fd, CardStatus* src, CardStatus*
     dst->m_primary_skill_offset[s.s2] = primary_s1 - s.s2;
     dst->m_evolved_skill_offset[primary_s1] = s.s2 - primary_s1;
     dst->m_evolved_skill_offset[primary_s2] = s.s - primary_s2;
+    dst->m_skills_modified = true;
 }
 
     template<>
@@ -2825,12 +2852,9 @@ inline void perform_skill<Skill::mimic>(Field* fd, CardStatus* src, CardStatus* 
     mimickable_skills.reserve(dst->m_card->m_skills.size()+dst->m_card->m_skills_on_play.size()+dst->m_card->m_skills_on_death.size()+dst->m_card->m_skills_on_attacked.size());
     _DEBUG_MSG(2, " * Mimickable skills of %s\n", status_description(dst).c_str());
     //include on activate/attacked
-    std::vector<std::vector<SkillSpec>> all;
-    all.emplace_back(dst->m_card->m_skills);
-    all.emplace_back(dst->m_card->m_skills_on_attacked);
-    for(std::vector<SkillSpec> & a : all)
+    for(const std::vector<SkillSpec> * a : {&dst->m_card->m_skills, &dst->m_card->m_skills_on_attacked})
     {
-    for (const SkillSpec & ss: a)
+    for (const SkillSpec & ss: *a)
     {
         // get skill
         Skill::Skill skill_id = static_cast<Skill::Skill>(ss.id);
@@ -3581,7 +3605,9 @@ void perform_targetted_allied_fast(Field* fd, CardStatus* src, const SkillSpec& 
     bool has_counted_quest = false;
 #endif
     bool src_overloaded = src->m_overloaded;
-    std::vector<CardStatus*> selection_array = fd->selection_array;
+    // take the targets without copying them (nested skills select into fd->selection_array), give the buffer back after
+    std::vector<CardStatus*> selection_array;
+    selection_array.swap(fd->selection_array);
     for (CardStatus * dst: selection_array)
     {
         if (dst->m_inhibited > 0 && !src_overloaded)
@@ -3599,6 +3625,7 @@ void perform_targetted_allied_fast(Field* fd, CardStatus* src, const SkillSpec& 
 #endif
                 );
     }
+    fd->selection_array.swap(selection_array);
 
     // Passive BGE: Divert
     if (__builtin_expect(fd->bg_effects[fd->tapi][PassiveBGE::divert], false)
@@ -3661,7 +3688,9 @@ void perform_targetted_hostile_fast(Field* fd, CardStatus* src, const SkillSpec&
 
     // apply skill to each target(dst)
     unsigned selection_array_len = fd->selection_array.size();
-    std::vector<CardStatus*> selection_array = fd->selection_array;
+    // take the targets without copying them (nested skills select into fd->selection_array), give the buffer back after
+    std::vector<CardStatus*> selection_array;
+    selection_array.swap(fd->selection_array);
     for (CardStatus * dst: selection_array)
     {
         // TurningTides
@@ -3692,6 +3721,7 @@ void perform_targetted_hostile_fast(Field* fd, CardStatus* src, const SkillSpec&
             }
         }
     }
+    fd->selection_array.swap(selection_array);
 
     // apply TurningTides
     if (__builtin_expect(has_turningtides, false) && (turningtides_value > 0))

@@ -146,7 +146,7 @@ if DEBUG_MODE:
 
 # Script version: written into every combat log, so old logs can be told apart from fixed behaviour.
 # Format YYYY.MM.DD-N; raise it with every behaviour change.
-SCRIPT_VERSION = "2026.10.30-5"
+SCRIPT_VERSION = "2026.10.30-11"
 
 import json
 import xml.etree.ElementTree as ET
@@ -4958,6 +4958,29 @@ $(document).ready(function(){
 
     _DB_YML_WARN_MB = 280   # warn when database.yml exceeds this size
 
+    @staticmethod
+    def _deck_card_overlap(deck_a, deck_b):
+        """Deck-card overlap of two TUO deck strings (commander and dominion not counted).
+        Returns (equal_cards, total_cards) with total = size of the larger deck, or None if a deck is missing."""
+        import re as _re_o
+        from collections import Counter as _Cn
+        def _body(d):
+            parts = [c.strip() for c in (d or '').split(',') if c.strip()]
+            return _Cn(_re_o.sub(r'-\d+$', '', c) for c in parts[2:])
+        a, b = _body(deck_a), _body(deck_b)
+        total = max(sum(a.values()), sum(b.values()))
+        if not total:
+            return None
+        return sum((a & b).values()), total
+
+    def _enemy_deck_meta(self, gauntlet_deck, live_deck, fetch_status):
+        """Combat-log fields that record where the enemy deck of the sim input came from."""
+        return {
+            'enemy_deck_source': 'live' if live_deck else ('gauntlet' if gauntlet_deck else 'none'),
+            'enemy_deck_gauntlet': gauntlet_deck or None,
+            'enemy_deck_live_status': fetch_status or None,
+        }
+
     def _tuo_build_info(self):
         """Identify the tuo.exe in use (cached per file mtime/size): build time, size, short SHA-256 and
         which patch features its binary contains. Written into every combat log as 'tuo_build'."""
@@ -6880,8 +6903,8 @@ $(document).ready(function(){
     # ==================== [S08] COMBAT LOG TOOLS ====================
 
     # Suspicious combat-log filter (F -> 6): thresholds on the TUO win % shown during the battle
-    SUSPICIOUS_LOSS_MIN_PCT = 99.0   # LOSS although TUO showed >= this win % in any turn
-    SUSPICIOUS_WIN_MAX_PCT  = 1.0    # WIN although TUO showed <= this win % in any turn
+    SUSPICIOUS_LOSS_MIN_PCT = 95.0   # LOSS although TUO showed >= this win % in any turn
+    SUSPICIOUS_WIN_MAX_PCT  = 5.0    # WIN although TUO showed <= this win % in any turn
     SUSPICIOUS_MIN_STREAK   = 3      # ...but only if this many consecutive turns are extreme
     SUSPICIOUS_LAST_TURN    = 9      # ...or if an extreme value occurs in this turn (single hit is enough)
 
@@ -7040,8 +7063,13 @@ $(document).ready(function(){
                         _cnt[_c['name']] = _cnt.get(_c['name'], 0) + 1
                 for _n, _k in _cnt.items():
                     _act[_n] = max(_act.get(_n, 0), _k)
+                # enemy commander / first card UIDs: 150/151 normally, 50/51 when I am the
+                # brawl defender (own UIDs 101-110 / 150 / 151)
+                _own_hi = any(isinstance(_c.get('uid'), int) and 101 <= _c['uid'] <= 110
+                              for _c in (_t.get('field') or {}).get('own', []))
+                _en_cmd = ('50', '51') if _own_hi else ('150', '151')
                 for _uid, _n in (_t.get('card_name_map') or {}).items():
-                    if str(_uid) in ('150', '151'):
+                    if str(_uid) in _en_cmd:
                         _act.setdefault(_n, 1)
             _act_str = ", ".join(f"{n} x{k}" if k > 1 else n for n, k in sorted(_act.items()))
             _mism = sorted(n if n not in _exp_cnt else f"{n} (x{k} played, x{_exp_cnt[n]} expected)"
@@ -7053,6 +7081,8 @@ $(document).ready(function(){
             hits.append({
                 'dk': _dk,
                 'exp_deck': _exp, 'act_deck': _act_str, 'mismatch': _mism,
+                'src': data.get('enemy_deck_source'), 'gdeck': data.get('enemy_deck_gauntlet'),
+                'lstat': data.get('enemy_deck_live_status'),
                 'guild': data.get('enemy_guild') or '-', 'ver': data.get('script_version') or 'old',
                 'path': path, 'file': os.path.basename(path), 'result': result,
                 'account': os.path.basename(os.path.dirname(path)),
@@ -7134,6 +7164,15 @@ $(document).ready(function(){
                 lines.append(f"    actual cards played:       {h['act_deck'] or '-'}")
                 _d = h.get('dk') or {}
                 lines.append("    enemy deck known: " + (f"{_d.get('known')}/{_d.get('of')} cards (INCOMPLETE - forecast optimistic)" if _d else "complete / unknown"))
+                if h.get('src'):
+                    _l = f"    enemy deck source: {h['src']}"
+                    if h['src'] == 'live' and h.get('gdeck'):
+                        _ov = self._deck_card_overlap(h['exp_deck'], h['gdeck'])
+                        if _ov:
+                            _l += f"  (arenagauntlet: {_ov[0]} of {_ov[1]} cards equal" + (" - DIFFERS)" if _ov[0] * 2 < _ov[1] else ")")
+                    elif h['src'] != 'live' and h.get('lstat') and not str(h['lstat']).lower().startswith('no proxy'):
+                        _l += f"  (LIVE FETCH FAILED: {h['lstat']})"
+                    lines.append(_l)
                 lines.append("    => " + (f"KNOWN-DECK MISMATCH (not in / more than in expected deck): {', '.join(h['mismatch'])}"
                                           if h['mismatch'] else "deck matches (suspect sim)"))
             with open(sum_path, 'w', encoding='utf-8') as f:
@@ -11220,11 +11259,6 @@ $(document).ready(function(){
                     continue
                 if ival == 0:
                     continue
-                if flag == 'attack_boost' and ival > 0:
-                    # A positive attack_boost is a Rally that expires at the end of the turn it
-                    # was cast in; none is active when a turn starts. Only the negative
-                    # (Weaken) value is permanent.
-                    continue
                 if flag in BOOL_FLAGS:
                     if ival:
                         tokens.append(f'{flag}=1')
@@ -11382,6 +11416,18 @@ $(document).ready(function(){
                                       if _tb.get('found') else "tuo.exe not found"))
         L.append(f"My deck:    {log_data.get('my_deck', '')}")
         L.append(f"Enemy deck: {log_data.get('enemy_deck', '')}")
+        _src = log_data.get('enemy_deck_source')
+        if _src:
+            L.append(f"Enemy deck source: {_src}" + (f"  (live status: {log_data.get('enemy_deck_live_status')})"
+                                                      if log_data.get('enemy_deck_live_status') else ''))
+            _gd = log_data.get('enemy_deck_gauntlet')
+            if _src == 'live' and _gd:
+                _ov = self._deck_card_overlap(log_data.get('enemy_deck'), _gd)
+                if _ov and _ov[0] * 2 < _ov[1]:
+                    L.append(f"!! LIVE DECK DIFFERS from arenagauntlet ({_ov[0]} of {_ov[1]} cards equal)  arenagauntlet: {_gd}")
+            _st = str(log_data.get('enemy_deck_live_status') or '')
+            if _src != 'live' and _st and not _st.lower().startswith('no proxy'):
+                L.append(f"!! LIVE FETCH FAILED although a proxy lookup was tried: {_st}")
         L.append("")
 
         def _fl(fl):
@@ -11878,6 +11924,8 @@ $(document).ready(function(){
             # In arena, getProfileData only works for same-guild members.
             # Only attempt if we have a proxy account in the enemy's guild.
             _live_deck = None
+            _fetch_status = None
+            _gauntlet_deck = enemy_deck_str
             _guild_key = (_cached_guild or enemy_guild or '').lower()
             if _guild_key and _guild_key in _guild_account_map:
                 _live_deck, _fetch_status = self._fetch_enemy_deck_live(
@@ -12373,6 +12421,7 @@ $(document).ready(function(){
                             'bge':         bge_name or None,
                             'my_deck':     my_deck_str,
                             'enemy_deck':  enemy_deck_str or None,
+                            **self._enemy_deck_meta(_gauntlet_deck, _live_deck, _fetch_status),
                             'turns':       _cl_turns,
                         }, account_name=_cl_acct)
                         _cl_turns = []   # reset for next battle
@@ -12591,6 +12640,7 @@ $(document).ready(function(){
             _had_guild_entry = gauntlet is not None and gauntlet[0] == 'GUILD'
 
             # ── Live deck fetch (always try before falling back to cache) ─
+            _gauntlet_deck = enemy_deck_str
             _live_deck, _fetch_status = self._fetch_enemy_deck_live(
                 enemy_name, _cached_guild, card_data=card_data, guild_map=_guild_account_map)
             if _live_deck:
@@ -12800,16 +12850,27 @@ $(document).ready(function(){
                             if not cid:
                                 continue
                             abs_hp = _brawl_field_hp.get(uid)
+                            _is_dead = False
                             if abs_hp is not None:
                                 if abs_hp <= 0:
-                                    continue
+                                    _is_dead = True
                             else:
                                 if uid_i in _killed:
-                                    continue
-                                s_check = _cl_card_states.get(uid, {})
-                                ev_h = s_check.get('h')
-                                if ev_h is not None and int(ev_h) <= 0:
-                                    continue
+                                    _is_dead = True
+                                else:
+                                    s_check = _cl_card_states.get(uid, {})
+                                    ev_h = s_check.get('h')
+                                    if ev_h is not None and int(ev_h) <= 0:
+                                        _is_dead = True
+                            if _is_dead:
+                                # A destroyed dominion must be reported explicitly: TUO places it at full HP at
+                                # start-up and cannot tell "destroyed" from "unchanged" by its absence.
+                                if uid_i in (51, 151):
+                                    _dn = self._card_id_to_tuo_name(cid, card_data)
+                                    if _dn:
+                                        result.append((_dn, {'dead': 1}))
+                                        _uids.append(uid_i)
+                                continue
                             s = dict(_cl_card_states.get(uid, {}))
                             s.update(self._summon_hint_flags(uid, _card_map))
                             self._carry_stasis(uid, _card_map, s)
@@ -12998,6 +13059,7 @@ $(document).ready(function(){
                             'account': _cl_acct, 'script_version': SCRIPT_VERSION, 'tuo_build': self._tuo_build_info(), 'enemy_name': enemy_name,
                             'enemy_guild': '', 'bge': bge_name or None,
                             'my_deck': my_deck_str, 'enemy_deck': enemy_deck_str or None,
+                            **self._enemy_deck_meta(_gauntlet_deck, _live_deck, _fetch_status),
                             'turns': _cl_turns,
                         }, account_name=_cl_acct)
                         _cl_turns = []
@@ -13041,6 +13103,7 @@ $(document).ready(function(){
                             'bge':         bge_name or None,
                             'my_deck':     my_deck_str,
                             'enemy_deck':  enemy_deck_str or None,
+                            **self._enemy_deck_meta(_gauntlet_deck, _live_deck, _fetch_status),
                             'turns':       _cl_turns,
                         }, account_name=_cl_acct)
                         _cl_turns = []
@@ -13456,16 +13519,27 @@ $(document).ready(function(){
                             if not cid:
                                 continue
                             abs_hp = _gw_field_hp.get(uid)
+                            _is_dead = False
                             if abs_hp is not None:
                                 if abs_hp <= 0:
-                                    continue
+                                    _is_dead = True
                             else:
                                 if uid_i in _gw_killed:
-                                    continue
-                                s_check = _gw_card_states.get(uid, {})
-                                ev_h = s_check.get('h')
-                                if ev_h is not None and int(ev_h) <= 0:
-                                    continue
+                                    _is_dead = True
+                                else:
+                                    s_check = _gw_card_states.get(uid, {})
+                                    ev_h = s_check.get('h')
+                                    if ev_h is not None and int(ev_h) <= 0:
+                                        _is_dead = True
+                            if _is_dead:
+                                # A destroyed dominion must be reported explicitly: TUO places it at full HP at
+                                # start-up and cannot tell "destroyed" from "unchanged" by its absence.
+                                if uid_i in (51, 151):
+                                    _dn = self._card_id_to_tuo_name(cid, card_data)
+                                    if _dn:
+                                        result.append((_dn, {'dead': 1}))
+                                        _uids.append(uid_i)
+                                continue
                             s = dict(_gw_card_states.get(uid, {}))
                             s.update(self._summon_hint_flags(uid, _gw_card_map))
                             self._carry_stasis(uid, _gw_card_map, s)
@@ -28263,7 +28337,7 @@ def interactive_menu():
             print(f"  3.   database.yml ({db_str})")
             print("  4.   Clear Old Gauntlet Entries (>7 days)")
             print("  5.   Scan Combat Logs for Unknown sim.cpp Flags")
-            print("  6.   Check Suspicious Combat Logs (Loss ≥99% / Win ≤1%)")
+            print("  6.   Check Suspicious Combat Logs (Loss ≥95% / Win ≤5%)")
             print("  7.   Win Rate per Mode and Account (from Combat Logs)")
             print("─"*52)
             print("  0.   ← Back to Main Menu")
