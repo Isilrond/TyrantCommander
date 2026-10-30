@@ -144,6 +144,10 @@ if DEBUG_MODE:
 # ==================== ACTUAL IMPORTS ====================
 # Now import everything for real (after debug checks)
 
+# Script version: written into every combat log, so old logs can be told apart from fixed behaviour.
+# Format YYYY.MM.DD-N; raise it with every behaviour change.
+SCRIPT_VERSION = "2026.10.30-5"
+
 import json
 import xml.etree.ElementTree as ET
 from urllib.request import urlopen, Request
@@ -3357,9 +3361,9 @@ $(document).ready(function(){
         Logik:
         - Calculate free slots
         - Divide by 20 (each package has 20 Cards)
-        - Abrunden auf ganze Zahl
+        - Round down to a whole number
         
-        Beispiel: 546 freie Slots / 20 = 27.3 -> 27 packages
+        Example: 546 free slots / 20 = 27.3 -> 27 packages
         
         Returns:
             tuple: (max_packs, free_slots)
@@ -3786,7 +3790,7 @@ $(document).ready(function(){
     def update_deck(self):
         """
         Updates a deck in einem bestimmten Slot
-        Accepts card names (e.g. "Barracus-6") statt IDs
+        Accepts card names (e.g. "Barracus-6") instead of IDs
         """
         try:
             # Refresh data to get current state
@@ -4953,6 +4957,33 @@ $(document).ready(function(){
         return os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
 
     _DB_YML_WARN_MB = 280   # warn when database.yml exceeds this size
+
+    def _tuo_build_info(self):
+        """Identify the tuo.exe in use (cached per file mtime/size): build time, size, short SHA-256 and
+        which patch features its binary contains. Written into every combat log as 'tuo_build'."""
+        import hashlib as _hl
+        from datetime import datetime as _dtm
+        p = self._tuo_path
+        try:
+            st = os.stat(p)
+        except OSError:
+            return {'found': False}
+        key = (st.st_mtime, st.st_size)
+        c = getattr(self, '_tuo_build_cache', None)
+        if c and c[0] == key:
+            return c[1]
+        info = {'found': True, 'size': st.st_size,
+                'mtime': _dtm.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')}
+        try:
+            with open(p, 'rb') as f:
+                data = f.read()
+            info['sha12'] = _hl.sha256(data).hexdigest()[:12]
+            info['live_position'] = b'enemy:hand-state' in data      # played/field/hand-state options
+            info['stasis_fix'] = b' stasis=' in data                 # live-field stasis patch (board dump string)
+        except Exception as ex:
+            info['error'] = str(ex)[:80]
+        self._tuo_build_cache = (key, info)
+        return info
 
     def _tuo_database_path(self):
         return os.path.join(self._tuo_dir, 'data', 'database.yml')
@@ -6851,17 +6882,91 @@ $(document).ready(function(){
     # Suspicious combat-log filter (F -> 6): thresholds on the TUO win % shown during the battle
     SUSPICIOUS_LOSS_MIN_PCT = 99.0   # LOSS although TUO showed >= this win % in any turn
     SUSPICIOUS_WIN_MAX_PCT  = 1.0    # WIN although TUO showed <= this win % in any turn
+    SUSPICIOUS_MIN_STREAK   = 3      # ...but only if this many consecutive turns are extreme
+    SUSPICIOUS_LAST_TURN    = 9      # ...or if an extreme value occurs in this turn (single hit is enough)
+
+    def combat_log_winrates(self, log_base=None):
+        """Overall win rate per mode and per account from all combat logs in combatlog/ (suspicious/ is skipped)."""
+        import json as _json
+        log_base = log_base or os.path.join(SCRIPT_DIR, 'combatlog')
+        if not os.path.isdir(log_base):
+            print(f"\n  ✗ No combatlog/ directory found at {log_base}")
+            return
+        stats = {}   # (account, mode) -> [wins, losses]
+        skipped = 0
+        for root, dirs, fnames in os.walk(log_base):
+            dirs[:] = [d for d in dirs if d != 'suspicious']
+            for fn in fnames:
+                if not fn.endswith('.json'):
+                    continue
+                path = os.path.join(root, fn)
+                try:
+                    with open(path, encoding='utf-8') as f:
+                        d = _json.load(f)
+                    res = str(d.get('result', '')).upper()
+                    if res not in ('WIN', 'LOSS'):
+                        skipped += 1
+                        continue
+                    acct = d.get('account') or os.path.basename(root)
+                    mode = d.get('mode') or '?'
+                    st = stats.setdefault((acct, mode), [0, 0])
+                    st[0 if res == 'WIN' else 1] += 1
+                except Exception:
+                    skipped += 1
+        if not stats:
+            print("\n  ✗ No usable combat logs found")
+            return
+
+        modes = sorted({m for (_, m) in stats})
+        accts = sorted({a for (a, _) in stats}, key=str.lower)
+        aw_ = max([len(a) for a in accts] + [7])
+        mw_ = max([len(m) for m in modes] + [4])
+
+        def _row(name, mode, w, l):
+            n = w + l
+            return f"  {name:<{aw_}}  {mode:<{mw_}}  {w:>6}  {l:>6}  {n:>6}  {100.0 * w / n:>6.1f} %"
+
+        head = f"  {'Account':<{aw_}}  {'Mode':<{mw_}}  {'Wins':>6}  {'Losses':>6}  {'Total':>6}  {'Rate':>8}"
+        line = "  " + "-" * (len(head) - 2)
+        print(f"\n{'='*len(head)}\n  WIN RATE FROM COMBAT LOGS\n{'='*len(head)}")
+        print("\n  PER MODE (all accounts)")
+        print(head); print(line)
+        gw = gl = 0
+        for m in modes:
+            w = sum(v[0] for (a, mm), v in stats.items() if mm == m)
+            l = sum(v[1] for (a, mm), v in stats.items() if mm == m)
+            gw += w; gl += l
+            print(_row('ALL', m, w, l))
+        print(line)
+        print(_row('ALL', 'ALL', gw, gl))
+        print("\n  PER ACCOUNT AND MODE")
+        print(head); print(line)
+        for a in accts:
+            aw = sum(v[0] for (aa, m), v in stats.items() if aa == a)
+            al = sum(v[1] for (aa, m), v in stats.items() if aa == a)
+            for m in modes:
+                if (a, m) in stats:
+                    print(_row(a, m, *stats[(a, m)]))
+            if sum(1 for (aa, m) in stats if aa == a) > 1:
+                print(_row(a, 'ALL', aw, al))
+            print(line)
+        if skipped:
+            print(f"\n  ({skipped} file(s) without a clear result skipped)")
 
     def check_suspicious_combat_logs(self):
         """
         Scans combatlog/ (all accounts) for suspicious battles and copies them to combatlog/suspicious/:
-          - LOSS where TUO showed a win % >= SUSPICIOUS_LOSS_MIN_PCT in at least one turn
-          - WIN  where TUO showed a win % <= SUSPICIOUS_WIN_MAX_PCT in at least one turn
+          - LOSS where TUO showed a win % >= SUSPICIOUS_LOSS_MIN_PCT
+          - WIN  where TUO showed a win % <= SUSPICIOUS_WIN_MAX_PCT
+        ...and only if the extreme value occurs in >= SUSPICIOUS_MIN_STREAK consecutive turns
+        or at least once in turn SUSPICIOUS_LAST_TURN (single earlier spikes are ignored).
         The suspicious/ folder itself is never scanned (no re-copying onto itself).
+        It is deleted completely after each scan and rebuilt with the current hits.
         (Integrated version of the former standalone check_suspicious_losses.py.)
         """
         import json as _json
         import shutil as _shutil
+        import re as _re
 
         log_base = os.path.join(SCRIPT_DIR, 'combatlog')
         if not os.path.isdir(log_base):
@@ -6884,6 +6989,7 @@ $(document).ready(function(){
         print(f"\n{'='*70}")
         print(f"  SUSPICIOUS COMBAT LOGS")
         print(f"  LOSS with TUO win% >= {loss_min:g}%   |   WIN with TUO win% <= {win_max:g}%")
+        print(f"  (only if >= {self.SUSPICIOUS_MIN_STREAK} turns in a row, or in turn {self.SUSPICIOUS_LAST_TURN})")
         print(f"  Files checked: {len(files)}")
         print(f"{'='*70}")
 
@@ -6910,13 +7016,57 @@ $(document).ready(function(){
                 extreme = min(x[1] for x in pcts)
             if not flagged:
                 continue
+            flagged_turns = {x[0] for x in flagged}
+            streak = best = 0
+            prev = None
+            for tn in sorted(t for t in flagged_turns if isinstance(t, int)):
+                streak = streak + 1 if prev is not None and tn == prev + 1 else 1
+                best = max(best, streak)
+                prev = tn
+            if best < self.SUSPICIOUS_MIN_STREAK and self.SUSPICIOUS_LAST_TURN not in flagged_turns:
+                continue
+            # expected (sim input) vs. actual (cards the enemy really played) enemy deck
+            _exp = data.get('enemy_deck') or ''
+            _exp_cnt = {}
+            for _c in _exp.split(','):
+                if _c.strip():
+                    _nm = _re.sub(r'-\d+$', '', _c.strip())
+                    _exp_cnt[_nm] = _exp_cnt.get(_nm, 0) + 1
+            _act = {}
+            for _t in turns:
+                _cnt = {}
+                for _c in (_t.get('field') or {}).get('enemy', []):
+                    if _c.get('card_id') and _c.get('name'):
+                        _cnt[_c['name']] = _cnt.get(_c['name'], 0) + 1
+                for _n, _k in _cnt.items():
+                    _act[_n] = max(_act.get(_n, 0), _k)
+                for _uid, _n in (_t.get('card_name_map') or {}).items():
+                    if str(_uid) in ('150', '151'):
+                        _act.setdefault(_n, 1)
+            _act_str = ", ".join(f"{n} x{k}" if k > 1 else n for n, k in sorted(_act.items()))
+            _mism = sorted(n if n not in _exp_cnt else f"{n} (x{k} played, x{_exp_cnt[n]} expected)"
+                           for n, k in _act.items() if k > _exp_cnt.get(n, 0))
+            _dk = {}
+            for _t in turns:
+                if _t.get('enemy_deck_known'):
+                    _dk = _t['enemy_deck_known']
             hits.append({
+                'dk': _dk,
+                'exp_deck': _exp, 'act_deck': _act_str, 'mismatch': _mism,
+                'guild': data.get('enemy_guild') or '-', 'ver': data.get('script_version') or 'old',
                 'path': path, 'file': os.path.basename(path), 'result': result,
                 'account': os.path.basename(os.path.dirname(path)),
                 'enemy': data.get('enemy_name', '?'), 'mode': data.get('mode', '?'),
                 'bge': data.get('bge'), 'extreme': extreme, 'flagged': flagged,
                 'total_turns': len(turns),
             })
+
+        # Scan finished -> wipe the old suspicious/ folder so it only holds the current result
+        if os.path.isdir(out_dir):
+            try:
+                _shutil.rmtree(out_dir)
+            except Exception as ex:
+                print(f"  ⚠ Could not clear {out_dir}: {ex}")
 
         if not hits:
             print(f"\n  ✓ No suspicious battles found")
@@ -6933,7 +7083,7 @@ $(document).ready(function(){
             print(f"  {'─'*66}")
             print(f"  📄 {h['account']}/{h['file']}")
             print(f"     {label}")
-            print(f"     Mode: {h['mode']}  |  Enemy: {h['enemy']}{bge_str}")
+            print(f"     Mode: {h['mode']}  |  Enemy: {h['enemy']}{bge_str}  |  Script: {h['ver']}")
             print(f"     {ext_name} win%: {h['extreme']:.1f}%  |  Turns total: {h['total_turns']}")
             for (turn, pct, card) in h['flagged']:
                 card_str = f"  -> played: {card}" if card else ""
@@ -6951,9 +7101,46 @@ $(document).ready(function(){
             except Exception as ex:
                 print(f"  ⚠ Could not copy {h['file']}: {ex}")
         print(f"\n{'='*70}")
-        print(f"  TOTAL: {len(hits)} suspicious battle(s) out of {len(files)} logs")
+        print(f"  TOTAL: {len(hits)} suspicious battle(s) out of {len(files)} logs  –  affects {100.0 * len(hits) / len(files):.2f}% of all logs")
         print(f"{'='*70}")
         print(f"\n  📁 {copied} file(s) copied to: {out_dir}")
+
+        # ── Compact summary file (one line per hit) – can be uploaded for targeted questions ──
+        try:
+            from collections import Counter as _Counter
+            sum_path = os.path.join(out_dir, '_suspicious_summary.txt')
+            lines = [
+                f"SUSPICIOUS COMBAT LOGS  ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                f"LOSS with TUO win% >= {loss_min:g}%  |  WIN with TUO win% <= {win_max:g}%",
+                f"(only if >= {self.SUSPICIOUS_MIN_STREAK} turns in a row, or in turn {self.SUSPICIOUS_LAST_TURN})",
+                f"TOTAL: {len(hits)} suspicious battle(s) out of {len(files)} logs  ({n_loss} loss, {n_win} win)  –  affects {100.0 * len(hits) / len(files):.2f}% of all logs",
+                "",
+                "BY ACCOUNT:",
+            ]
+            for acc, n in _Counter(h['account'] for h in hits).most_common():
+                lines.append(f"  {n:>4}  {acc}")
+            lines += ["", "BY ENEMY:"]
+            for en, n in _Counter(h['enemy'] for h in hits).most_common():
+                lines.append(f"  {n:>4}  {en}")
+            lines += ["", "BATTLES  (result | account | mode | enemy | BGE | extreme win% | flagged turns | file):"]
+            for h in sorted(hits, key=lambda x: (x['result'], x['account'], x['file'])):
+                ft = ", ".join(f"T{t}:{p:.1f}%" + (f"({c})" if c else "") for (t, p, c) in h['flagged'])
+                lines.append(
+                    f"{h['result']} | {h['account']} | {h['mode']} | {h['enemy']} | "
+                    f"{h['bge'] or '-'} | {'max' if h['result']=='LOSS' else 'min'} {h['extreme']:.1f}% | "
+                    f"{ft} | {h['file']}")
+                lines.append(f"    guild: {h['guild']}   script version: {h['ver']}")
+                lines.append(f"    expected deck (sim input): {h['exp_deck'] or '-'}")
+                lines.append(f"    actual cards played:       {h['act_deck'] or '-'}")
+                _d = h.get('dk') or {}
+                lines.append("    enemy deck known: " + (f"{_d.get('known')}/{_d.get('of')} cards (INCOMPLETE - forecast optimistic)" if _d else "complete / unknown"))
+                lines.append("    => " + (f"KNOWN-DECK MISMATCH (not in / more than in expected deck): {', '.join(h['mismatch'])}"
+                                          if h['mismatch'] else "deck matches (suspect sim)"))
+            with open(sum_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(lines) + "\n")
+            print(f"  📝 Summary: {sum_path}")
+        except Exception as ex:
+            print(f"  ⚠ Could not write summary: {ex}")
 
     def scan_combat_logs_for_unknown_flags(self):
         """
@@ -7037,7 +7224,7 @@ $(document).ready(function(){
                                         unknown[flag]['files'].append(fname)
             except Exception as e:
                 errors += 1
-                print(f"  ⚠ Fehler in {os.path.basename(fpath)}: {e}")
+                print(f"  ⚠ Error in {os.path.basename(fpath)}: {e}")
 
         print(f"  Scanned : {total_scanned} files  |  Errors: {errors}")
         print(f"{'='*60}")
@@ -9802,12 +9989,17 @@ $(document).ready(function(){
                 # cache (shared across sessions / parallel instances).
                 if not hasattr(self, '_guild_member_name_cache'):
                     self._guild_member_name_cache = {}
+                if not hasattr(self, '_guild_roster_fresh'):
+                    self._guild_roster_fresh = set()
                 cache_key = guild_name.lower()
                 if cache_key not in self._guild_member_name_cache:
                     disk_map = _load_member_cache(guild_name)
                     if disk_map is not None:
                         self._guild_member_name_cache[cache_key] = disk_map
                     else:
+                        print(f"  ⏳ Building roster cache for guild {guild_name} "
+                              f"({len(members)} members, once per run)...", flush=True)
+                        _tr0 = time.time()
                         name_map = {}
                         for member_id in members:
                             try:
@@ -9820,13 +10012,21 @@ $(document).ready(function(){
                                 continue
                         self._guild_member_name_cache[cache_key] = name_map
                         _save_member_cache(guild_name, name_map)
+                        self._guild_roster_fresh.add(cache_key)
+                        print(f"  ✓ Roster cache ready ({time.time() - _tr0:.0f} s)", flush=True)
 
                 user_id = self._guild_member_name_cache[cache_key].get(name.lower())
-                if user_id is None:
+                # A name missing from the roster triggers one refresh per guild and run
+                # (member may have joined after the cache was built); never repeat it.
+                if user_id is None and cache_key not in self._guild_roster_fresh:
                     # Cache may be stale (member joined after last build).
                     # Re-initialize the proxy to get a fresh faction.members list,
                     # rebuild the name map once, then retry.
                     try:
+                        print(f"  ⏳ '{name}' not in cached roster of {guild_name} - refreshing roster "
+                              f"(once per run)...", flush=True)
+                        _tr1 = time.time()
+                        self._guild_roster_fresh.add(cache_key)
                         commander.initialize(verbose=False)
                         fresh_faction  = commander.init_data.get('faction') or {}
                         fresh_members  = fresh_faction.get('members', [])
@@ -9844,6 +10044,7 @@ $(document).ready(function(){
                         self._guild_member_name_cache[cache_key] = fresh_name_map
                         _save_member_cache(guild_name, fresh_name_map)
                         user_id = fresh_name_map.get(name.lower())
+                        print(f"  ✓ Roster refreshed ({time.time() - _tr1:.0f} s)", flush=True)
                     except Exception:
                         pass
                 if user_id is None:
@@ -9890,10 +10091,36 @@ $(document).ready(function(){
                 return None, f"exception: {e}"
 
 
+        # Proxy sessions are kept for the whole run (login + initialize costs ~15-20 s each time)
+        if not hasattr(self, '_proxy_cmd_cache'):
+            self._proxy_cmd_cache = {}
+        _proxy_cache = self._proxy_cmd_cache
+
+        def _get_proxy(sf):
+            """(commander_or_None, reused) - cached TyrantCommander per settings file."""
+            if sf in _proxy_cache:
+                return _proxy_cache[sf], True
+            _nick = os.path.basename(sf).replace('settings_', '').replace('.json', '')
+            print(f"  ⏳ Proxy login {_nick} (once per run, takes ~15-20 s)...", flush=True)
+            _t0 = time.time()
+            t = TyrantCommander(sf)
+            if t.initialize(verbose=False):
+                _proxy_cache[sf] = t
+                print(f"  ✓ Proxy {_nick} ready ({time.time() - _t0:.0f} s)", flush=True)
+                return t, False
+            return None, False
+
         # ── Attempt 1: direct lookup with current account ────────────────
-        deck_str, _reason1 = _deck_from_profile(self, enemy_name)
-        if deck_str:
-            return deck_str, "direct"
+        # Only worth trying when the target can be in our own guild: the roster of a
+        # different guild never contains the name, and the miss triggered a ~25 s roster
+        # refresh of our own guild before the proxy lookup was even started.
+        _own_guild = ((self.init_data.get('faction') or {}).get('name') or '').lower()
+        if enemy_guild and _own_guild and enemy_guild.lower() != _own_guild:
+            _reason1 = "target is in another guild"
+        else:
+            deck_str, _reason1 = _deck_from_profile(self, enemy_name)
+            if deck_str:
+                return deck_str, "direct"
 
         # ── Resolve guild name ────────────────────────────────────────────
         if not enemy_guild:
@@ -9907,9 +10134,15 @@ $(document).ready(function(){
         if proxy_sf:
             proxy_nick = os.path.basename(proxy_sf).replace('settings_','').replace('.json','')
             try:
-                tmp = TyrantCommander(proxy_sf)
-                if tmp.initialize(verbose=False):
+                tmp, _reused = _get_proxy(proxy_sf)
+                if tmp is not None:
                     deck_str, _reason2 = _deck_from_profile(tmp, enemy_name)
+                    if not deck_str and _reused:
+                        # cached session may be stale -> re-init once and retry
+                        _proxy_cache.pop(proxy_sf, None)
+                        tmp, _ = _get_proxy(proxy_sf)
+                        if tmp is not None:
+                            deck_str, _reason2 = _deck_from_profile(tmp, enemy_name)
                     if deck_str:
                         return deck_str, f"Proxy {proxy_nick} [{enemy_guild}]"
                     return None, f"Proxy {proxy_nick} [{enemy_guild}] – {_reason2}"
@@ -9939,9 +10172,14 @@ $(document).ready(function(){
         if proxy_sf:
             proxy_nick = os.path.basename(proxy_sf).replace('settings_','').replace('.json','')
             try:
-                tmp = TyrantCommander(proxy_sf)
-                if tmp.initialize(verbose=False):
+                tmp, _reused = _get_proxy(proxy_sf)
+                if tmp is not None:
                     deck_str, _reason3 = _deck_from_profile(tmp, enemy_name)
+                    if not deck_str and _reused:
+                        _proxy_cache.pop(proxy_sf, None)
+                        tmp, _ = _get_proxy(proxy_sf)
+                        if tmp is not None:
+                            deck_str, _reason3 = _deck_from_profile(tmp, enemy_name)
                     if deck_str:
                         return deck_str, f"Proxy {proxy_nick} [{enemy_guild}] (JSON-scan)"
                     return None, f"Proxy {proxy_nick} [{enemy_guild}] – {_reason3}"
@@ -10187,6 +10425,24 @@ $(document).ready(function(){
             return None, None, str(e)
 
 
+    @staticmethod
+    def _complete_enemy_deck(deck_str, played):
+        """Append enemy cards seen in play that are missing from (or exceed) the cached deck string."""
+        import re as _re
+        from collections import Counter
+        parts = [p.strip() for p in deck_str.split(',') if p.strip()]
+        if len(parts) < 3 or not played:
+            return deck_str
+        base = lambda n: _re.sub(r'-\d+$', '', n.strip())
+        start = 2 if parts[1].startswith('Alpha ') else 1
+        have = Counter(base(p) for p in parts[start:])
+        lvls = Counter(m.group(1) for p in parts[start:] for m in [_re.search(r'-(\d+)$', p)] if m)
+        suf = ('-' + lvls.most_common(1)[0][0]) if lvls else ''
+        add = []
+        for n, c in Counter(base(x) for x in played).items():
+            add += [n + suf] * max(0, c - have.get(n, 0))
+        return ', '.join(parts + add) if add else deck_str
+
     def _run_tuo_reorder(self, my_deck, enemy_deck, hand_cards,
                          bge_name=None, reorder_n=1000, played_cards=None, force_ordered=False,
                          surge=False, enemy_played_cards=None,
@@ -10267,7 +10523,72 @@ $(document).ready(function(){
         cmd += ['-t', str(self.tuo_threads),
                 'reorder', str(reorder_n),
                 'hand', hand_str]
-        if enemy_played_cards:
+        # Live position: TUO builds the real battlefield (field / enemy:field + states) and drops the
+        # already played cards from the draw pile (played / enemy:played) instead of starting a fresh game.
+        # Needs a tuo.exe built from the patched sim.cpp; an older tuo.exe answers "Unknown option"
+        # and we fall back to the old behaviour (see below).
+        _ep_all = getattr(self, '_tuo_enemy_played_all', None)
+        self._tuo_enemy_played_all = None          # read-and-clear: valid for this call only
+        # Cached arena decks can be incomplete: add enemy cards that were seen in play but are missing
+        # from the deck string, otherwise TUO gets an impossible state (win% 0 / wrong jumps).
+        self._last_deck_added = []
+        # How much of the enemy deck is known (deck cards only, without commander and dominion)
+        self._last_deck_known = None
+        try:
+            if enemy_deck:
+                _pk = [x.strip() for x in enemy_deck.split(',') if x.strip()]
+                _st = 2 if (len(_pk) > 1 and ('Alpha ' in _pk[1] or 'Nexus' in _pk[1])) else 1
+                _kn = max(0, len(_pk) - _st)
+                _of = getattr(self, '_enemy_eds', 0) or 10
+                if _kn < _of:
+                    self._last_deck_known = {'known': _kn, 'of': _of}
+                    if getattr(self, '_last_deck_known_shown', None) != _kn:
+                        print(f"  ⚠ Enemy deck only {_kn}/{_of} known – forecast from about round {_kn + 1} on is rather optimistic "
+                              f"(the enemy runs out of cards in the sim)", flush=True)
+                    self._last_deck_known_shown = _kn
+                else:
+                    self._last_deck_known_shown = None
+        except Exception:
+            pass
+        if _ep_all and enemy_deck:
+            try:
+                _ed2 = self._complete_enemy_deck(enemy_deck, _ep_all)
+                if _ed2 != enemy_deck:
+                    _n_old = len(enemy_deck.split(','))
+                    self._last_deck_added = [x.strip() for x in _ed2.split(',')[_n_old:]]
+                    enemy_deck = _ed2
+                    cmd[2] = _ed2
+                    if self._last_deck_added != getattr(self, '_last_deck_added_shown', None):
+                        print(f"  ⚠ Enemy deck completed (card seen in play, not in the known deck): "
+                              f"+{', +'.join(self._last_deck_added)}", flush=True)
+                    self._last_deck_added_shown = list(self._last_deck_added)
+            except Exception:
+                pass
+        _live_used = bool(getattr(self, '_tuo_live_ok', True) and (hand_states or enemy_hand_states))
+        if _live_used:
+            def _base_nm(n):
+                return _re.sub(r'-\d+$', '', n.strip())
+
+            def _field_names(states, deck_str):
+                parts = [p.strip() for p in deck_str.split(',')]
+                names = [n for n, _f in (states if isinstance(states, list) else list(states.items()))]
+                if parts and _base_nm(parts[0]) in names:
+                    names.remove(_base_nm(parts[0]))        # commander
+                if len(parts) > 1 and parts[1].startswith('Alpha ') and _base_nm(parts[1]) in names:
+                    names.remove(_base_nm(parts[1]))        # dominion
+                return names
+            if played_cards:
+                cmd += ['played', ", ".join(played_cards)]
+            _ep = _ep_all if _ep_all else enemy_played_cards
+            if _ep:
+                cmd += ['enemy:played', ", ".join(_ep)]
+            _own_field = _field_names(hand_states, my_deck) if hand_states else []
+            _en_field = _field_names(enemy_hand_states, enemy_deck) if enemy_hand_states else []
+            if _own_field:
+                cmd += ['field', ", ".join(_own_field)]
+            if _en_field:
+                cmd += ['enemy:field', ", ".join(_en_field)]
+        elif enemy_played_cards:
             enemy_hand_str = ", ".join(enemy_played_cards)
             cmd += ['enemy:hand', enemy_hand_str]
 
@@ -10282,7 +10603,8 @@ $(document).ready(function(){
                 cmd += ['enemy:hand-state', ehs_str]
 
         # Print full TUO command for debugging
-        _cmd_str = ' '.join(repr(c) if ' ' in c or ',' in c else c for c in cmd)
+        # double quotes only: cmd.exe does not understand single quotes (copy&paste into tuo.exe)
+        _cmd_str = ' '.join(('"' + c + '"') if ' ' in c or ',' in c else c for c in cmd)
         print(f"  [TUO] {_cmd_str}")
         self._last_tuo_cmd = _cmd_str
 
@@ -10294,6 +10616,18 @@ $(document).ready(function(){
                 timeout=120,
             )
             output = proc.stdout + proc.stderr
+            if _live_used and 'Unknown option' in output:
+                # tuo.exe is older than the patched sim.cpp -> use the old method from now on
+                self._tuo_live_ok = False
+                print("  ⚠ tuo.exe does not know played/field (rebuild it from the patched sources). "
+                      "Falling back to the old simulation (fresh game from turn 1).")
+                return self._run_tuo_reorder(my_deck, enemy_deck, hand_cards,
+                                             bge_name=bge_name, reorder_n=reorder_n,
+                                             played_cards=played_cards, force_ordered=force_ordered,
+                                             surge=surge, enemy_played_cards=enemy_played_cards,
+                                             yfort=yfort, efort=efort, eeffect=eeffect, mode=mode,
+                                             global_effect=global_effect, yeffect=yeffect,
+                                             hand_states=hand_states, enemy_hand_states=enemy_hand_states)
             for line in proc.stdout.splitlines()[:15]:
                 pass
             if proc.stderr.strip():
@@ -10342,7 +10676,9 @@ $(document).ready(function(){
             # Walk opt_cards (skip index 0=commander, 1=dominion if present)
             # find first card whose base name is in hand
             recommended = None
-            for card in opt_cards[1:]:  # skip commander
+            # Skip the frozen prefix (commander, dominion, already played cards): a played copy
+            # of a card that is also in hand must not be taken for the recommendation.
+            for card in opt_cards[max(1, freeze_n):]:
                 base = _re.sub(r'\s*#\d+$', '', card).strip()  # strip #2 suffix
                 if base in hand_set:
                     recommended = hand_set[base]
@@ -10470,7 +10806,211 @@ $(document).ready(function(){
                 cid = tok.get('card_id')
                 if uid is not None and cid is not None:
                     token_map[str(uid)] = str(cid)
+        try:
+            self._track_summons(battle_data)
+        except Exception:
+            pass
+        try:
+            self._track_appearance(battle_data)
+        except Exception:
+            pass
+        try:
+            self._track_commander_damage(battle_data)
+        except Exception:
+            pass
         return token_map
+
+    def _track_appearance(self, battle_data):
+        """
+        Remember in which order cards (hand cards and summoned tokens) appeared on the field.
+        The real board order is the order of appearance (a played card or a token is added to the
+        right; dead cards disappear). It is NOT the UID order: own hand UIDs are deck slots and
+        tokens (UID 52+/152+) get high UIDs although they stand between earlier and later cards.
+        Order matters for Fortify, Mend, Avenge, Revenge, Swipe, Hunt (see skill guide).
+        Source: the turn events (battle_data['turn'][N]['plays'] / ['tokens'] / summon actions),
+        because playCard responses carry no 'field' block. Inside one turn:
+          1. tokens summoned by a card that became active at the turn start (summoner is neither the
+             played card nor a card killed this turn)
+          2. the played card
+          3. tokens summoned by the played card (On Play), by a card that died (summon on death)
+             or by unknown sources
+        A UID that shows up again in a later turn (UID reuse) gets a new position.
+        """
+        bid = battle_data.get('battle_id')
+        if getattr(self, '_appear_bid', None) != bid:
+            self._appear_bid = bid
+            self._appear_seq = {}
+            self._appear_turn = {}
+            self._appear_n = 0
+        turns = battle_data.get('turn') or {}
+        keys = sorted(int(k) for k in turns.keys() if str(k).lstrip('-').isdigit())
+
+        def _uid_key(u):
+            return (0, int(u)) if str(u).lstrip('-').isdigit() else (1, 0)
+
+        for k in keys:
+            tv = turns.get(str(k))
+            if not isinstance(tv, dict):
+                continue
+            plays = [str(p.get('card_uid')) for p in (tv.get('plays') or [])
+                     if isinstance(p, dict) and p.get('card_uid') is not None]
+            toks = [str(t.get('card_uid')) for t in (tv.get('tokens') or [])
+                    if isinstance(t, dict) and t.get('card_uid') is not None]
+            src = {}
+            for a in (tv.get('actions') or []):
+                if isinstance(a, dict) and a.get('skill_id') == 'summon':
+                    for t in (a.get('targets') or []):
+                        src[str(t)] = str(a.get('card_uid'))
+            killed_now = {str(x) for key in ('attack_kill', 'defend_kill')
+                          for x in (tv.get(key) or [])}
+            # a token whose summoner died this turn (summon on death) appears after the play
+            before = [u for u in toks if src.get(u) is not None
+                      and src[u] not in plays and src[u] not in killed_now]
+            after = [u for u in toks if u not in before]
+            order = sorted(before, key=_uid_key) + plays + sorted(after, key=_uid_key)
+            for u in order:
+                prev = self._appear_turn.get(u)
+                if prev is None or prev < k:
+                    self._appear_n += 1
+                    self._appear_seq[u] = self._appear_n
+                    self._appear_turn[u] = k
+
+    def _order_by_appearance(self, uid_range):
+        """Commander/dominion first, then the UIDs in order of appearance on the field
+        (UIDs never seen - e.g. when the tool starts in the middle of a battle - appeared earlier
+        and keep their original UID order at the front)."""
+        seq = getattr(self, '_appear_seq', None) or {}
+        uids = list(uid_range)
+        head = [u for u in uids if u in (50, 51, 150, 151)]
+        rest = [u for u in uids if u not in head]
+        idx = {u: i for i, u in enumerate(rest)}
+        rest.sort(key=lambda u: (seq.get(str(u), 0), idx[u]))
+        return head + rest
+
+    def _track_commander_damage(self, battle_data):
+        """
+        Commander HP is never reported by the API, but every hit on a commander is an action
+        with targets [-1] (attacker's commander, UID 50) or [-2] (defender's commander, UID 150);
+        'value' is the damage. Sum it up per battle. Turns are stored per turn number, so a turn
+        that is sent again does not count twice.
+        """
+        bid = battle_data.get('battle_id')
+        if getattr(self, '_cmd_bid', None) != bid:
+            self._cmd_bid = bid
+            self._cmd_turn_dmg = {}
+        for k, tv in (battle_data.get('turn') or {}).items():
+            if not (isinstance(tv, dict) and 'actions' in tv and str(k).lstrip('-').isdigit()):
+                continue
+            d = {'-1': 0, '-2': 0}
+            for a in (tv.get('actions') or []):
+                if not isinstance(a, dict):
+                    continue
+                for t in (a.get('targets') or []):
+                    if str(t) in d:
+                        try:
+                            d[str(t)] += int(a.get('value') or 0)
+                        except (TypeError, ValueError):
+                            pass
+            self._cmd_turn_dmg[int(k)] = d
+
+    def _commander_damage(self, uid_i):
+        """Total damage a commander has taken (UID 50 = attacker, 150 = defender)."""
+        key = '-1' if uid_i == 50 else '-2'
+        try:
+            return sum(v.get(key, 0) for v in (getattr(self, '_cmd_turn_dmg', None) or {}).values())
+        except Exception:
+            return 0
+
+    def _track_summons(self, battle_data):
+        """
+        Remember (cumulatively, per battle) in which turn every summoned unit appeared,
+        which side owns it and which card summoned it. The API reports no remaining delay,
+        so TUO needs this to compute it (see _summon_hint_flags).
+        """
+        bid = battle_data.get('battle_id')
+        if getattr(self, '_tok_bid', None) != bid:
+            self._tok_bid = bid
+            self._tok_info = {}
+            self._play_info = {}
+        turns = battle_data.get('turn') or {}
+        keys = sorted(int(k) for k in turns.keys() if str(k).lstrip('-').isdigit())
+        if keys:
+            self._tok_cur = keys[-1]
+        for k in keys:
+            tv = turns.get(str(k))
+            if not isinstance(tv, dict):
+                continue
+            # cards played by the owner (not tokens): remember the turn so a live unit's age is exact
+            # even when earlier copies of the same card have died (the played list alone is ambiguous)
+            for _pl in (tv.get('plays') or []):
+                if isinstance(_pl, dict) and _pl.get('card_uid') is not None:
+                    self._play_info[str(_pl.get('card_uid'))] = k
+            toks = tv.get('tokens') or []
+            if not toks:
+                continue
+            src = {}
+            for a in (tv.get('actions') or []):
+                if isinstance(a, dict) and a.get('skill_id') == 'summon':
+                    for t in (a.get('targets') or []):
+                        src[str(t)] = str(a.get('card_uid'))
+            for tok in toks:
+                uid = tok.get('card_uid')
+                if uid is None:
+                    continue
+                self._tok_info[str(uid)] = (k, 1 if tok.get('is_attacker') else 0, src.get(str(uid)))
+
+    def _carry_stasis(self, uid, card_map, s):
+        """
+        The API reports a unit's Stasis only for the first turn after it was played/summoned;
+        later snapshots omit the key although the protection stays until the unit activates
+        (real fight vs Pryyf: units without the key still blocked 81/96 in the enemy round).
+        Remember the last value seen per unit (and card) and put it back into the flags;
+        the sim removes it itself when the unit activates. An explicit stasis 0 clears it.
+        """
+        try:
+            bid = getattr(self, '_appear_bid', None)
+            if getattr(self, '_stasis_bid', None) != bid or not hasattr(self, '_stasis_seen'):
+                self._stasis_bid = bid
+                self._stasis_seen = {}
+            key = str(uid)
+            cid = str(card_map.get(key))
+            if 'stasis' in s:
+                if s['stasis']:
+                    self._stasis_seen[key] = (cid, s['stasis'])
+                else:
+                    self._stasis_seen.pop(key, None)
+            else:
+                old = self._stasis_seen.get(key)
+                if old and old[0] == cid:
+                    s['stasis'] = old[1]
+        except Exception:
+            pass
+
+    def _summon_hint_flags(self, uid, card_map):
+        """
+        Extra hand-state flags for a summoned unit so TUO can derive its remaining delay:
+          summon_turns = owner turn starts since the summon + 1 (always >= 1)
+          summon_src   = card_id of the summoning card (TUO applies its tower rule)
+        Returns {} for units that were not summoned.
+        """
+        info = (getattr(self, '_tok_info', None) or {}).get(str(uid))
+        cur = getattr(self, '_tok_cur', None)
+        if not info and cur is not None:
+            # a card the owner played itself: played_turns = owner turn starts since the play + 1
+            pt = (getattr(self, '_play_info', None) or {}).get(str(uid))
+            if pt is not None:
+                parity = 1 if pt % 2 == 1 else 0     # attacker plays in odd turns, defender in even turns
+                return {'played_turns': sum(1 for k in range(pt + 1, cur + 1) if k % 2 == parity) + 1}
+        if not info or cur is None:
+            return {}
+        t, att, src = info
+        parity = 1 if att else 0
+        age = sum(1 for k in range(t + 1, cur + 1) if k % 2 == parity)
+        out = {'summon_turns': age + 1}
+        sid = card_map.get(src) if src is not None else None
+        if sid is not None and str(sid).isdigit():
+            out['summon_src'] = int(sid)
+        return out
 
     def _update_field_state(self, card_states, battle_data):
         """
@@ -10489,8 +11029,18 @@ $(document).ready(function(){
             tv = turn[tk]
             if not isinstance(tv, dict):
                 continue
-            for section in ('begin', 'end'):
-                for item in tv.get(section, []):
+            for item in tv.get('begin', []):
+                uid  = str(item.get('card_uid', ''))
+                flag = item.get('status_flag')
+                val  = item.get('value')
+                if uid and flag is not None and val is not None:
+                    this_turn.setdefault(uid, {})[flag] = val
+            # Upkeep phase (Barrier, Absorb, Stasis, Enhance, ...) is listed like actions. Without it e.g. a
+            # Barrier cast at the start of the enemy turn never reaches the live state (protect stays 0).
+            for action in tv.get('upkeep', []):
+                if not isinstance(action, dict):
+                    continue
+                for item in (action.get('status', []) if 'status' in action else [action]):
                     uid  = str(item.get('card_uid', ''))
                     flag = item.get('status_flag')
                     val  = item.get('value')
@@ -10503,6 +11053,15 @@ $(document).ready(function(){
                     val  = item.get('value')
                     if uid and flag is not None and val is not None:
                         this_turn.setdefault(uid, {})[flag] = val
+            # The 'end' events (Rally, Enrage, Enfeeble, ... wearing off) come last. They used to be
+            # applied before the actions of the same turn, so every effect cast in that turn stayed
+            # in the state although the server had already ended it.
+            for item in tv.get('end', []):
+                uid  = str(item.get('card_uid', ''))
+                flag = item.get('status_flag')
+                val  = item.get('value')
+                if uid and flag is not None and val is not None:
+                    this_turn.setdefault(uid, {})[flag] = val
         # Replace state for cards mentioned this turn; keep others unchanged
         # Permanent values (current HP, permanent max-HP/avenge buffs) are only reported
         # when they change. They never expire, so carry them over from the previous state
@@ -10557,6 +11116,37 @@ $(document).ready(function(){
                         card_states[str(int(uid))] = {'h': 0}
                     except (ValueError, TypeError):
                         pass
+        # Berserk raises the attack permanently, but the API reports no such status: only the single
+        # activations are listed (action skill_id 'berserk', value = attack gained). Sum them per card;
+        # events up to the card's death are ignored (UIDs of summoned units can be reused).
+        try:
+            _bid2 = battle_data.get('battle_id')
+            _ba = getattr(self, '_berserk_acc', None)
+            if not _ba or _ba.get('bid') != _bid2:
+                _ba = self._berserk_acc = {'bid': _bid2, 'ev': {}, 'kill': {}}
+            for tk, tv in turn.items():
+                if not isinstance(tv, dict):
+                    continue
+                try:
+                    _tki = int(tk)
+                except (ValueError, TypeError):
+                    continue
+                for ai, action in enumerate(tv.get('actions', [])):
+                    if str(action.get('skill_id')) == 'berserk':
+                        _ba['ev'][(_tki, ai)] = (str(action.get('card_uid')), int(action.get('value', 0) or 0))
+                for kill_key in ('attack_kill', 'defend_kill'):
+                    for uid in tv.get(kill_key, []):
+                        _ku = str(int(uid))
+                        _ba['kill'][_ku] = max(_ba['kill'].get(_ku, -1), _tki)
+            _bsum = {}
+            for (_tki, _ai), (_bu, _bv) in _ba['ev'].items():
+                if _tki > _ba['kill'].get(_bu, -1):
+                    _bsum[_bu] = _bsum.get(_bu, 0) + _bv
+            for _bu, _bt in _bsum.items():
+                if _bt > 0 and _bu not in ('-1', '-2'):
+                    card_states.setdefault(_bu, {})['berserk_attack'] = _bt
+        except Exception:
+            pass
 
     def _build_hand_state_str(self, card_states_for_hand):
         """
@@ -10571,13 +11161,17 @@ $(document).ready(function(){
         SKIP_FLAGS = {'poisoner', 'h', 'mimic_skill', 'corroder'}  # mimic_skill handled separately below
         INT_FLAGS  = {
             # Core HP/ATK modifiers
-            'h', 'perm_max_health', 'attack_boost', 'avenge_attack',
+            'h', 'perm_max_health', 'attack_boost', 'avenge_attack', 'berserk_attack',
             # Status effects
             'protect', 'absorb', 'enfeeble', 'inhibited', 'stasis', 'poison',
             'disease', 'corrosive', 'corrosion',
             'subdue', 'sabotage', 'mark',
             # Countdown timers
             'jam_countdown', 'flurry_countdown', 'add_skill_counter',
+            # Summoned units: TUO derives the remaining delay from these
+            'summon_turns', 'summon_src', 'played_turns',
+            # Commander: total damage taken (TUO lowers the commander HP by it)
+            'cmd_damage',
             # Skill interactions
             'add_skill_berserk', 'entrap', 'tribute',
             # Enhance values (all sim.cpp-supported enhance_* flags)
@@ -10590,7 +11184,7 @@ $(document).ready(function(){
             'enhance_stasis', 'enhance_swipe', 'enhance_tribute', 'enhance_venom',
             'enhance_refresh',
         }
-        BOOL_FLAGS = {'jammed', 'overloaded', 'sunder', 'enrage'}
+        BOOL_FLAGS = {'jammed', 'overloaded', 'sunder', 'enrage', 'dead'}
 
         # Normalise input to list of (name, flags)
         if isinstance(card_states_for_hand, list):
@@ -10625,6 +11219,11 @@ $(document).ready(function(){
                 except (TypeError, ValueError):
                     continue
                 if ival == 0:
+                    continue
+                if flag == 'attack_boost' and ival > 0:
+                    # A positive attack_boost is a Rally that expires at the end of the turn it
+                    # was cast in; none is active when a turn starts. Only the negative
+                    # (Weaken) value is permanent.
                     continue
                 if flag in BOOL_FLAGS:
                     if ival:
@@ -10691,6 +11290,55 @@ $(document).ready(function(){
 
 
 
+    def _cl_turn_extra(self, bd_after, own_uids, enemy_uids, own_states, enemy_states):
+        """
+        Extra per-turn data for the combat log, so that the real field state can be compared with
+        the simulator afterwards:
+          board              both sides in board order (left to right): uid, name, hp, all flags
+          commander_damage   damage taken so far by commander UID 50 / 150 (before and after this turn)
+          events_after       the raw events the server returned for this turn (our play and the
+                             opponent's reply), each turn number only once per battle
+        """
+        out = {}
+        try:
+            def _side(uids, states):
+                res = []
+                for i, (nm, fl) in enumerate(states or []):
+                    u = uids[i] if uids and i < len(uids) else None
+                    res.append({'pos': i, 'uid': u, 'name': nm,
+                                'hp': (fl or {}).get('h'), 'flags': dict(fl or {})})
+                return res
+            out['board'] = {'own': _side(own_uids, own_states), 'enemy': _side(enemy_uids, enemy_states)}
+            before = {'50': self._commander_damage(50), '150': self._commander_damage(150)}
+            if bd_after:
+                try:
+                    self._track_commander_damage(bd_after)
+                except Exception:
+                    pass
+            after = {'50': self._commander_damage(50), '150': self._commander_damage(150)}
+            out['commander_damage'] = {'before': before, 'after': after}
+            if bd_after:
+                bid = bd_after.get('battle_id')
+                if getattr(self, '_cl_ev_bid', None) != bid:
+                    self._cl_ev_bid = bid
+                    self._cl_ev_seen = set()
+                ev = {}
+                for k, tv in (bd_after.get('turn') or {}).items():
+                    if isinstance(tv, dict) and tv and k not in self._cl_ev_seen:
+                        ev[k] = tv
+                        if 'actions' in tv:
+                            self._cl_ev_seen.add(k)
+                out['events_after'] = ev
+        except Exception as e:
+            out['extra_error'] = str(e)
+        _dk = getattr(self, '_last_deck_known', None)
+        if _dk:
+            out['enemy_deck_known'] = dict(_dk)   # enemy deck only partly known: {'known': n, 'of': 10}
+        _da = getattr(self, '_last_deck_added', None)
+        if _da:
+            out['enemy_deck_added'] = list(_da)   # enemy cards the sim had to add (seen in play, not in the known deck)
+        return out
+
     def _write_combat_log(self, log_data, account_name=''):
         """
         Write a combat log JSON to combatlog/<account>/
@@ -10709,11 +11357,112 @@ $(document).ready(function(){
         fname   = f"{ts}_{result}_vs_{enemy}.json"
         fpath   = os.path.join(log_dir, fname)
 
+        # The readable report lives inside the JSON (key 'report', one line per list entry) - no separate .txt file.
+        try:
+            log_data['report'] = self._write_combat_report(log_data, None)
+        except Exception:
+            pass   # non-fatal
         try:
             with open(fpath, 'w', encoding='utf-8') as f:
                 _json.dump(log_data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             pass   # non-fatal
+
+    def _write_combat_report(self, log_data, txt_path):
+        """Readable version of a combat log (same name, .txt): per turn the boards in order,
+        commander damage and what happened after the decision. Meant to be set against the simulator."""
+        L = []
+        L.append(f"Combat log: {log_data.get('account', '?')} vs {log_data.get('enemy_name', '?')}  "
+                 f"[{log_data.get('result', '?')}]  mode={log_data.get('mode', '?')}  bge={log_data.get('bge', '')}")
+        L.append(f"Script version: {log_data.get('script_version', 'unknown (older than version numbering)')}")
+        _tb = log_data.get('tuo_build')
+        if _tb:
+            L.append("TUO build: " + (f"{_tb.get('mtime')}  {_tb.get('size')} bytes  sha {_tb.get('sha12')}  "
+                                      f"live_position={_tb.get('live_position')}  stasis_fix={_tb.get('stasis_fix')}"
+                                      if _tb.get('found') else "tuo.exe not found"))
+        L.append(f"My deck:    {log_data.get('my_deck', '')}")
+        L.append(f"Enemy deck: {log_data.get('enemy_deck', '')}")
+        L.append("")
+
+        def _fl(fl):
+            keep = []
+            for k, v in (fl or {}).items():
+                if k in ('h',) or v in (0, None, False):
+                    continue
+                keep.append(f"{k}={v}")
+            return ' '.join(keep)
+
+        def _board(side):
+            if not side:
+                return ["   (empty)"]
+            out = []
+            for c in side:
+                hp = c.get('hp')
+                out.append(f"   {c.get('pos', 0) + 1:>2}. {c.get('name', '?')} [uid {c.get('uid')}]  "
+                           f"HP {hp if hp is not None else '-'}  {_fl(c.get('flags'))}".rstrip())
+            return out
+
+        for t in log_data.get('turns', []):
+            names = dict(t.get('card_name_map') or {})
+            for sd in ((t.get('board') or {}).get('own', []), (t.get('board') or {}).get('enemy', [])):
+                for c in sd:
+                    if c.get('uid') is not None:
+                        names.setdefault(str(c['uid']), c.get('name'))
+            names['-1'] = 'Commander(UID 50)'
+            names['-2'] = 'Commander(UID 150)'
+
+            def _n(u):
+                return f"{names.get(str(u), '?')}#{u}"
+
+            L.append("=" * 78)
+            agreed = 'agreed' if t.get('tuo_agreed') else 'DIFFERENT'
+            L.append(f"Turn {t.get('turn')}:  sim win {t.get('tuo_win_pct')}%  recommended: {t.get('tuo_recommended')}  "
+                     f"played: {t.get('card_played')}  ({agreed})")
+            L.append(f"Hand: {', '.join(t.get('hand') or [])}")
+            if t.get('enemy_deck_known'):
+                L.append(f"Enemy deck only partly known: {t['enemy_deck_known'].get('known')}/{t['enemy_deck_known'].get('of')} deck cards (forecast gets optimistic once the sim enemy runs out of cards)")
+            if t.get('enemy_deck_added'):
+                L.append(f"Sim added enemy cards (seen in play, not in known deck): {', '.join(t['enemy_deck_added'])}")
+            cd = (t.get('commander_damage') or {})
+            if cd:
+                b, a = cd.get('before', {}), cd.get('after', {})
+                L.append(f"Commander damage taken (UID 50 / UID 150): before {b.get('50', 0)} / {b.get('150', 0)}"
+                         f"   after this turn {a.get('50', 0)} / {a.get('150', 0)}")
+            bd = t.get('board') or {}
+            L.append("Own board (left to right):")
+            L.extend(_board(bd.get('own')))
+            L.append("Enemy board (left to right):")
+            L.extend(_board(bd.get('enemy')))
+            ev = t.get('events_after') or {}
+            if ev:
+                L.append("What happened after the decision:")
+                for k in sorted(ev, key=lambda x: int(x) if str(x).lstrip('-').isdigit() else 0):
+                    tv = ev[k]
+                    if not isinstance(tv, dict):
+                        continue
+                    L.append(f"  -- game turn {k}")
+                    for p_ in tv.get('plays') or []:
+                        L.append(f"     plays {_n(p_.get('card_uid'))}")
+                    for a in tv.get('actions') or []:
+                        sk = a.get('skill_id')
+                        sk = 'attack' if sk in (0, '0', None) else sk
+                        tg = ', '.join(_n(x) for x in (a.get('targets') or []))
+                        blk = ''.join(f" [blocked by {b_.get('skill')} {b_.get('value')}]" for b_ in (a.get('block') or []))
+                        _tg = [str(x) for x in (a.get('targets') or [])]
+                        hp = ''.join(f" ->h={st.get('value')}" for st in (a.get('status') or [])
+                                     if st.get('status_flag') == 'h' and len(_tg) == 1
+                                     and str(st.get('card_uid')) == _tg[0])
+                        L.append(f"     {_n(a.get('card_uid'))} {sk} {a.get('value')} -> {tg}{blk}{hp}")
+                    for tk in tv.get('tokens') or []:
+                        L.append(f"     token appears: uid {tk.get('card_uid')} card {tk.get('card_id')}")
+                    for key in ('attack_kill', 'defend_kill'):
+                        if tv.get(key):
+                            L.append(f"     killed ({key}): {', '.join(_n(x) for x in tv[key])}")
+            L.append("")
+        if txt_path:
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(L) + '\n')
+        return L
 
     def _parse_enemy_played_cards(self, battle_data, card_data, brawl_mode=False):
         """
@@ -10751,6 +11500,23 @@ $(document).ready(function(){
                 cname = self._card_id_to_tuo_name(card_id, card_data)
                 names.append(cname)
                 included.append((uid_i, cname))
+        return names
+
+    def _parse_enemy_all_played_cards(self, battle_data, card_data, brawl_mode=False):
+        """
+        Returns ALL card names the enemy has played so far (dead or alive), ordered by UID.
+        Used for the TUO option `enemy:played`: played cards are no longer in the enemy's draw pile.
+        (_parse_enemy_played_cards only returns the cards that are still on the field.)
+        Brawl: enemy UIDs 1-10. Arena: enemy UIDs 101-110.
+        """
+        enemy_min, enemy_max = (1, 10) if brawl_mode else (101, 110)
+        card_map = battle_data.get('card_map', {})
+        names = []
+        for uid_i in sorted(int(k) for k in card_map.keys()
+                            if k.isdigit() and enemy_min <= int(k) <= enemy_max):
+            card_id = card_map.get(str(uid_i))
+            if card_id:
+                names.append(self._card_id_to_tuo_name(card_id, card_data))
         return names
 
     def _print_sim_bar(self, win, stall=0.0):
@@ -10938,6 +11704,7 @@ $(document).ready(function(){
                         self.api.call('setActiveDeck', deck_id=_prev_slot)
                     return
 
+            _auto_pre_win = None
             if sel == '':
                 # ── Auto-select priority logic ───────────────────────
 
@@ -10987,6 +11754,7 @@ $(document).ready(function(){
                 unknown_targets = [t for t in target_list if not t['gauntlet']]
 
                 target = None
+                _auto_pre_win = None   # pre-sim win % of chosen target (reused, skips 2nd sim)
                 # Focus unknown mode: attack first unknown deck if any exist
                 if focus_unknown and unknown_targets:
                     target = unknown_targets[0]
@@ -11004,6 +11772,7 @@ $(document).ready(function(){
                         for t in known_targets:
                             deck_str = t['gauntlet'][1]
                             print(f"  🎯 Pre-sim {t['name']} [{t['guild']}]...", end=' ', flush=True)
+                            _t0 = time.time()
                             win_pre, _, _ = self._run_tuo_sim(
                                 my_deck_pre, deck_str,
                                 bge_name=bge_pre or None,
@@ -11013,13 +11782,14 @@ $(document).ready(function(){
                             if win_pre is None:
                                 print("sim failed – skip", flush=True)
                                 continue
-                            print(f"{win_pre:.1f}%", end='')
+                            print(f"{win_pre:.1f}% ({time.time() - _t0:.1f} s)", end='')
                             if win_pre > _best_win:
                                 _best_win = win_pre
                                 _best_t   = t
                             if win_pre >= 30.0:
                                 print("  ✓", flush=True)
                                 target = t
+                                _auto_pre_win = win_pre
                                 break
                             else:
                                 print("  ✗ <30%", flush=True)
@@ -11083,6 +11853,7 @@ $(document).ready(function(){
                     # Priority 3: highest pre-sim win rate among known decks
                     if target is None and _best_t is not None:
                         target = _best_t
+                        _auto_pre_win = _best_win
                         print(f"  -> No pre-sim winner / no unknown targets – using best known: {target['name']} ({_best_win:.1f}%)")
 
                 if target is None:
@@ -11209,7 +11980,10 @@ $(document).ready(function(){
                 print(f"  Enemy:    {enemy_deck_str[:80]}{'...' if len(enemy_deck_str)>80 else ''}")
 
             # ── Pre-battle analysis ──────────────────────────────────
-            if enemy_deck_str:
+            if enemy_deck_str and _auto_pre_win is not None and not _live_deck:
+                print(f"\n  Pre-sim result reused: {_auto_pre_win:.1f}% (50000 runs)")
+                self._print_sim_bar(_auto_pre_win, 0.0)
+            elif enemy_deck_str:
                 print(f"\n⏳ Pre-battle analysis (10000 runs{', BGE: '+bge_name if bge_name else ''})...")
                 win, stall, raw = self._run_tuo_sim(
                     my_deck_str, enemy_deck_str,
@@ -11382,7 +12156,8 @@ $(document).ready(function(){
                         # (_field_hp / _card_map for THIS turn) is authoritative and takes
                         # precedence over the historical _killed set.
                         result = []
-                        for uid_i in uid_range:
+                        _uids = []
+                        for uid_i in self._order_by_appearance(uid_range):
                             if uid_i < 0:
                                 continue
                             uid = str(uid_i)
@@ -11390,21 +12165,34 @@ $(document).ready(function(){
                             if not cid:
                                 continue
                             abs_hp = _field_hp.get(uid)
+                            _is_dead = False
                             if abs_hp is not None:
                                 # Current field info is authoritative for this UID
                                 if abs_hp <= 0:
-                                    continue  # truly dead (field says 0 HP)
+                                    _is_dead = True  # truly dead (field says 0 HP)
                                 # alive per current field — include even if UID was
                                 # used by a different (now-dead) card earlier
                             else:
                                 # No current field info — fall back to history
                                 if uid_i in _killed:
-                                    continue
-                                s_check = _cl_card_states.get(uid, {})
-                                ev_h = s_check.get('h')
-                                if ev_h is not None and int(ev_h) <= 0:
-                                    continue
+                                    _is_dead = True
+                                else:
+                                    s_check = _cl_card_states.get(uid, {})
+                                    ev_h = s_check.get('h')
+                                    if ev_h is not None and int(ev_h) <= 0:
+                                        _is_dead = True
+                            if _is_dead:
+                                # A destroyed dominion must be reported explicitly: TUO places it at full HP at
+                                # start-up and cannot tell "destroyed" from "unchanged" by its absence.
+                                if uid_i in (51, 151):
+                                    _dn = self._card_id_to_tuo_name(cid, card_data)
+                                    if _dn:
+                                        result.append((_dn, {'dead': 1}))
+                                        _uids.append(uid_i)
+                                continue
                             s = dict(_cl_card_states.get(uid, {}))
+                            s.update(self._summon_hint_flags(uid, _card_map))
+                            self._carry_stasis(uid, _card_map, s)
                             # Commanders (50/150): API keeps their runtime states (e.g.
                             # jam_countdown) under internal UIDs -1/-2. Merge them, but keep
                             # the derived commander HP ('h') untouched.
@@ -11417,15 +12205,31 @@ $(document).ready(function(){
                                         s['h'] = _ch
                                     else:
                                         s.pop('h', None)
+                            if uid_i in (50, 150):
+                                _cd = self._commander_damage(uid_i)
+                                if _cd > 0:
+                                    s['cmd_damage'] = _cd
+                                    # The sim subtracts cmd_damage from the full commander HP itself;
+                                    # an 'h' (already the remaining HP) would be reduced a second time.
+                                    s.pop('h', None)
                             name = self._card_id_to_tuo_name(cid, card_data)
                             # Include even if s is empty (card on field with full HP, no effects)
                             if name and cid:
                                 result.append((name, s))
+                                _uids.append(uid_i)
+                        self._last_state_uids = _uids
                         return result
 
                     _own_states   = _states_for_range(_own_range)
+                    _cl_own_uids = list(getattr(self, '_last_state_uids', []))
                     _enemy_states = _states_for_range(_enemy_range)
+                    _cl_enemy_uids = list(getattr(self, '_last_state_uids', []))
 
+                    self._tuo_enemy_played_all = self._parse_enemy_all_played_cards(battle_data, card_data, brawl_mode=False)
+                    try:
+                        self._enemy_eds = int(battle_data.get('eds', 0) or 0)   # real enemy deck size from the API
+                    except (ValueError, TypeError):
+                        self._enemy_eds = 0
                     win_pct, recommended_card, raw_out = self._run_tuo_reorder(
                         my_deck_str, sim_deck, [_n for _n in hand_names if _n],
                         bge_name=bge_name or None,
@@ -11505,6 +12309,11 @@ $(document).ready(function(){
                         'tuo_agreed':      play_name == recommended_card,
                         'hand':            [cname for (_, _, cname) in hand_display],
                         'field':           _cl_field,
+                        'appear_seq':      dict(getattr(self, '_appear_seq', {}) or {}),
+                        **self._cl_turn_extra(_cl_bd_after if battle_result else None,
+                                              vars().get('_cl_own_uids'), vars().get('_cl_enemy_uids'),
+                                              vars().get('_own_states') or vars().get('_gw_own_states'),
+                                              vars().get('_enemy_states') or vars().get('_gw_enemy_states')),
                         'own_states':      _own_states   if '_own_states'   in vars() else [],
                         'enemy_states':    _enemy_states if '_enemy_states' in vars() else [],
                         'api_card_states': _pre_sim_states,
@@ -11559,7 +12368,7 @@ $(document).ready(function(){
                             'mode':        'arena',
                             'result':      'WIN' if winner == 1 else 'LOSS',
                             'account':     _cl_acct,
-                            'enemy_name':  enemy_name,
+                            'script_version': SCRIPT_VERSION, 'tuo_build': self._tuo_build_info(), 'enemy_name':  enemy_name,
                             'enemy_guild': enemy_guild,
                             'bge':         bge_name or None,
                             'my_deck':     my_deck_str,
@@ -11982,7 +12791,8 @@ $(document).ready(function(){
                         # (_brawl_field_hp) takes precedence over historical _killed
                         # (handles UID reuse within a battle).
                         result = []
-                        for uid_i in uid_range:
+                        _uids = []
+                        for uid_i in self._order_by_appearance(uid_range):
                             if uid_i < 0:
                                 continue
                             uid = str(uid_i)
@@ -12001,6 +12811,8 @@ $(document).ready(function(){
                                 if ev_h is not None and int(ev_h) <= 0:
                                     continue
                             s = dict(_cl_card_states.get(uid, {}))
+                            s.update(self._summon_hint_flags(uid, _card_map))
+                            self._carry_stasis(uid, _card_map, s)
                             # Commander runtime states live under internal UIDs -1/-2
                             # (see arena _states_for_range); keep derived 'h' untouched.
                             if uid_i in (50, 150):
@@ -12012,14 +12824,30 @@ $(document).ready(function(){
                                         s['h'] = _ch
                                     else:
                                         s.pop('h', None)
+                            if uid_i in (50, 150):
+                                _cd = self._commander_damage(uid_i)
+                                if _cd > 0:
+                                    s['cmd_damage'] = _cd
+                                    # The sim subtracts cmd_damage from the full commander HP itself;
+                                    # an 'h' (already the remaining HP) would be reduced a second time.
+                                    s.pop('h', None)
                             name = self._card_id_to_tuo_name(cid, card_data)
                             if name and cid:
                                 result.append((name, s))
+                                _uids.append(uid_i)
+                        self._last_state_uids = _uids
                         return result
 
                     _own_states   = _brawl_states_for_range(_own_range)
+                    _cl_own_uids = list(getattr(self, '_last_state_uids', []))
                     _enemy_states = _brawl_states_for_range(_enemy_range)
+                    _cl_enemy_uids = list(getattr(self, '_last_state_uids', []))
 
+                    self._tuo_enemy_played_all = self._parse_enemy_all_played_cards(battle_data, card_data, brawl_mode=True)
+                    try:
+                        self._enemy_eds = int(battle_data.get('eds', 0) or 0)   # real enemy deck size from the API
+                    except (ValueError, TypeError):
+                        self._enemy_eds = 0
                     win_pct, recommended_card, raw_out = self._run_tuo_reorder(
                         my_deck_str, sim_deck, [_n for _n in hand_names if _n],
                         bge_name=bge_name or None,
@@ -12122,6 +12950,11 @@ $(document).ready(function(){
                         'tuo_agreed':      play_name == recommended_card,
                         'hand':            [cname for (_, _, cname) in hand_display],
                         'field':           _cl_field,
+                        'appear_seq':      dict(getattr(self, '_appear_seq', {}) or {}),
+                        **self._cl_turn_extra(_cl_bd_after if battle_result else None,
+                                              vars().get('_cl_own_uids'), vars().get('_cl_enemy_uids'),
+                                              vars().get('_own_states') or vars().get('_gw_own_states'),
+                                              vars().get('_enemy_states') or vars().get('_gw_enemy_states')),
                         'own_states':      _own_states   if '_own_states'   in vars() else [],
                         'enemy_states':    _enemy_states if '_enemy_states' in vars() else [],
                         'api_card_states': _pre_sim_states,
@@ -12162,7 +12995,7 @@ $(document).ready(function(){
                         self._write_combat_log({
                             'battle_id': battle_id, 'mode': 'brawl',
                             'result': 'WIN' if _fail_win == 1 else 'LOSS',
-                            'account': _cl_acct, 'enemy_name': enemy_name,
+                            'account': _cl_acct, 'script_version': SCRIPT_VERSION, 'tuo_build': self._tuo_build_info(), 'enemy_name': enemy_name,
                             'enemy_guild': '', 'bge': bge_name or None,
                             'my_deck': my_deck_str, 'enemy_deck': enemy_deck_str or None,
                             'turns': _cl_turns,
@@ -12203,7 +13036,7 @@ $(document).ready(function(){
                             'mode':        'brawl',
                             'result':      'WIN' if winner == 1 else 'LOSS',
                             'account':     _cl_acct,
-                            'enemy_name':  enemy_name,
+                            'script_version': SCRIPT_VERSION, 'tuo_build': self._tuo_build_info(), 'enemy_name':  enemy_name,
                             'enemy_guild': '',
                             'bge':         bge_name or None,
                             'my_deck':     my_deck_str,
@@ -12614,7 +13447,8 @@ $(document).ready(function(){
                         # (_gw_field_hp) takes precedence over historical _gw_killed
                         # (handles UID reuse within a battle).
                         result = []
-                        for uid_i in uid_range:
+                        _uids = []
+                        for uid_i in self._order_by_appearance(uid_range):
                             if uid_i < 0:   # skip UID -1 (commander mimic state)
                                 continue
                             uid = str(uid_i)
@@ -12633,19 +13467,37 @@ $(document).ready(function(){
                                 if ev_h is not None and int(ev_h) <= 0:
                                     continue
                             s = dict(_gw_card_states.get(uid, {}))
+                            s.update(self._summon_hint_flags(uid, _gw_card_map))
+                            self._carry_stasis(uid, _gw_card_map, s)
                             # For commanders (uid 50/150), merge API internal states (-1/-2)
                             if uid_i == 150:
                                 s.update(_gw_card_states.get('-2', {}))
                             elif uid_i == 50:
                                 s.update(_gw_card_states.get('-1', {}))
+                            if uid_i in (50, 150):
+                                _cd = self._commander_damage(uid_i)
+                                if _cd > 0:
+                                    s['cmd_damage'] = _cd
+                                    # The sim subtracts cmd_damage from the full commander HP itself;
+                                    # an 'h' (already the remaining HP) would be reduced a second time.
+                                    s.pop('h', None)
                             name = self._card_id_to_tuo_name(cid, card_data)
                             if name and cid:
                                 result.append((name, s))
+                                _uids.append(uid_i)
+                        self._last_state_uids = _uids
                         return result
 
                     _gw_own_states   = _gw_states_for_range(_gw_own_range)
+                    _cl_own_uids = list(getattr(self, '_last_state_uids', []))
                     _gw_enemy_states = _gw_states_for_range(_gw_enemy_range)
+                    _cl_enemy_uids = list(getattr(self, '_last_state_uids', []))
 
+                    self._tuo_enemy_played_all = self._parse_enemy_all_played_cards(battle_data, card_data, brawl_mode=brawl_mode_uids)
+                    try:
+                        self._enemy_eds = int(battle_data.get('eds', 0) or 0)   # real enemy deck size from the API
+                    except (ValueError, TypeError):
+                        self._enemy_eds = 0
                     win_pct, recommended_card, _ = self._run_tuo_reorder(
                         my_deck_str, sim_deck, [_n for _n in hand_names if _n],
                         bge_name=None,
@@ -12727,6 +13579,11 @@ $(document).ready(function(){
                         'tuo_agreed':      play_name == recommended_card,
                         'hand':            [cname for (_, _, cname) in hand_display],
                         'field':           _cl_field,
+                        'appear_seq':      dict(getattr(self, '_appear_seq', {}) or {}),
+                        **self._cl_turn_extra(_cl_bd_after if battle_result else None,
+                                              vars().get('_cl_own_uids'), vars().get('_cl_enemy_uids'),
+                                              vars().get('_own_states') or vars().get('_gw_own_states'),
+                                              vars().get('_enemy_states') or vars().get('_gw_enemy_states')),
                         'own_states':      _gw_own_states   if '_gw_own_states'   in vars() else [],
                         'enemy_states':    _gw_enemy_states if '_gw_enemy_states' in vars() else [],
                         'api_card_states': _pre_sim_states,
@@ -12750,7 +13607,7 @@ $(document).ready(function(){
                             self._write_combat_log({
                                 'battle_id': battle_id, 'mode': 'gw',
                                 'result': 'WIN' if _fail_win == 1 else 'LOSS',
-                                'account': _cl_acct, 'enemy_name': enemy_name,
+                                'account': _cl_acct, 'script_version': SCRIPT_VERSION, 'tuo_build': self._tuo_build_info(), 'enemy_name': enemy_name,
                                 'enemy_guild': '', 'bge': my_bge or None,
                                 'my_deck': my_deck_str, 'enemy_deck': enemy_deck_str or None,
                                 'turns': _gw_turns,
@@ -12804,7 +13661,7 @@ $(document).ready(function(){
                             'mode':        'gw',
                             'result':      'WIN' if winner == 1 else 'LOSS',
                             'account':     _cl_acct,
-                            'enemy_name':  enemy_name,
+                            'script_version': SCRIPT_VERSION, 'tuo_build': self._tuo_build_info(), 'enemy_name':  enemy_name,
                             'enemy_guild': '',
                             'bge':         my_bge or None,
                             'my_deck':     my_deck_str,
@@ -14109,7 +14966,7 @@ $(document).ready(function(){
          'pvp': {'type_id': 6, 'skill': 'overload', 'wins': 30},
          'commander': None, 'required': ['Abunisapphire'],
          'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Veles Shapeshifter',
-                  'Metro Monitor'], 'pool_min': 3},
+                  'Metro Monitor', "Yurich's Toeslasher"], 'pool_min': 3},
         # step 8 — Fortify Tantzaeon-6 in 30 battles and win
         {'name': "Tantzaeon's Mirror",
          'desc': 'Fortify a Lv. 6 Tantzaeon in 30 battles and win',
@@ -14339,7 +15196,7 @@ $(document).ready(function(){
          'commander': None,
          'required': ['Lead Dozer'],
          'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Veles Shapeshifter',
-                  'Metro Monitor'],
+                  'Metro Monitor', "Yurich's Toeslasher"],
          'pool_min': 3},
         # step 16 — Enrage Havoc Alpha-6 4x in 40 battles and win
         {'name': 'Mega Extreme - Raider',
@@ -14792,7 +15649,7 @@ $(document).ready(function(){
          'pvp': {'type_id': 1, 'skill': 'overload', 'value': 300},
          'commander': None, 'required': [],
          'pool': ['Enyo Ruinmaker', "Yurich's Observatory", 'Veles Shapeshifter',
-                  'Metro Monitor'],
+                  'Metro Monitor', "Yurich's Toeslasher"],
          'pool_min': 3},
         # step 11 — Mimic 375x
         {'name': 'Progenitor Ra',
@@ -18812,6 +19669,7 @@ $(document).ready(function(){
         print(f"{'='*60}")
 
         ok = 0; failed = 0; skipped = 0; no_match = 0
+        _imp_used_ids = set()   # card IDs placed in decks by this import
         incomplete = []   # accounts that failed due to insufficient SP
         for sf in settings_files:
             nick = os.path.basename(sf).replace('settings_', '').replace('.json', '')
@@ -18915,6 +19773,7 @@ $(document).ready(function(){
                         failed += 1
                         continue
                     ok += 1
+                    _imp_used_ids.update(int(c) for c in [commander_id, dominion_id, *card_ids] if c)
                     continue  # _resolve_missing_cards already saved the deck
 
                 cards_json = _json.dumps(
@@ -18928,6 +19787,7 @@ $(document).ready(function(){
                 if result and result.get('result') in (True, 1, '1', 'true'):
                     print(f"  ✓  {kong}: Slot {slot} updated")
                     ok += 1
+                    _imp_used_ids.update(int(c) for c in [commander_id, dominion_id, *card_ids] if c)
                 else:
                     print(f"  ✗  {kong}: API error")
                     failed += 1
@@ -18937,6 +19797,24 @@ $(document).ready(function(){
 
         print(f"\n{'─'*60}")
         print(f"  Done — {ok} ✓  {failed} ✗  {skipped} skipped  {no_match} no match in file")
+        # Cards that were just built into decks are in use: take them off the outdated list
+        # so a later salvage run does not touch them.
+        try:
+            _od_file = os.path.join(SCRIPT_DIR, 'outdatedIDs.txt')
+            if _imp_used_ids and os.path.isfile(_od_file):
+                with open(_od_file, 'r') as _odf:
+                    _od_ids = {int(_l.strip()) for _l in _odf if _l.strip().isdigit()}
+                _od_hit = sorted(_od_ids & self._outdated_all_level_ids(_imp_used_ids))
+                if _od_hit:
+                    self._write_outdated_ids_safe(_od_file, _od_ids - set(_od_hit))
+                    self._log_outdated_ids_change('removed by deck import', _od_hit, 'cards used in imported decks')
+                    _od_names = []
+                    for _i in _od_hit:
+                        _inf = card_data.get(_i, {})
+                        _od_names.append(_inf.get('name', f'ID {_i}') if isinstance(_inf, dict) else f'ID {_i}')
+                    print(f"  ℹ Removed {len(_od_hit)} ID(s) from outdatedIDs.txt (now in use): {', '.join(sorted(set(_od_names)))}")
+        except Exception as _ode:
+            print(f"  ⚠ Could not update outdatedIDs.txt: {_ode}")
         if incomplete:
             print(f"\n  ⚠ Incomplete (insufficient SP after 10 workflow loops):")
             for _acc in incomplete:
@@ -19450,11 +20328,11 @@ $(document).ready(function(){
         Salvages all Base Epics keeping X copies per card.
         
         Base Epics are the 25 Fusion-Material Cards:
-        - 5x Bloodthirsty (ohne Malgoth)
-        - 5x Imperial (ohne Nimbus)
-        - 5x Raider (ohne Omega)
-        - 5x Righteous (ohne Benediction)
-        - 5x Xeno (ohne Apex)
+        - 5x Bloodthirsty (without Malgoth)
+        - 5x Imperial (without Nimbus)
+        - 5x Raider (without Omega)
+        - 5x Righteous (without Benediction)
+        - 5x Xeno (without Apex)
         
         Args:
             keep_count: Number to keep per card (default: 1)
@@ -19837,7 +20715,7 @@ $(document).ready(function(){
         # Schritt 4: Bestimme Tier based on Position
         def get_fusion_tier_by_position(name):
             """
-            Tier-Logik basierend auf Position in Fusion-Kette:
+            Tier logic based on position in the fusion chain:
             - Tier 0: Base only (no recipe, used as ingredient)
             - Tier 1: Middle link (has recipe AND used as ingredient)
             - Tier 2: End result (has recipe, NOT used as ingredient)
@@ -21222,16 +22100,16 @@ $(document).ready(function(){
 
     def shop_salvage_workflow(self, pack_count, salvage_base_epics=False, keep_base_epics=1):
         """
-        Kompletter Workflow:
+        Complete workflow:
           1. Buy packages
-          2. Alle Commons salvage
-          3. Alle Rares salvage
-          4. Optional: Base Epics salvage (keep X)
-          5. Summary ausgeben
+          2. Salvage all commons
+          3. Salvage all rares
+          4. Optional: salvage base epics (keep X)
+          5. Print summary
 
         Args:
             pack_count: Number of packages to buy
-            salvage_base_epics: Wenn True, auch Base Epics salvage
+            salvage_base_epics: if True, also salvage base epics
             keep_base_epics: Number of base epics to keep per card
 
         Returns:
@@ -21755,6 +22633,26 @@ $(document).ready(function(){
                 pass
             raise
 
+    def _outdated_all_level_ids(self, ids):
+        """Return the IDs of every level (1-6) of the cards that the given IDs belong to,
+        the same set that 'Remove card from list' removes. IDs without card data stay as they are."""
+        ids = {int(i) for i in ids}
+        try:
+            cd = self._load_card_data_with_rarity() or {}
+            bases = set()
+            for i in ids:
+                info = cd.get(i)
+                if isinstance(info, dict):
+                    bases.add(info.get('base_id', i))
+            out = set(ids)
+            for cid, info in cd.items():
+                if isinstance(info, dict) and info.get('base_id', cid) in bases \
+                        and 1 <= info.get('level', 1) <= 6:
+                    out.add(int(cid))
+            return out
+        except Exception:
+            return ids
+
     def salvage_outdated_all_accounts(self):
         """
         Runs _salvage_outdated_cards for all play_enabled accounts silently.
@@ -22145,6 +23043,12 @@ $(document).ready(function(){
                     _equipped_ids.add(int(_slot_data['commander_id']))
                 if _slot_data.get('dominion_id'):
                     _equipped_ids.add(int(_slot_data['dominion_id']))
+
+            # A card in use keeps all its levels off the list (not only the equipped ID);
+            # the equipped ID itself is handled in the loop below, which also reports it.
+            _eq_on_list = _equipped_ids & outdated_ids
+            if _eq_on_list:
+                outdated_ids -= (self._outdated_all_level_ids(_eq_on_list) - _eq_on_list)
 
             cards_to_salvage = []
             cards_equipped_skipped = []
@@ -24105,8 +25009,8 @@ $(document).ready(function(){
         Prefers higher levels to save SP.
         
         Args:
-            base_id: Base-ID der Card (Level 1)
-            target_level: Beneededtes Level
+            base_id: base ID of the card (level 1)
+            target_level: required level
             card_data: Card info dictionary
             used_cards: Dict tracking how many Cards already were used {card_id: count}
         
@@ -24694,7 +25598,7 @@ $(document).ready(function(){
         Resets a Dominion back to its base version
         Used internally by build_dominion_autobuild()
         
-        WICHTIG: Reset gibt back:
+        IMPORTANT: Reset returns:
         - Alpha Dominion-2 (ID 50002) - NOT Level 1!
         - Nexus Dominion-2 (ID 50239) - NOT Level 1!
         - All used materials (Shards, Fusion-Cards, etc.)
@@ -25051,7 +25955,7 @@ $(document).ready(function(){
     def _calculate_fusion_path(self, current_id, target_id, card_data):
         """
         Calculates the fusion path from current_id to target_id
-        Verwendet Breadth-First-Search für mehrstufige Pfade
+        Uses breadth-first search for multi-step paths
         
         Returns:
             List of steps: [{'type': 'upgrade'/'fusion', ...}, ...]
@@ -27048,6 +27952,8 @@ def interactive_menu():
             input("\n[ENTER] to continue...")
         elif choice == "scan_flags":
             commander.scan_combat_logs_for_unknown_flags(); input("\n[ENTER] to continue...")
+        elif choice == "winrates":
+            commander.combat_log_winrates(); input("\n[ENTER] to continue...")
         elif choice == "suspicious_logs":
             commander.check_suspicious_combat_logs(); input("\n[ENTER] to continue...")
         elif choice == "92":
@@ -27344,7 +28250,7 @@ def interactive_menu():
     # ── Submenu: Settings ─────────────────────────────────────────────────────
 
     def _menu_settings():
-        _map = {'1': '3', '2': '91', '3': '92', '4': '37', '5': 'scan_flags', '6': 'suspicious_logs'}
+        _map = {'1': '3', '2': '91', '3': '92', '4': '37', '5': 'scan_flags', '6': 'suspicious_logs', '7': 'winrates'}
         while True:
             t_val  = commander.tuo_threads
             _db_mb = commander._tuo_database_size_mb()
@@ -27358,6 +28264,7 @@ def interactive_menu():
             print("  4.   Clear Old Gauntlet Entries (>7 days)")
             print("  5.   Scan Combat Logs for Unknown sim.cpp Flags")
             print("  6.   Check Suspicious Combat Logs (Loss ≥99% / Win ≤1%)")
+            print("  7.   Win Rate per Mode and Account (from Combat Logs)")
             print("─"*52)
             print("  0.   ← Back to Main Menu")
             print("="*52)

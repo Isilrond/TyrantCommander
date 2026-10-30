@@ -25,7 +25,7 @@ SKIP_FLAGS = {'poisoner', 'h', 'mimic_skill', 'corroder',
               'siege_evolved_into_besiege', 'siege_evolved_into_mortar',
               'swipe_evolved_into_drain'}
 INT_FLAGS  = {
-    'h', 'perm_max_health', 'attack_boost', 'avenge_attack',
+    'h', 'perm_max_health', 'attack_boost', 'avenge_attack', 'berserk_attack',
     'protect', 'absorb', 'enfeeble', 'inhibited', 'stasis', 'poison',
     'disease', 'corrosive', 'corrosion', 'subdue', 'sabotage', 'mark',
     'jam_countdown', 'flurry_countdown', 'add_skill_counter',
@@ -39,6 +39,8 @@ INT_FLAGS  = {
     'enhance_swipe', 'enhance_tribute', 'enhance_venom', 'enhance_refresh',
 }
 BOOL_FLAGS = {'jammed', 'overloaded', 'sunder', 'enrage'}
+# cmd_damage = commander damage handed to the sim (derived from events, not an API card state)
+SUMMON_HINT_FLAGS = ('summon_turns', 'summon_src', 'played_turns', 'cmd_damage')
 
 
 def parse_hand_state_str(hs_str):
@@ -60,6 +62,14 @@ def parse_hand_state_str(hs_str):
                     flags[k.strip()] = int(v.strip())
                 except ValueError:
                     flags[k.strip()] = v.strip()
+        # summon_turns / summon_src are sim hints for the remaining delay of summoned units
+        # (not API state). Drop them; an entry that only existed for them is ignored,
+        # as before the hints existed.
+        had_hint = any(f in flags for f in SUMMON_HINT_FLAGS)
+        for f in SUMMON_HINT_FLAGS:
+            flags.pop(f, None)
+        if had_hint and not flags:
+            continue
         result.append((name, flags))
     return result
 
@@ -96,7 +106,8 @@ def build_expected(acs, uid_range, name_map):
             continue  # not in card_name_map → can't verify
 
         tuo_flags = {}
-        if h is not None and int(h) > 0:
+        # A commander's remaining HP is not sent as 'h' (the script sends the damage taken as cmd_damage instead)
+        if h is not None and int(h) > 0 and uid_i not in (50, 150):
             tuo_flags['h'] = int(h)
         for flag, val in flags.items():
             # mimic_skill: nested dict → extract derived skill (x takes priority over n)
@@ -130,6 +141,25 @@ def build_expected(acs, uid_range, name_map):
     return result
 
 
+# Flags the script adds on its own (not reported by the API in later turns):
+#  - stasis: the API reports it only for the first turn after play; the script carries it forward
+#    (see _carry_stasis), so it is legitimately present in the hand-state without an api_card_states entry.
+SCRIPT_CARRIED_FLAGS = {'stasis', 'berserk_attack', 'dead'}  # berserk_attack is summed up by the script from the berserk events
+
+
+def _fit_score(exp_flags, act_flags):
+    """How well an actual hand-state entry fits an expected one (higher = better)."""
+    sc = 0
+    for k, v in exp_flags.items():
+        if k == 'attack_boost' and isinstance(v, (int, float)) and v > 0:
+            continue  # positive Rally is never sent
+        if k in act_flags:
+            sc += 2 if act_flags[k] == v else -1
+        else:
+            sc -= 1
+    return sc
+
+
 def compare_hs(expected_list, actual_list, side, issues):
     """Compare expected vs actual hand-state lists."""
     # Group actual by base name (strip #N suffix)
@@ -139,22 +169,34 @@ def compare_hs(expected_list, actual_list, side, issues):
 
     for exp_name, exp_flags in expected_list:
         base = exp_name.split('#')[0]
+        if exp_flags and all(f == 'attack_boost' and isinstance(v, (int, float)) and v > 0
+                             for f, v in exp_flags.items()):
+            continue  # only a positive Rally, which the script deliberately drops: nothing to pair
+                      # (pairing it would take the hand-state entry of another card with the same name)
         if base not in actual_by_base or not actual_by_base[base]:
             issues.append(f"  {side} MISSING card '{exp_name}'  expected={exp_flags}")
             continue
-        _, act_flags = actual_by_base[base].pop(0)
+        # Several cards with the same name: take the best-fitting entry, not simply the first one
+        cands = actual_by_base[base]
+        best_i = max(range(len(cands)), key=lambda i: _fit_score(exp_flags, cands[i][1]))
+        _, act_flags = cands.pop(best_i)
         for flag, exp_val in exp_flags.items():
+            if flag == 'attack_boost' and isinstance(exp_val, (int, float)) and exp_val > 0:
+                continue  # the script deliberately drops a positive Rally (expires at end of turn)
             if flag not in act_flags:
                 issues.append(f"  {side} MISSING flag '{flag}'={exp_val} on {exp_name}")
             elif act_flags[flag] != exp_val:
                 issues.append(f"  {side} WRONG '{flag}': expected={exp_val} actual={act_flags[flag]} on {exp_name}")
         for flag, act_val in act_flags.items():
-            if flag not in exp_flags:
+            if flag not in exp_flags and flag not in SCRIPT_CARRIED_FLAGS:
                 issues.append(f"  {side} EXTRA flag '{flag}'={act_val} on {exp_name} (not in api_card_states)")
 
     # Extra cards in actual not matched to expected
     for base, remaining in actual_by_base.items():
-        for name, _ in remaining:
+        for name, flags in remaining:
+            # a card that only carries script-added flags (stasis) and no API state is fine
+            if flags and all(k in SCRIPT_CARRIED_FLAGS or k in ('summon_turns', 'summon_src', 'played_turns') for k in flags):
+                continue
             issues.append(f"  {side} EXTRA card '{name}' (dead or wrong UID range)")
 
 
@@ -180,7 +222,7 @@ def detect_ranges(tuo_cmd, acs, name_map=None, cached_own_101=None, file_mode=No
         # Priority check: enemy:hand card at uid 1-10 → own is 101-110
         # Must run before deck-name matching (same card may appear in both decks)
         if name_map:
-            ehm = _re.search(r"enemy:hand\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", tuo_cmd)
+            ehm = _re.search(r"enemy:(?:hand|played)\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", tuo_cmd)
             ehand_str = next((g for g in (ehm.groups() if ehm else []) if g), '') or ''
             if ehand_str:
                 ehand_names = {n.strip().rsplit('-', 1)[0].strip().lower()
@@ -291,31 +333,31 @@ def detect_ranges(tuo_cmd, acs, name_map=None, cached_own_101=None, file_mode=No
             own_101 = _own_is_101(tuo_cmd, acs, name_map, cached_own_101)
             if own_101:
                 # Brawl defender: own commander/dominion = 150/151, enemy = 50/51
-                return (list(range(101, 111)) + [150] + [151] + list(range(152, 200)),
-                        list(range(1, 11)) + [50] + [51] + list(range(52, 100)), mode)
+                return ([150] + [151] + list(range(101, 111)) + list(range(152, 200)),
+                        [50] + [51] + list(range(1, 11)) + list(range(52, 100)), mode)
             else:
-                return (list(range(1, 11)) + [50] + [51] + list(range(52, 100)),
-                        list(range(101, 111)) + [150] + [151] + list(range(152, 200)), mode)
+                return ([50] + [51] + list(range(1, 11)) + list(range(52, 100)),
+                        [150] + [151] + list(range(101, 111)) + list(range(152, 200)), mode)
         own_101 = _own_is_101(tuo_cmd, acs, name_map, cached_own_101)
         if own_101:
             # own=101-110: own forts=152..152+n_own-1, own summons=52+n_enemy..100
-            return (list(range(101, 111)) + [51] +
+            return ([50] + [51] + list(range(101, 111)) +
                     list(range(52 + n_enemy_forts, 100)) +
                     list(range(152, 152 + n_own_forts)),
-                    list(range(1, 11)) + [151] +
+                    [150] + [151] + list(range(1, 11)) +
                     list(range(52, 52 + n_enemy_forts)) +
                     list(range(152 + n_own_forts, 200)), mode)
         else:
-            return (list(range(1, 11)) + [51] +
+            return ([50] + [51] + list(range(1, 11)) +
                     list(range(152 + n_enemy_forts, 200)) +
                     list(range(52, 52 + n_own_forts)),
-                    list(range(101, 111)) + [151] +
+                    [150] + [151] + list(range(101, 111)) +
                     list(range(152, 152 + n_enemy_forts)) +
                     list(range(52 + n_own_forts, 100)), mode)
     else:
         # Arena: no forts, own=1-10, commander=50, dominion=51, summons start at 52
-        return (list(range(1, 11))   + [50] + [51] + list(range(52, 100)),
-                list(range(101, 111)) + [150] + [151] + list(range(152, 200)), 'arena')
+        return ([50] + [51] + list(range(1, 11)) + list(range(52, 100)),
+                [150] + [151] + list(range(101, 111)) + list(range(152, 200)), 'arena')
 
 
 
@@ -439,10 +481,34 @@ def check_sim_inputs(data, file_mode):
                     if over:
                         add(issues, tn, f"HAND NOT IN REMAINING DECK: {sorted(over.elements())}")
 
+            # live position (v6.0): `played` / `enemy:played` replace enemy:hand
+            ep_arg = _arg_after(tokens, 'enemy:played', 4)
+            pl_arg = _arg_after(tokens, 'played', 4)
+            _live = ('enemy:played' in tokens) or ('field' in tokens) or ('enemy:field' in tokens) or ('played' in tokens)
+            if _live:
+                # all enemy cards revealed so far (dead or alive), enemy UIDs 101-110 (arena) / 1-10 (brawl)
+                lo_, hi_ = (1, 10) if file_mode == 'brawl' else (101, 110)
+                cnm_ = t.get('card_name_map') or {}
+                exp_ep = _Counter(_norm_name(nm_) for uid_, nm_ in cnm_.items()
+                                  if str(uid_).isdigit() and lo_ <= int(uid_) <= hi_ and nm_
+                                  and not re.match(r'^UID\d+$', str(nm_)))
+                act_ep = _Counter(_names(ep_arg)) if ep_arg else _Counter()
+                if exp_ep != act_ep:
+                    add(issues, tn, f"ENEMY:PLAYED MISMATCH vs all revealed enemy cards -> {_fmt_diff(exp_ep, act_ep)}")
+                # enemy cards seen in play must exist (as often) in the enemy deck string
+                _dk = _Counter(_names(en_deck_s))
+                _over = act_ep - _dk
+                if _over:
+                    add(issues, tn, f"ENEMY DECK INCOMPLETE: played but not in enemy deck -> {sorted(_over.elements())}")
+                act_pl = _Counter(_names(pl_arg)) if pl_arg else _Counter()
+                if act_pl != _Counter(played_hist):
+                    add(issues, tn, f"PLAYED MISMATCH vs own play history -> {_fmt_diff(_Counter(played_hist), act_pl)}")
             # enemy:hand vs previous round's enemy field
             eh_arg = _arg_after(tokens, 'enemy:hand', 4)
             act_eh = _Counter(_names(eh_arg)) if eh_arg else _Counter()
-            if idx == 0:
+            if _live:
+                pass  # enemy:hand is not used any more in live-position commands
+            elif idx == 0:
                 if file_mode == 'arena' and act_eh:
                     add(issues, tn, f"ENEMY:HAND T1: arena T1 should have no enemy:hand, got {sorted(act_eh.elements())}")
             else:
@@ -528,6 +594,7 @@ def check_log(path):
 
     total_issues = 0
     turns_checked = 0
+    soft_warns = {}   # turn -> [str]: findings shown as warnings only
     cached_own_101 = None  # cached per-battle to avoid detection flip-flop
 
     for t in turns:
@@ -677,6 +744,8 @@ def check_log(path):
                     _uid_flags = acs.get(str(_u), {})
                     if isinstance(_uid_flags, dict) and _uid_flags.get('h', 1) == 0:
                         continue  # dead card — don't count as covered
+                    if not _uid_flags:
+                        continue  # stateless card can't own a hand-state entry (summon-loop case)
                     _nm = name_map.get(str(_u), '').rsplit('-', 1)[0].strip().lower()
                     if _nm: _dom_own_counts[_nm] += 1
             for _u in enemy_range:
@@ -684,6 +753,8 @@ def check_log(path):
                     _uid_flags = acs.get(str(_u), {})
                     if isinstance(_uid_flags, dict) and _uid_flags.get('h', 1) == 0:
                         continue  # dead card — don't count as covered
+                    if not _uid_flags:
+                        continue  # stateless card can't own a hand-state entry (summon-loop case)
                     _nm = name_map.get(str(_u), '').rsplit('-', 1)[0].strip().lower()
                     if _nm: _dom_enemy_counts[_nm] += 1
 
@@ -725,6 +796,19 @@ def check_log(path):
         compare_hs(exp_own,   actual_hs,  'OWN',   turn_issues)
         compare_hs(exp_enemy, actual_ehs, 'ENEMY', turn_issues)
 
+        # The API reports a berserk_attack that is too high right after an Enrage-boosted attack
+        # (seen: 43 reported while the unit really hit with 29; both agree again one turn later).
+        # The script sums the berserk events, which matches the real damage, so an API value
+        # above the script's is only a warning. A script value above the API's stays an issue.
+        _kept = []
+        for _m in turn_issues:
+            _mm = re.search(r"ENEMY WRONG 'berserk_attack': expected=(\d+) actual=(\d+)", _m)
+            if _mm and int(_mm.group(1)) > int(_mm.group(2)):
+                soft_warns.setdefault(turn_num, []).append(' ' + _m.strip() + '  [API ahead of the berserk events]')
+            else:
+                _kept.append(_m)
+        turn_issues = _kept
+
         # Unknown flags
         unknown = {f for flags in acs.values() if isinstance(flags, dict)
                    for f in flags
@@ -753,6 +837,8 @@ def check_log(path):
             for m in si_issues[tn]:
                 print(m)
                 total_issues += 1
+    for _tn, _ml in soft_warns.items():
+        si_warns.setdefault(_tn, []).extend(_ml)
     if si_warns:
         print("\n  ── Warnings (not counted) ──")
         for tn in sorted(si_warns, key=lambda x: (str(type(x)), x)):
@@ -770,12 +856,12 @@ def main():
     except Exception as _e:
         import traceback as _tb
         print("\n" + "="*70)
-        print("FEHLER")
+        print("ERROR")
         print("="*70)
         _tb.print_exc()
         print("="*70)
     finally:
-        input("\nEnter zum Schließen...")
+        input("\nPress Enter to close...")
 
 
 def _main():
@@ -842,7 +928,11 @@ def _main():
                 while os.path.exists(os.path.join(issues_dir, f"{base}_{idx}{ext}")):
                     idx += 1
                 dst = os.path.join(issues_dir, f"{base}_{idx}{ext}")
-            _shutil.copy2(path, dst)
+            try:
+                os.makedirs(issues_dir, exist_ok=True)
+                _shutil.copy2(path, dst)
+            except OSError as e:
+                print(f"  (could not copy {dst_name} to Issues folder: {e})")
 
     print(f"\n{'='*70}")
     print(f"  TOTAL: {len(files)} log(s)  {total_t} turns  ", end='')
@@ -865,7 +955,7 @@ def _main():
     else:
         # Remove empty Issues folder if no issues found
         import shutil as _shutil
-        _shutil.rmtree(issues_dir)
+        _shutil.rmtree(issues_dir, ignore_errors=True)
 
 
 if __name__ == '__main__':

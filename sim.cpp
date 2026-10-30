@@ -4,6 +4,7 @@
 #include <boost/range/adaptors.hpp>
 #include <boost/range/join.hpp>
 #include <iostream>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <sstream>
@@ -270,11 +271,9 @@ inline void CardStatus::set(const Card& card)
 inline unsigned CardStatus::attack_power() const
 {
     signed attack = calc_attack_power();
-    if(__builtin_expect(attack <0,false))
-    {
-        std::cout << m_card->m_name << " " << m_card->m_attack  << " " << attack << " " << m_temp_attack_buff << " " << m_corroded_weakened << std::endl;
-    }
-    _DEBUG_ASSERT(attack >= 0);
+    // Live position: a negative attack_boost taken over from the real game (weaken/sunder larger than the base attack)
+    // gives a negative sum here. The game floors the attack at 0; without this the cast to unsigned wraps to ~4 billion.
+    if (attack < 0) { return 0; }
     return (unsigned)attack;
 }
 
@@ -449,6 +448,185 @@ std::string CardStatus::description() const
     return desc + "]";
 }
 //------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// Live state overrides (hand-state / enemy:hand-state): apply one flag set to one card.
+static void apply_live_state(CardStatus* status, const std::map<std::string, int>& f)
+{
+    // remaining turns until the card may act (0 = active)
+    if (f.count("delay"))
+        status->m_delay = f.at("delay");
+
+    // HP (absolute current value, only set if alive)
+    if (f.count("h") && f.at("h") > 0)
+        status->m_hp = f.at("h");
+    // Permanent max HP bonus
+    if (f.count("perm_max_health"))
+        status->m_perm_health_buff = f.at("perm_max_health");
+    // Attack modifier (Weaken=negative, Rally/Enrage=positive)
+    if (f.count("attack_boost"))
+    {
+        // A negative value is a Weaken that is active at the start of the turn: it ends with the owner's
+        // turn, so it goes into the temporary slot. A positive value stays permanent (Enrage-like).
+        if (f.at("attack_boost") < 0)
+            status->m_temp_attack_buff = f.at("attack_boost");
+        else
+            status->m_perm_attack_buff = f.at("attack_boost");
+    }
+    // Avenge accumulated ATK (additive)
+    if (f.count("avenge_attack"))
+        status->m_perm_attack_buff += f.at("avenge_attack");
+    // Berserk gains accumulated so far (the game reports only the single activations, the caller sums them)
+    if (f.count("berserk_attack"))
+        status->m_perm_attack_buff += f.at("berserk_attack");
+    // Barrier / Protection
+    if (f.count("protect"))
+        status->m_protected = f.at("protect");
+    // Absorption
+    if (f.count("absorb"))
+        status->m_absorption = f.at("absorb");
+    // Enfeeble stacks
+    if (f.count("enfeeble"))
+        status->m_enfeebled = f.at("enfeeble");
+    // Inhibit stacks
+    if (f.count("inhibited"))
+        status->m_inhibited = f.at("inhibited");
+    // Jammed
+    if (f.count("jammed"))
+        status->m_jammed = (f.at("jammed") != 0);
+    // Skill-specific cooldowns
+    if (f.count("jam_countdown"))
+        status->m_skill_cd[Skill::jam] = f.at("jam_countdown");
+    if (f.count("flurry_countdown"))
+        status->m_skill_cd[Skill::flurry] = f.at("flurry_countdown");
+    // Entrap counter (Counter X granted by Entrap)
+    if (f.count("add_skill_counter"))
+        status->m_entrapped = f.at("add_skill_counter");
+    // Overloaded (skills bypass Evade/Inhibit/Protect)
+    if (f.count("overloaded"))
+        status->m_overloaded = (f.at("overloaded") != 0);
+    // Stasis (cumulative protect from Stasis skill)
+    if (f.count("stasis"))
+        status->m_protected_stasis = f.at("stasis");
+    // Poison damage per turn
+    if (f.count("poison"))
+        status->m_poisoned = f.at("poison");
+    // Sunder
+    if (f.count("sunder"))
+        status->m_sundered = (f.at("sunder") != 0);
+    // Entrap status (bool)
+    if (f.count("entrap"))
+        if (f.at("entrap")) status->m_entrapped = std::max(status->m_entrapped, 1u);
+    // Tribute
+    if (f.count("tribute"))
+        status->m_tributed = f.at("tribute");
+    // Enrage
+    if (f.count("enrage"))
+        status->m_enraged = (f.at("enrage") != 0);
+    // Subdue (permanent ATK reduction)
+    if (f.count("subdue"))
+        status->m_subdued = f.at("subdue");
+    // Sabotage (reduces skill X value)
+    if (f.count("sabotage"))
+        status->m_sabotaged = f.at("sabotage");
+    // Mark (target takes increased damage)
+    if (f.count("mark"))
+        status->m_marked = f.at("mark");
+    // Enhance values per skill
+    if (f.count("enhance_subdue"))
+        status->m_enhanced_value[Skill::subdue] = f.at("enhance_subdue");
+    if (f.count("enhance_scavenge"))
+        status->m_enhanced_value[Skill::scavenge] = f.at("enhance_scavenge");
+    if (f.count("add_skill_berserk"))
+        status->m_enhanced_value[Skill::berserk] = f.at("add_skill_berserk");
+    if (f.count("enhance_berserk"))
+        status->m_enhanced_value[Skill::berserk] = f.at("enhance_berserk");
+    if (f.count("enhance_avenge"))
+        status->m_enhanced_value[Skill::avenge] = f.at("enhance_avenge");
+    if (f.count("enhance_leech"))
+        status->m_enhanced_value[Skill::leech] = f.at("enhance_leech");
+    if (f.count("enhance_coalition"))
+        status->m_enhanced_value[Skill::coalition] = f.at("enhance_coalition");
+    if (f.count("enhance_mark"))
+        status->m_enhanced_value[Skill::mark] = f.at("enhance_mark");
+    if (f.count("enhance_venom"))
+        status->m_enhanced_value[Skill::venom] = f.at("enhance_venom");
+    if (f.count("enhance_allegiance"))
+        status->m_enhanced_value[Skill::allegiance] = f.at("enhance_allegiance");
+    if (f.count("enhance_inhibit"))
+        status->m_enhanced_value[Skill::inhibit] = f.at("enhance_inhibit");
+    if (f.count("enhance_armor"))
+        status->m_enhanced_value[Skill::armor] = f.at("enhance_armor");
+    if (f.count("enhance_armored"))
+        status->m_enhanced_value[Skill::armor] = f.at("enhance_armored");
+    if (f.count("enhance_legion"))
+        status->m_enhanced_value[Skill::legion] = f.at("enhance_legion");
+    if (f.count("enhance_tribute"))
+        status->m_enhanced_value[Skill::tribute] = f.at("enhance_tribute");
+    if (f.count("enhance_hunt"))
+        status->m_enhanced_value[Skill::hunt] = f.at("enhance_hunt");
+    if (f.count("enhance_barrier"))
+        status->m_enhanced_value[Skill::barrier] = f.at("enhance_barrier");
+    if (f.count("enhance_evade"))
+        status->m_enhanced_value[Skill::evade] = f.at("enhance_evade");
+    if (f.count("enhance_counter"))
+        status->m_enhanced_value[Skill::counter] = f.at("enhance_counter");
+    if (f.count("enhance_fortify"))
+        status->m_enhanced_value[Skill::fortify] = f.at("enhance_fortify");
+    if (f.count("enhance_poison"))
+        status->m_enhanced_value[Skill::poison] = f.at("enhance_poison");
+    if (f.count("enhance_disease"))
+        status->m_enhanced_value[Skill::disease] = f.at("enhance_disease");
+    if (f.count("enhance_drain"))
+        status->m_enhanced_value[Skill::drain] = f.at("enhance_drain");
+    if (f.count("enhance_stasis"))
+        status->m_enhanced_value[Skill::stasis] = f.at("enhance_stasis");
+    if (f.count("enhance_swipe"))
+        status->m_enhanced_value[Skill::swipe] = f.at("enhance_swipe");
+    if (f.count("enhance_coalition"))
+        status->m_enhanced_value[Skill::coalition] = f.at("enhance_coalition");
+    if (f.count("enhance_corrosive"))
+        status->m_enhanced_value[Skill::corrosive] = f.at("enhance_corrosive");
+    if (f.count("enhance_sabotage"))
+        status->m_enhanced_value[Skill::sabotage] = f.at("enhance_sabotage");
+    if (f.count("enhance_besiege"))
+        status->m_enhanced_value[Skill::mortar] = f.at("enhance_besiege");
+    if (f.count("enhance_refresh"))
+        status->m_enhanced_value[Skill::refresh] = f.at("enhance_refresh");
+    // Disease
+    if (f.count("disease"))
+        status->m_diseased = f.at("disease");
+    // Corrosive (rate) and Corrosion (weakened ATK)
+    if (f.count("corrosive"))
+        status->m_corroded_rate = f.at("corrosive");
+    if (f.count("corrosion"))
+        status->m_corroded_weakened = f.at("corrosion");
+    // Absorb evolved into Evade
+    if (f.count("absorb_evolved_into_evade") && f.at("absorb_evolved_into_evade"))
+        status->m_evolved_skill_offset[Skill::absorb] = Skill::evade - Skill::absorb;
+    // Weaken evolved into Sunder
+    if (f.count("weaken_evolved_into_sunder") && f.at("weaken_evolved_into_sunder"))
+        status->m_evolved_skill_offset[Skill::weaken] = Skill::sunder - Skill::weaken;
+    // Pierce evolved into Rupture
+    if (f.count("pierce_evolved_into_rupture") && f.at("pierce_evolved_into_rupture"))
+        status->m_evolved_skill_offset[Skill::pierce] = Skill::rupture - Skill::pierce;
+    // Swipe evolved into Drain
+    if (f.count("swipe_evolved_into_drain") && f.at("swipe_evolved_into_drain"))
+        status->m_evolved_skill_offset[Skill::swipe] = Skill::drain - Skill::swipe;
+    // Leech evolved into Refresh
+    if (f.count("leech_evolved_into_refresh") && f.at("leech_evolved_into_refresh"))
+        status->m_evolved_skill_offset[Skill::leech] = Skill::refresh - Skill::leech;
+    // Siege evolved into Mortar (API may use "mortar" or "besiege" as target name)
+    if ((f.count("siege_evolved_into_mortar") && f.at("siege_evolved_into_mortar")) ||
+        (f.count("siege_evolved_into_besiege") && f.at("siege_evolved_into_besiege")))
+        status->m_evolved_skill_offset[Skill::siege] = Skill::mortar - Skill::siege;
+    // Poison evolved into Venom
+    if (f.count("poison_evolved_into_venom") && f.at("poison_evolved_into_venom"))
+        status->m_evolved_skill_offset[Skill::poison] = Skill::venom - Skill::poison;
+    // Payback evolved into Revenge
+    if (f.count("payback_evolved_into_revenge") && f.at("payback_evolved_into_revenge"))
+        status->m_evolved_skill_offset[Skill::payback] = Skill::revenge - Skill::payback;
+}
+
 void Hand::reset(std::mt19937& re)
 {
     assaults.reset();
@@ -462,188 +640,217 @@ void Hand::reset(std::mt19937& re)
         stasis_faction_bitmap |= (1u << commander.m_card->m_faction);
     }
 
-    // Apply live card state overrides from hand-state / enemy:hand-state flags
-    // Cards with same name are disambiguated by #N index (field position order).
+    // Cards that were already played in the real battle (dead or alive) are no longer
+    // in the draw pile. One instance per entry is removed (match by id, then base id).
+    // Search from the back so copies of the current hand (placed at the front) are kept.
     {
-        auto& state_map = (commander.m_player == 0) ? your_hand_state : enemy_hand_state;
-        if (!state_map.empty())
+        const std::vector<unsigned>& played = (side == 0) ? your_played_ids : enemy_played_ids;
+        for (unsigned pid : played)
         {
-            std::map<std::string, int> name_encounter;
-            for (CardStatus* status : assaults.m_indirect)
+            auto& pile = deck->shuffled_cards;
+            auto it = pile.end();
+            for (auto rit = pile.rbegin(); rit != pile.rend(); ++rit)
+            { if ((*rit)->m_id == pid) { it = std::next(rit).base(); break; } }
+            if (it == pile.end())
             {
-                std::string base_name = simplify_name(status->m_card->m_name);
-                int idx = ++name_encounter[base_name];
-                // Try indexed name first (e.g. "zashikinoz#2"), fallback to plain name
-                std::string indexed_name = base_name + "#" + std::to_string(idx);
-                auto it = state_map.find(indexed_name);
-                if (it == state_map.end())
-                    it = state_map.find(base_name);
-                if (it == state_map.end()) continue;
-                const auto& f = it->second;
-
-                // HP (absolute current value, only set if alive)
-                if (f.count("h") && f.at("h") > 0)
-                    status->m_hp = f.at("h");
-                // Permanent max HP bonus
-                if (f.count("perm_max_health"))
-                    status->m_perm_health_buff = f.at("perm_max_health");
-                // Attack modifier (Weaken=negative, Rally/Enrage=positive)
-                if (f.count("attack_boost"))
-                    status->m_perm_attack_buff = f.at("attack_boost");
-                // Avenge accumulated ATK (additive)
-                if (f.count("avenge_attack"))
-                    status->m_perm_attack_buff += f.at("avenge_attack");
-                // Barrier / Protection
-                if (f.count("protect"))
-                    status->m_protected = f.at("protect");
-                // Absorption
-                if (f.count("absorb"))
-                    status->m_absorption = f.at("absorb");
-                // Enfeeble stacks
-                if (f.count("enfeeble"))
-                    status->m_enfeebled = f.at("enfeeble");
-                // Inhibit stacks
-                if (f.count("inhibited"))
-                    status->m_inhibited = f.at("inhibited");
-                // Jammed
-                if (f.count("jammed"))
-                    status->m_jammed = (f.at("jammed") != 0);
-                // Skill-specific cooldowns
-                if (f.count("jam_countdown"))
-                    status->m_skill_cd[Skill::jam] = f.at("jam_countdown");
-                if (f.count("flurry_countdown"))
-                    status->m_skill_cd[Skill::flurry] = f.at("flurry_countdown");
-                // Entrap counter (Counter X granted by Entrap)
-                if (f.count("add_skill_counter"))
-                    status->m_entrapped = f.at("add_skill_counter");
-                // Overloaded (skills bypass Evade/Inhibit/Protect)
-                if (f.count("overloaded"))
-                    status->m_overloaded = (f.at("overloaded") != 0);
-                // Stasis (cumulative protect from Stasis skill)
-                if (f.count("stasis"))
-                    status->m_protected_stasis = f.at("stasis");
-                // Poison damage per turn
-                if (f.count("poison"))
-                    status->m_poisoned = f.at("poison");
-                // Sunder
-                if (f.count("sunder"))
-                    status->m_sundered = (f.at("sunder") != 0);
-                // Entrap status (bool)
-                if (f.count("entrap"))
-                    if (f.at("entrap")) status->m_entrapped = std::max(status->m_entrapped, 1u);
-                // Tribute
-                if (f.count("tribute"))
-                    status->m_tributed = f.at("tribute");
-                // Enrage
-                if (f.count("enrage"))
-                    status->m_enraged = (f.at("enrage") != 0);
-                // Subdue (permanent ATK reduction)
-                if (f.count("subdue"))
-                    status->m_subdued = f.at("subdue");
-                // Sabotage (reduces skill X value)
-                if (f.count("sabotage"))
-                    status->m_sabotaged = f.at("sabotage");
-                // Mark (target takes increased damage)
-                if (f.count("mark"))
-                    status->m_marked = f.at("mark");
-                // Enhance values per skill
-                if (f.count("enhance_subdue"))
-                    status->m_enhanced_value[Skill::subdue] = f.at("enhance_subdue");
-                if (f.count("enhance_scavenge"))
-                    status->m_enhanced_value[Skill::scavenge] = f.at("enhance_scavenge");
-                if (f.count("add_skill_berserk"))
-                    status->m_enhanced_value[Skill::berserk] = f.at("add_skill_berserk");
-                if (f.count("enhance_berserk"))
-                    status->m_enhanced_value[Skill::berserk] = f.at("enhance_berserk");
-                if (f.count("enhance_avenge"))
-                    status->m_enhanced_value[Skill::avenge] = f.at("enhance_avenge");
-                if (f.count("enhance_leech"))
-                    status->m_enhanced_value[Skill::leech] = f.at("enhance_leech");
-                if (f.count("enhance_coalition"))
-                    status->m_enhanced_value[Skill::coalition] = f.at("enhance_coalition");
-                if (f.count("enhance_mark"))
-                    status->m_enhanced_value[Skill::mark] = f.at("enhance_mark");
-                if (f.count("enhance_venom"))
-                    status->m_enhanced_value[Skill::venom] = f.at("enhance_venom");
-                if (f.count("enhance_allegiance"))
-                    status->m_enhanced_value[Skill::allegiance] = f.at("enhance_allegiance");
-                if (f.count("enhance_inhibit"))
-                    status->m_enhanced_value[Skill::inhibit] = f.at("enhance_inhibit");
-                if (f.count("enhance_armor"))
-                    status->m_enhanced_value[Skill::armor] = f.at("enhance_armor");
-                if (f.count("enhance_armored"))
-                    status->m_enhanced_value[Skill::armor] = f.at("enhance_armored");
-                if (f.count("enhance_legion"))
-                    status->m_enhanced_value[Skill::legion] = f.at("enhance_legion");
-                if (f.count("enhance_tribute"))
-                    status->m_enhanced_value[Skill::tribute] = f.at("enhance_tribute");
-                if (f.count("enhance_hunt"))
-                    status->m_enhanced_value[Skill::hunt] = f.at("enhance_hunt");
-                if (f.count("enhance_barrier"))
-                    status->m_enhanced_value[Skill::barrier] = f.at("enhance_barrier");
-                if (f.count("enhance_evade"))
-                    status->m_enhanced_value[Skill::evade] = f.at("enhance_evade");
-                if (f.count("enhance_counter"))
-                    status->m_enhanced_value[Skill::counter] = f.at("enhance_counter");
-                if (f.count("enhance_fortify"))
-                    status->m_enhanced_value[Skill::fortify] = f.at("enhance_fortify");
-                if (f.count("enhance_poison"))
-                    status->m_enhanced_value[Skill::poison] = f.at("enhance_poison");
-                if (f.count("enhance_disease"))
-                    status->m_enhanced_value[Skill::disease] = f.at("enhance_disease");
-                if (f.count("enhance_drain"))
-                    status->m_enhanced_value[Skill::drain] = f.at("enhance_drain");
-                if (f.count("enhance_stasis"))
-                    status->m_enhanced_value[Skill::stasis] = f.at("enhance_stasis");
-                if (f.count("enhance_swipe"))
-                    status->m_enhanced_value[Skill::swipe] = f.at("enhance_swipe");
-                if (f.count("enhance_coalition"))
-                    status->m_enhanced_value[Skill::coalition] = f.at("enhance_coalition");
-                if (f.count("enhance_corrosive"))
-                    status->m_enhanced_value[Skill::corrosive] = f.at("enhance_corrosive");
-                if (f.count("enhance_sabotage"))
-                    status->m_enhanced_value[Skill::sabotage] = f.at("enhance_sabotage");
-                if (f.count("enhance_besiege"))
-                    status->m_enhanced_value[Skill::mortar] = f.at("enhance_besiege");
-                if (f.count("enhance_refresh"))
-                    status->m_enhanced_value[Skill::refresh] = f.at("enhance_refresh");
-                // Disease
-                if (f.count("disease"))
-                    status->m_diseased = f.at("disease");
-                // Corrosive (rate) and Corrosion (weakened ATK)
-                if (f.count("corrosive"))
-                    status->m_corroded_rate = f.at("corrosive");
-                if (f.count("corrosion"))
-                    status->m_corroded_weakened = f.at("corrosion");
-                // Absorb evolved into Evade
-                if (f.count("absorb_evolved_into_evade") && f.at("absorb_evolved_into_evade"))
-                    status->m_evolved_skill_offset[Skill::absorb] = Skill::evade - Skill::absorb;
-                // Weaken evolved into Sunder
-                if (f.count("weaken_evolved_into_sunder") && f.at("weaken_evolved_into_sunder"))
-                    status->m_evolved_skill_offset[Skill::weaken] = Skill::sunder - Skill::weaken;
-                // Pierce evolved into Rupture
-                if (f.count("pierce_evolved_into_rupture") && f.at("pierce_evolved_into_rupture"))
-                    status->m_evolved_skill_offset[Skill::pierce] = Skill::rupture - Skill::pierce;
-                // Swipe evolved into Drain
-                if (f.count("swipe_evolved_into_drain") && f.at("swipe_evolved_into_drain"))
-                    status->m_evolved_skill_offset[Skill::swipe] = Skill::drain - Skill::swipe;
-                // Leech evolved into Refresh
-                if (f.count("leech_evolved_into_refresh") && f.at("leech_evolved_into_refresh"))
-                    status->m_evolved_skill_offset[Skill::leech] = Skill::refresh - Skill::leech;
-                // Siege evolved into Mortar (API may use "mortar" or "besiege" as target name)
-                if ((f.count("siege_evolved_into_mortar") && f.at("siege_evolved_into_mortar")) ||
-                    (f.count("siege_evolved_into_besiege") && f.at("siege_evolved_into_besiege")))
-                    status->m_evolved_skill_offset[Skill::siege] = Skill::mortar - Skill::siege;
-                // Poison evolved into Venom
-                if (f.count("poison_evolved_into_venom") && f.at("poison_evolved_into_venom"))
-                    status->m_evolved_skill_offset[Skill::poison] = Skill::venom - Skill::poison;
-                // Payback evolved into Revenge
-                if (f.count("payback_evolved_into_revenge") && f.at("payback_evolved_into_revenge"))
-                    status->m_evolved_skill_offset[Skill::payback] = Skill::revenge - Skill::payback;
+                const Card* ref = deck->all_cards.by_id(pid);
+                if (!ref) continue;
+                for (auto rit = pile.rbegin(); rit != pile.rend(); ++rit)
+                { if ((*rit)->m_base_id == ref->m_base_id) { it = std::next(rit).base(); break; } }
+            }
+            if (it == pile.end()) continue;
+            const unsigned removed_id = (*it)->m_id;
+            pile.erase(it);
+            // 'ordered' strategy: the played copy has used up the earliest position of its card
+            if (deck->strategy == DeckStrategy::ordered)
+            {
+                auto o = deck->order.find(removed_id);
+                if (o != deck->order.end() && !o->second.empty()) o->second.pop_front();
             }
         }
     }
 }
+
+// Diagnostics (environment variable TUO_LIVE_DEBUG=1): print both boards to stderr
+static void live_dump_board(Field* fd, const char* label)
+{
+    std::cerr << "[LIVE] ---- " << label << " (turn " << fd->turn << ") ----" << std::endl;
+    for (unsigned p = 0; p < 2; ++p)
+    {
+        Hand* h = fd->players[p];
+        std::cerr << "[LIVE] player " << p << " (side " << h->side << ") commander " << h->commander.m_card->m_name
+                  << " hp=" << h->commander.m_hp << std::endl;
+        for (CardStatus* st : h->structures.m_indirect)
+            std::cerr << "[LIVE]   struct " << st->m_card->m_name << " id=" << st->m_card->m_id << " hp=" << st->m_hp
+                      << " delay=" << st->m_delay << std::endl;
+        for (CardStatus* st : h->assaults.m_indirect)
+            std::cerr << "[LIVE]   unit   " << st->m_card->m_name << " id=" << st->m_card->m_id << " hp=" << st->m_hp
+                      << " atk=" << st->attack_power() << " delay=" << st->m_delay
+                      << " protect=" << st->m_protected << " stasis=" << st->m_protected_stasis << std::endl;
+    }
+}
+
+//------------------------------------------------------------------------------
+// Live field (field / enemy:field + hand-state / enemy:hand-state):
+// place the units that are on the real battlefield right now, then apply their states.
+// Called once from play() after the normal start-up (dominion/fortresses).
+// Returns true if anything was placed or changed.
+static bool apply_live_field(Field* fd)
+{
+    bool any = false;
+    for (unsigned p = 0; p < 2; ++p)
+    {
+        Hand* h = fd->players[p];
+        const std::vector<unsigned>& field_ids = (h->side == 0) ? your_field_ids : enemy_field_ids;
+        auto& state_map = (h->side == 0) ? your_hand_state : enemy_hand_state;
+        if (field_ids.empty() && state_map.empty()) continue;
+        any = true;
+
+        const std::vector<unsigned>& played = (h->side == 0) ? your_played_ids : enemy_played_ids;
+        const unsigned N = played.size();   // turns this side has completed (one card per turn)
+        // Remaining wait time as the sim needs it. The sim reduces timers again at the start of
+        // its first turn; for your own units the real game has already done that reduction once.
+        auto sim_delay = [&](unsigned card_delay, unsigned plays_after) -> unsigned
+        {
+            if (h->side == 0)
+            {
+                unsigned real = (card_delay > plays_after + 1) ? card_delay - (plays_after + 1) : 0;
+                return real > 0 ? real + 1 : 0;
+            }
+            return (card_delay > plays_after) ? card_delay - plays_after : 0;
+        };
+        // dominion was placed at start-up (first structure): it has been counting down since turn 1
+        if (h->deck->alpha_dominion && h->structures.size() > 0 && h->structures[0].m_card == h->deck->alpha_dominion)
+        { h->structures[0].m_delay = sim_delay(h->deck->alpha_dominion->m_delay, N); }
+
+        std::vector<CardStatus*> placed;
+        bool dominion_skipped = false;
+        std::map<std::string, int> place_encounter;
+        for (unsigned fid : field_ids)
+        {
+            const Card* c = fd->cards.by_id(fid);
+            if (!c) continue;
+            // the dominion was already placed at start-up: do not place it a second time
+            if (!dominion_skipped && h->deck->alpha_dominion && c->m_base_id == h->deck->alpha_dominion->m_base_id)
+            { dominion_skipped = true; continue; }
+            // Summoned unit whose name is ambiguous in cards.xml (e.g. a summon token that exists several times):
+            // take the exact card from the Summon skill of its source instead of the name lookup.
+            {
+                const std::string pbase = simplify_name(c->m_name);
+                const int pidx = ++place_encounter[pbase];
+                auto sit = state_map.find(pbase + "#" + std::to_string(pidx));
+                if (sit == state_map.end()) sit = state_map.find(pbase);
+                if (sit != state_map.end() && sit->second.count("summon_src"))
+                {
+                    const Card* sc = fd->cards.by_id(static_cast<unsigned>(sit->second.at("summon_src")));
+                    if (sc)
+                    {
+                        const unsigned sid = sc->m_skill_value[Skill::summon];
+                        const Card* tc = sid ? fd->cards.by_id(sid) : nullptr;
+                        if (tc && tc->m_base_id == c->m_base_id) { c = tc; }
+                        else if (tc && simplify_name(tc->m_name) == pbase) { c = tc; }
+                    }
+                }
+            }
+            // prefer the level used in the deck itself
+            for (const Card* dc : h->deck->cards)
+            { if (dc->m_base_id == c->m_base_id) { c = dc; break; } }
+            if (c->m_type != CardType::assault && c->m_type != CardType::structure) continue;
+            Storage<CardStatus>& store = (c->m_type == CardType::assault) ? h->assaults : h->structures;
+            CardStatus* st = &store.add_back();
+            st->set(c);
+            st->m_index = store.size() - 1;
+            st->m_player = p;
+            st->m_field = fd;
+            st->m_delay = 0;   // already active unless it was played very recently (below)
+            placed.push_back(st);
+        }
+        // Units played in the last few turns may still be waiting: walk the played list
+        // backwards (newest first) and give the newest still-unassigned unit of that card its delay.
+        {
+            std::vector<bool> used(placed.size(), false);
+            for (unsigned i = 0; i < N && i < 8; ++i)
+            {
+                const Card* pc = fd->cards.by_id(played[N - 1 - i]);
+                if (!pc) continue;
+                for (size_t j = placed.size(); j-- > 0; )
+                {
+                    if (used[j] || placed[j]->m_card->m_base_id != pc->m_base_id) continue;
+                    used[j] = true;
+                    placed[j]->m_delay = sim_delay(placed[j]->m_card->m_delay, i);
+                    break;
+                }
+            }
+        }
+
+        // Units with Stasis that are already on the field must register their faction,
+        // otherwise cards played later by the sim never get the stacked Stasis.
+        {
+            auto mark_stasis = [&](CardStatus* st)
+            {
+                if (st->skill(Skill::stasis) || (fd->bg_effects[p][PassiveBGE::temporalbacklash] && st->skill(Skill::counter)))
+                { h->stasis_faction_bitmap |= (1u << st->m_card->m_faction); }
+            };
+            for (CardStatus* st : h->structures.m_indirect) mark_stasis(st);
+            for (CardStatus* st : h->assaults.m_indirect) mark_stasis(st);
+        }
+
+        if (state_map.empty()) continue;
+        std::map<std::string, int> name_encounter;
+        auto apply_to = [&](CardStatus* status)
+        {
+            std::string base_name = simplify_name(status->m_card->m_name);
+            int idx = ++name_encounter[base_name];
+            auto it = state_map.find(base_name + "#" + std::to_string(idx));
+            if (it == state_map.end()) it = state_map.find(base_name);
+            if (it == state_map.end()) return;
+            const std::map<std::string, int>& fl = it->second;
+            // Summoned unit: the API gives no remaining delay, so it is derived here from the
+            // owner's turn starts since the summon (summon_turns = turn starts + 1).
+            if (fl.count("summon_turns") && fl.at("summon_turns") >= 1)
+            {
+                const unsigned age = static_cast<unsigned>(fl.at("summon_turns") - 1);
+                unsigned base = status->m_card->m_delay;
+                // units summoned by a tower (structure, active Summon) start with delay - 1
+                if (base > 0 && fl.count("summon_src") && fd->fixes[Fix::reduce_delay_summoned_by_tower])
+                {
+                    const Card* sc = fd->cards.by_id(static_cast<unsigned>(fl.at("summon_src")));
+                    if (sc && sc->m_type == CardType::structure
+                        && sc->m_skill_trigger[Skill::summon] == Skill::Trigger::activate)
+                    { --base; }
+                }
+                status->m_delay = (h->side == 0) ? sim_delay(base, age > 0 ? age - 1 : 0)
+                                                 : sim_delay(base, age);
+                status->m_summoned = true;
+            }
+            apply_live_state(status, fl);
+            // Commander: the API never reports its HP; the tool sums up the damage it has taken
+            if (status == &h->commander && fl.count("cmd_damage") && fl.at("cmd_damage") > 0)
+            {
+                const unsigned dmg = static_cast<unsigned>(fl.at("cmd_damage"));
+                status->m_hp = (status->m_hp > dmg) ? (status->m_hp - dmg) : 1u;
+            }
+        };
+        apply_to(&h->commander);
+        for (CardStatus* status : h->structures.m_indirect) apply_to(status);
+        for (CardStatus* status : h->assaults.m_indirect) apply_to(status);
+        // Destroyed dominion: the start-up placed it at full HP, the real game has already lost it
+        // (hand-state flag dead=1). Without this it soaks up Mortar/Siege hits and counts as a live target.
+        if (h->deck->alpha_dominion && h->structures.size() > 0 && h->structures[0].m_card == h->deck->alpha_dominion)
+        {
+            auto dit = state_map.find(simplify_name(h->deck->alpha_dominion->m_name));
+            if (dit != state_map.end() && dit->second.count("dead") && dit->second.at("dead"))
+            {
+                h->structures[0].m_hp = 0;
+                h->structures.remove([](CardStatus& s) { return s.m_hp == 0; });
+                for (unsigned i = 0; i < h->structures.size(); ++i) { h->structures[i].m_index = i; }
+            }
+        }
+    }
+    if (std::getenv("TUO_LIVE_DEBUG")) { live_dump_board(fd, "after placing the live field"); }
+    return any;
+}
+
 
 //---------------------- $40 Game rules implementation -------------------------
 // Everything about how a battle plays out, except the following:
@@ -1518,7 +1725,7 @@ void turn_start_phase_update(Field*fd, CardStatus * status)
 {
             //apply Absorb + Triggered\{Valor} Enhances
             check_and_perform_early_enhance(fd,status);
-            if(fd->fixes[Fix::enhance_early])check_and_perform_later_enhance(fd,status);
+            if(fd->fixes[Fix::enhance_early] && !(fd->live_struct_enhance_inline && status->m_card->m_type == CardType::structure))check_and_perform_later_enhance(fd,status);
             //refresh absorb
             if(status->has_skill(Skill::absorb))
             {
@@ -1526,7 +1733,16 @@ void turn_start_phase_update(Field*fd, CardStatus * status)
             }
             if(__builtin_expect(fd->fixes[Fix::barrier_each_turn],true) && status->has_skill(Skill::barrier)){
                 _DEBUG_MSG(1,"%s gets barrier protection %u per turn\n",status_description(status).c_str(),status->skill(Skill::barrier));
-                status->m_protected += status->skill(Skill::barrier);
+                if (fd->live_enhance_timer && fd->turn == 1 && status->m_player == fd->tapi)
+                {
+                    // live position: the protect read from the real game was taken after this turn's barrier upkeep,
+                    // so only top it up to the barrier value instead of adding the barrier a second time
+                    if (status->m_protected < status->skill(Skill::barrier)) { status->m_protected = status->skill(Skill::barrier); }
+                }
+                else
+                {
+                    status->m_protected += status->skill(Skill::barrier);
+                }
             }
             check_and_perform_bravery(fd,status);
             if (status->m_delay > 0)
@@ -1550,6 +1766,7 @@ void turn_start_phase_update(Field*fd, CardStatus * status)
 
 void turn_start_phase(Field* fd)
 {
+    struct TurnStartGuard { Field* f; explicit TurnStartGuard(Field* f_) : f(f_) { f->in_turn_start = true; } ~TurnStartGuard() { f->in_turn_start = false; } } turn_start_guard(fd);
     // Active player's commander card:
     cooldown_skills(&fd->tap->commander);
     //grab assaults before new ones get summoned
@@ -2280,6 +2497,8 @@ inline bool skill_predicate<Skill::enhance>(Field* fd, CardStatus* src, CardStat
     if (!is_alive(dst)) return false;
     if (!dst->has_skill(s.s)) return false;
     if (is_active(dst)) return true;
+    // live position: an own card whose timer runs out in this turn start can be enhanced as well
+    if (fd->live_enhance_timer && fd->in_turn_start && can_act(dst) && dst->m_delay == 1 && dst->m_player == fd->tapi) return true;
     if (is_defensive_skill(s.s)) return true;
     if (is_instant_debuff_skill(s.s)) return true; // Enhance Sabotage, Inhibit, Disease also without dst being active
     if (is_triggered_skill(s.s) && s.s != Skill::valor) return true;// Enhance Allegiance, Stasis, Bravery ( + not in TU: Flurry, Summon; No enhance on inactive dst: Valor)
@@ -3018,7 +3237,9 @@ void perform_counter(Field* fd, CardStatus* att_status, CardStatus* def_status)
 }
 bool check_and_perform_enhance(Field* fd, CardStatus* src, bool early)
 {
-      if(!is_active(src))return false; // active
+      // live position: a card whose timer runs out in this very turn start already enhances
+      const bool about_to_activate = fd->live_enhance_timer && fd->in_turn_start && can_act(src) && src->m_delay == 1;
+      if(!is_active(src) && !about_to_activate)return false; // active
       if(!src->has_skill(Skill::enhance))return false; // enhance Skill
       for(auto ss : src->m_card->m_skills)
       {
@@ -3937,7 +4158,11 @@ Results<uint64_t> play(Field* fd,bool skip_init, bool skip_preplay,unsigned turn
     if(!skip_init){ //>>> start skip init
         fd->players[0]->commander.m_player = 0;
         fd->players[1]->commander.m_player = 1;
-        fd->tapi = fd->gamemode == surge ? 1 : 0;
+        // Live position (field / hand-state given): the real battle is at the point where we
+        // have to move, so we always act first, also in surge.
+        const bool live_position = !your_field_ids.empty() || !enemy_field_ids.empty()
+            || !your_hand_state.empty() || !enemy_hand_state.empty();
+        fd->tapi = (fd->gamemode == surge && !live_position) ? 1 : 0;
         fd->tipi = opponent(fd->tapi);
         fd->tap = fd->players[fd->tapi];
         fd->tip = fd->players[fd->tipi];
@@ -3972,10 +4197,15 @@ Results<uint64_t> play(Field* fd,bool skip_init, bool skip_preplay,unsigned turn
             std::swap(fd->tap, fd->tip);
             ai = opponent(ai);
         }
+        // Place the real battlefield (units + states) on top of the fresh start
+        if (live_position) { fd->live_enhance_timer = true; fd->live_struct_enhance_inline = true; apply_live_field(fd); }
     }//>>> end skip init
     unsigned both_turn_limit = fd->turn+2*turns_both;
     while(__builtin_expect(fd->turn <= turn_limit && !fd->end && (turns_both==0 || fd->turn < both_turn_limit), true))
     {
+        { static const char* _ld = std::getenv("TUO_LIVE_DEBUG");
+          // TUO_LIVE_DEBUG=1 dumps up to turn 9; TUO_LIVE_DEBUG=<n> (n>1) dumps up to turn n
+          if (_ld) { unsigned _lim = (unsigned)std::atoi(_ld); if (_lim < 2) { _lim = 9; } if (fd->turn <= _lim) { live_dump_board(fd, "start of turn"); } } }
         if(!skip_preplay){ //>>> start skip init
 
             fd->current_phase = Field::playcard_phase;
@@ -4141,6 +4371,9 @@ Results<uint64_t> play(Field* fd,bool skip_init, bool skip_preplay,unsigned turn
             }
             else
             {
+                // Live position: the structure's Enhance runs here, in index order with its other skills
+                if (fd->live_struct_enhance_inline) { check_and_perform_later_enhance(fd, current_status); }
+                if (__builtin_expect(fd->end, false)) { break; }
                 evaluate_skills<CardType::structure>(fd, current_status, current_status->m_card->m_skills);
             }
         }
