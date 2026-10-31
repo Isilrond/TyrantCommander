@@ -233,6 +233,7 @@ inline void CardStatus::set(const Card& card)
     m_step = CardStep::none;
     m_perm_health_buff = 0;
     m_perm_attack_buff = 0;
+    m_berserk_attack = 0;
     m_temp_attack_buff = 0;
     m_corroded_rate = 0;
     m_corroded_weakened = 0;
@@ -479,8 +480,12 @@ static void apply_live_state(CardStatus* status, const std::map<std::string, int
     if (f.count("avenge_attack"))
         status->m_perm_attack_buff += f.at("avenge_attack");
     // Berserk gains accumulated so far (the game reports only the single activations, the caller sums them)
+    // (the caller already leaves out Berserk gained before the card's last Avenge trigger)
     if (f.count("berserk_attack"))
+    {
         status->m_perm_attack_buff += f.at("berserk_attack");
+        status->m_berserk_attack += f.at("berserk_attack");
+    }
     // Barrier / Protection
     if (f.count("protect"))
         status->m_protected = f.at("protect");
@@ -982,7 +987,13 @@ void prepend_on_death(Field* fd, bool paybacked=false)
                         (std::abs((signed)from_idx - (signed)host_idx) > 1 ? "Half-" : ""),
                          avenge_value);
                 if (!adj_status->m_sundered)
-                { adj_status->m_perm_attack_buff += avenge_value; }
+                {
+                    // Observed in the real game: an Avenge trigger wipes the attack gained from Berserk so far
+                    // (attack = base + avenge total + Berserk gained afterwards)
+                    adj_status->m_perm_attack_buff -= std::min(adj_status->m_berserk_attack, adj_status->m_perm_attack_buff);
+                    adj_status->m_berserk_attack = 0;
+                    adj_status->m_perm_attack_buff += avenge_value;
+                }
                 adj_status->ext_hp(avenge_value);
             }
 
@@ -3162,6 +3173,7 @@ void perform_berserk(Field* fd, CardStatus* att_status, CardStatus* def_status)
             {
                 // perform_skill_berserk
                 att_status->m_perm_attack_buff += berserk_value;
+                att_status->m_berserk_attack += berserk_value;
 #ifndef NQUEST
                 if (att_status->m_player == 0)
                 {

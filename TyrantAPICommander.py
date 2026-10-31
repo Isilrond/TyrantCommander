@@ -146,7 +146,13 @@ if DEBUG_MODE:
 
 # Script version: written into every combat log, so old logs can be told apart from fixed behaviour.
 # Format YYYY.MM.DD-N; raise it with every behaviour change.
-SCRIPT_VERSION = "2026.10.30-11"
+SCRIPT_VERSION = "2026.10.31-5"
+# Flexible mode, probe games per hand card: FLEX_SIM_ITER inside the forecast simulation (every simulated
+# game decides its cards with it, so it is the big time factor), FLEX_PICK_ITER for the single card choice run
+# of the real turn. More = more exact, slower.
+FLEX_SIM_ITER = 50
+LIVE_REORDER_N = 5000    # simulated games of the live forecast per turn (was 10000)
+FLEX_PICK_ITER = 100
 
 import json
 import xml.etree.ElementTree as ET
@@ -10014,7 +10020,7 @@ $(document).ready(function(){
             except Exception:
                 pass
 
-        def _deck_from_profile(commander, name):
+        def _deck_from_profile(commander, name, allow_refresh=True):
             """commander: a TyrantCommander instance (self or a proxy).
             Returns (deck_str_or_None, reason_str)."""
             try:
@@ -10057,7 +10063,7 @@ $(document).ready(function(){
                 user_id = self._guild_member_name_cache[cache_key].get(name.lower())
                 # A name missing from the roster triggers one refresh per guild and run
                 # (member may have joined after the cache was built); never repeat it.
-                if user_id is None and cache_key not in self._guild_roster_fresh:
+                if user_id is None and allow_refresh and cache_key not in self._guild_roster_fresh:
                     # Cache may be stale (member joined after last build).
                     # Re-initialize the proxy to get a fresh faction.members list,
                     # rebuild the name map once, then retry.
@@ -10157,7 +10163,10 @@ $(document).ready(function(){
         if enemy_guild and _own_guild and enemy_guild.lower() != _own_guild:
             _reason1 = "target is in another guild"
         else:
-            deck_str, _reason1 = _deck_from_profile(self, enemy_name)
+            # Guild unknown (Brawl, or a player without a guild): a name missing from the cached
+            # roster must not trigger the ~28 s roster refresh - such an enemy cannot be a member
+            # of our own guild, and the refresh never found anybody.
+            deck_str, _reason1 = _deck_from_profile(self, enemy_name, allow_refresh=bool(enemy_guild))
             if deck_str:
                 return deck_str, "direct"
 
@@ -10418,7 +10427,7 @@ $(document).ready(function(){
         import random as _random
         _om = 'ordered' if force_ordered else getattr(self, 'tuo_order_mode', 'ordered')
         if _om == 'flexible':
-            _oflags = ['flexible', 'flexible-iter', '100']
+            _oflags = ['flexible', 'flexible-iter', str(FLEX_SIM_ITER)]
         else:
             _oflags = ['ordered']
         _pvp_mode = 'surge' if surge else ('pvp', 'random') if pvp_random else 'pvp'
@@ -10499,6 +10508,7 @@ $(document).ready(function(){
         """
         import subprocess, re as _re, random as _random
 
+        self._last_flex_pick = None      # set again below when the card choice run succeeds
 
         if not self._tuo_available():
             return None, None, ""
@@ -10540,7 +10550,7 @@ $(document).ready(function(){
         hand_str = ", ".join(hand_cards)
         _om2 = 'ordered' if force_ordered else getattr(self, 'tuo_order_mode', 'ordered')
         if _om2 == 'flexible':
-            _oflags2 = ['flexible', 'flexible-iter', '100']
+            _oflags2 = ['flexible', 'flexible-iter', str(FLEX_SIM_ITER)]
         else:
             _oflags2 = ['ordered']
         tuo_mode = mode if mode else ('surge' if surge else 'pvp')
@@ -10723,6 +10733,21 @@ $(document).ready(function(){
                     recommended = hand_set[base]
                     break
 
+            # Flexible mode: TUO decides the card itself during the game and leaves the deck order
+            # unchanged, so 'first hand card in the order' is simply hand card 1, not the sim's choice.
+            # Ask the sim for its first decision (value of every hand card) and play the best one.
+            self._last_flex_pick = None
+            if 'flexible' in cmd and len(set(hand_cards)) >= 2 and getattr(self, '_tuo_flex_print_ok', True):
+                _pick = self._flex_pick_card(cmd, hand_cards, recommended, hand_set)
+                if _pick:
+                    recommended = _pick['card']
+                    self._last_flex_pick = _pick
+                    print("  ⇄ Card choice (sim, " + str(_pick['iter']) + " probes per card): "
+                          + ', '.join(f"{k} {v}" for k, v in _pick['values'].items())
+                          + ("" if recommended == _pick['deck_order_card']
+                             else f"  (first hand card would have been {_pick['deck_order_card']})"),
+                          flush=True)
+
             return win_pct, recommended, output
 
         except subprocess.TimeoutExpired:
@@ -10731,6 +10756,54 @@ $(document).ready(function(){
             import traceback
             traceback.print_exc()
             return None, None, str(e)
+
+    def _flex_pick_card(self, cmd, hand_cards, deck_order_card, hand_set):
+        """Value of each hand card at the first decision of the live position, from one TUO game
+        (sim 1) that prints TUO's flexible evaluation (env TUO_FLEX_PRINT, needs the rebuilt tuo.exe).
+        Returns {'card', 'values', 'iter', 'deck_order_card'} or None (old tuo.exe / no result).
+        Ties go to the card the deck order would have played."""
+        import subprocess, re as _re
+        try:
+            c = list(cmd)
+            if 'reorder' in c:
+                i = c.index('reorder')
+                c[i:i + 2] = ['sim', '1']
+            elif 'sim' not in c:
+                c += ['sim', '1']
+            if '-t' in c:
+                c[c.index('-t') + 1] = '1'
+            if 'flexible-iter' in c:
+                c[c.index('flexible-iter') + 1] = str(FLEX_PICK_ITER)
+            else:
+                c += ['flexible-iter', str(FLEX_PICK_ITER)]
+            env = dict(os.environ)
+            env['TUO_FLEX_PRINT'] = '1'
+            env['TUO_LIVE_DEBUG'] = '0'
+            proc = subprocess.run(c, capture_output=True, text=True, cwd=self._tuo_dir,
+                                  timeout=180, env=env)
+            m = _re.search(r'Flexible Order:\s*\((.*)\)\s*$', proc.stdout, _re.M)
+            if not m:
+                if 'Unknown option' not in (proc.stdout + proc.stderr):
+                    self._tuo_flex_print_ok = False
+                    print("  ⚠ tuo.exe does not print the card values (rebuild it from the patched sources: "
+                          "sim.cpp, sim.h, deck.cpp). Card choice stays 'first hand card'.", flush=True)
+                return None
+            vals = {}
+            for nm, v in _re.findall(r'(.+?)\s+(-?\d+)(?:,\s+|$)', m.group(1)):
+                nm = nm.strip()
+                if nm:
+                    vals[nm] = max(vals.get(nm, -1), int(v))
+            vals = {k: v for k, v in vals.items() if k in hand_set}
+            if len(vals) < 2:
+                return None
+            top = max(vals.values())
+            best = deck_order_card if vals.get(deck_order_card) == top else \
+                next(k for k, v in vals.items() if v == top)
+            return {'card': best, 'values': vals, 'iter': FLEX_PICK_ITER,
+                    'deck_order_card': deck_order_card}
+        except Exception as e:
+            print(f"  ⚠ Card choice run failed ({e}) - using the first hand card", flush=True)
+            return None
 
     def _parse_current_hand(self, battle_data, brawl_mode=False,
                              played_uids=None, drawn_uids=None):
@@ -11162,7 +11235,7 @@ $(document).ready(function(){
             _bid2 = battle_data.get('battle_id')
             _ba = getattr(self, '_berserk_acc', None)
             if not _ba or _ba.get('bid') != _bid2:
-                _ba = self._berserk_acc = {'bid': _bid2, 'ev': {}, 'kill': {}}
+                _ba = self._berserk_acc = {'bid': _bid2, 'ev': {}, 'kill': {}, 'av': {}}
             for tk, tv in turn.items():
                 if not isinstance(tv, dict):
                     continue
@@ -11173,17 +11246,29 @@ $(document).ready(function(){
                 for ai, action in enumerate(tv.get('actions', [])):
                     if str(action.get('skill_id')) == 'berserk':
                         _ba['ev'][(_tki, ai)] = (str(action.get('card_uid')), int(action.get('value', 0) or 0))
+                    elif str(action.get('skill_id')) == 'avenge':
+                        # an Avenge trigger wipes the Berserk attack the card had gained until then
+                        _ba['av'][(_tki, ai)] = str(action.get('card_uid'))
                 for kill_key in ('attack_kill', 'defend_kill'):
                     for uid in tv.get(kill_key, []):
                         _ku = str(int(uid))
                         _ba['kill'][_ku] = max(_ba['kill'].get(_ku, -1), _tki)
             _bsum = {}
+            _lastav = {}
+            for _ak, _au in _ba['av'].items():
+                if _ak > _lastav.get(_au, (-1, -1)):
+                    _lastav[_au] = _ak
             for (_tki, _ai), (_bu, _bv) in _ba['ev'].items():
+                if (_tki, _ai) < _lastav.get(_bu, (-1, -1)):
+                    continue
                 if _tki > _ba['kill'].get(_bu, -1):
                     _bsum[_bu] = _bsum.get(_bu, 0) + _bv
             for _bu, _bt in _bsum.items():
                 if _bt > 0 and _bu not in ('-1', '-2'):
                     card_states.setdefault(_bu, {})['berserk_attack'] = _bt
+            for _bu, _bf in card_states.items():   # an Avenge trigger can lower the sum again
+                if isinstance(_bf, dict) and 'berserk_attack' in _bf and _bsum.get(_bu, 0) <= 0:
+                    _bf.pop('berserk_attack', None)
         except Exception:
             pass
 
@@ -11465,6 +11550,9 @@ $(document).ready(function(){
             L.append(f"Turn {t.get('turn')}:  sim win {t.get('tuo_win_pct')}%  recommended: {t.get('tuo_recommended')}  "
                      f"played: {t.get('card_played')}  ({agreed})")
             L.append(f"Hand: {', '.join(t.get('hand') or [])}")
+            if t.get('tuo_flex'):
+                _tf = t['tuo_flex']
+                L.append("Card values (sim, %s probes per card): %s" % (_tf.get('iter'), ', '.join(f"{k} {v}" for k, v in (_tf.get('values') or {}).items())))
             if t.get('enemy_deck_known'):
                 L.append(f"Enemy deck only partly known: {t['enemy_deck_known'].get('known')}/{t['enemy_deck_known'].get('of')} deck cards (forecast gets optimistic once the sim enemy runs out of cards)")
             if t.get('enemy_deck_added'):
@@ -12281,7 +12369,7 @@ $(document).ready(function(){
                     win_pct, recommended_card, raw_out = self._run_tuo_reorder(
                         my_deck_str, sim_deck, [_n for _n in hand_names if _n],
                         bge_name=bge_name or None,
-                        reorder_n=10000,
+                        reorder_n=LIVE_REORDER_N,
                         played_cards=play_order_names if play_order_names else None,
                         enemy_played_cards=enemy_played if enemy_played else None,
                         hand_states=_own_states if _own_states else None,
@@ -12355,6 +12443,7 @@ $(document).ready(function(){
                         'card_played':     play_name,
                         'tuo_recommended': recommended_card,
                         'tuo_agreed':      play_name == recommended_card,
+                        'tuo_flex':        getattr(self, '_last_flex_pick', None),
                         'hand':            [cname for (_, _, cname) in hand_display],
                         'field':           _cl_field,
                         'appear_seq':      dict(getattr(self, '_appear_seq', {}) or {}),
@@ -12647,7 +12736,10 @@ $(document).ready(function(){
                 enemy_deck_str = _live_deck
                 print(f"  ✓ Live deck ({_fetch_status}): {_live_deck}")
             elif enemy_deck_str:
-                print(f"  ⚠ Live fetch: {_fetch_status} – using cached deck")
+                # no guild known (player without a guild, or guild never seen): no live lookup is
+                # possible, the last known deck is the normal case - info, not a warning
+                _sym = "ℹ" if _fetch_status == "no guild known" else "⚠"
+                print(f"  {_sym} Live fetch: {_fetch_status} – using cached deck")
             else:
                 print(f"  ⚠ Live fetch: {_fetch_status} – no deck available")
 
@@ -12912,7 +13004,7 @@ $(document).ready(function(){
                     win_pct, recommended_card, raw_out = self._run_tuo_reorder(
                         my_deck_str, sim_deck, [_n for _n in hand_names if _n],
                         bge_name=bge_name or None,
-                        reorder_n=10000,
+                        reorder_n=LIVE_REORDER_N,
                         played_cards=play_order_names if play_order_names else None,
                         surge=True,
                         mode='surge',
@@ -13009,6 +13101,7 @@ $(document).ready(function(){
                         'card_played':     play_name,
                         'tuo_recommended': recommended_card,
                         'tuo_agreed':      play_name == recommended_card,
+                        'tuo_flex':        getattr(self, '_last_flex_pick', None),
                         'hand':            [cname for (_, _, cname) in hand_display],
                         'field':           _cl_field,
                         'appear_seq':      dict(getattr(self, '_appear_seq', {}) or {}),
@@ -13576,7 +13669,7 @@ $(document).ready(function(){
                         my_deck_str, sim_deck, [_n for _n in hand_names if _n],
                         bge_name=None,
                         yeffect=my_bge or None,
-                        reorder_n=10000,
+                        reorder_n=LIVE_REORDER_N,
                         played_cards=play_order_names if play_order_names else None,
                         surge=True,
                         mode='surge',
@@ -13651,6 +13744,7 @@ $(document).ready(function(){
                         'card_played':     play_name,
                         'tuo_recommended': recommended_card,
                         'tuo_agreed':      play_name == recommended_card,
+                        'tuo_flex':        getattr(self, '_last_flex_pick', None),
                         'hand':            [cname for (_, _, cname) in hand_display],
                         'field':           _cl_field,
                         'appear_seq':      dict(getattr(self, '_appear_seq', {}) or {}),
