@@ -146,7 +146,7 @@ if DEBUG_MODE:
 
 # Script version: written into every combat log, so old logs can be told apart from fixed behaviour.
 # Format YYYY.MM.DD-N; raise it with every behaviour change.
-SCRIPT_VERSION = "2026.10.31-5"
+SCRIPT_VERSION = "2026.10.31-12"
 # Flexible mode, probe games per hand card: FLEX_SIM_ITER inside the forecast simulation (every simulated
 # game decides its cards with it, so it is the big time factor), FLEX_PICK_ITER for the single card choice run
 # of the real turn. More = more exact, slower.
@@ -5117,6 +5117,7 @@ $(document).ready(function(){
         print(f"  Active accounts: {len(active_files)}")
 
         lines = []
+        _cmd_cnt, _dom_cnt, _card_cnt = {}, {}, {}   # usage summary (commander / dominion / cards)
         ok = 0
         unlocked = 0
         for sf in active_files:
@@ -5172,6 +5173,16 @@ $(document).ready(function(){
                 lines.append(f"{account_name}: {deck_str}")
                 print(f"  ✓  {account_name}")
                 ok += 1
+                # usage tally: first = commander, then dominion (if the deck has one), then the cards
+                _parts = [x.strip() for x in deck_str.split(',') if x.strip()]
+                if _parts:
+                    _cmd_cnt[_parts[0]] = _cmd_cnt.get(_parts[0], 0) + 1
+                    _rest = _parts[1:]
+                    if _rest and dominion_id and str(dominion_id) not in ('0', 'None', ''):
+                        _dom_cnt[_rest[0]] = _dom_cnt.get(_rest[0], 0) + 1
+                        _rest = _rest[1:]
+                    for _c in _rest:
+                        _card_cnt[_c] = _card_cnt.get(_c, 0) + 1
             except Exception as _e:
                 print(f"  ✗  {nick}: {_e}")
 
@@ -5181,6 +5192,20 @@ $(document).ready(function(){
         with open(out_path, 'w', encoding='utf-8') as _f:
             for line in lines:
                 _f.write(line + '\n')
+            # Usage summary as comment lines (same layout as the brawl top-100 export)
+            def _top(_d, _n):
+                return sorted(_d.items(), key=lambda x: (-x[1], x[0]))[:_n]
+            if _cmd_cnt:
+                _f.write('\n')
+                for _i, (_n, _c) in enumerate(_top(_cmd_cnt, 3), 1):
+                    _f.write(f"// Top{_i} Commander: {_n} ({_c})\n")
+                if _dom_cnt:
+                    _f.write('\n')
+                    for _i, (_n, _c) in enumerate(_top(_dom_cnt, 3), 1):
+                        _f.write(f"// Top{_i} Dominion: {_n} ({_c})\n")
+                _f.write('\n')
+                for _i, (_n, _c) in enumerate(_top(_card_cnt, 10), 1):
+                    _f.write(f"// Top{_i} Card: {_n} ({_c})\n")
 
         print(f"\n  ✓  {ok}/{len(active_files)} accounts exported")
         if unlocked:
@@ -7071,8 +7096,13 @@ $(document).ready(function(){
                     _act[_n] = max(_act.get(_n, 0), _k)
                 # enemy commander / first card UIDs: 150/151 normally, 50/51 when I am the
                 # brawl defender (own UIDs 101-110 / 150 / 151)
-                _own_hi = any(isinstance(_c.get('uid'), int) and 101 <= _c['uid'] <= 110
-                              for _c in (_t.get('field') or {}).get('own', []))
+                # (decide per turn from the field AND the board: own commander uid 150 = brawl defender
+                #  position; the field alone is empty in the first turns, which put the own commander
+                #  and dominion into the 'actual cards played' list)
+                _own_hi = (any(isinstance(_c.get('uid'), int) and 101 <= _c['uid'] <= 110
+                               for _c in (_t.get('field') or {}).get('own', []))
+                           or any(_c.get('uid') == 150
+                                  for _c in (_t.get('board') or {}).get('own', [])))
                 _en_cmd = ('50', '51') if _own_hi else ('150', '151')
                 for _uid, _n in (_t.get('card_name_map') or {}).items():
                     if str(_uid) in _en_cmd:
@@ -10656,6 +10686,7 @@ $(document).ready(function(){
         _cmd_str = ' '.join(('"' + c + '"') if ' ' in c or ',' in c else c for c in cmd)
         print(f"  [TUO] {_cmd_str}")
         self._last_tuo_cmd = _cmd_str
+        self._last_tuo_run = None   # set below together with the parsed result (combat log: tuo_run)
 
         try:
             proc = subprocess.run(
@@ -10709,6 +10740,8 @@ $(document).ready(function(){
                 return None, None, output
 
             win_pct = float(win_pct_raw) if win_pct_raw else 0.0
+            _raw_line = next((l.strip() for l in output.splitlines() if l.startswith('Optimized Deck')), '')
+            self._last_tuo_run = {'cmd': _cmd_str, 'win_pct': win_pct, 'result_line': _raw_line[:400]}
             opt_deck_str = opt_m.group(2).strip()
 
             # Find first hand card that appears in optimized deck order
@@ -10778,7 +10811,9 @@ $(document).ready(function(){
                 c += ['flexible-iter', str(FLEX_PICK_ITER)]
             env = dict(os.environ)
             env['TUO_FLEX_PRINT'] = '1'
-            env['TUO_LIVE_DEBUG'] = '0'
+            # The sim only checks whether TUO_LIVE_DEBUG is SET (even '0' switches the board dumps on and
+            # writes ~7 MB to stderr per card choice), so remove it instead of setting it to 0.
+            env.pop('TUO_LIVE_DEBUG', None)
             proc = subprocess.run(c, capture_output=True, text=True, cwd=self._tuo_dir,
                                   timeout=180, env=env)
             m = _re.search(r'Flexible Order:\s*\((.*)\)\s*$', proc.stdout, _re.M)
@@ -11461,7 +11496,7 @@ $(document).ready(function(){
     def _write_combat_log(self, log_data, account_name=''):
         """
         Write a combat log JSON to combatlog/<account>/
-        Filename: YYYYMMDD_HHMMSS_RESULT_vs_enemy.json
+        Filename: YYYYMMDD_HHMMSS_MODE_RESULT_vs_enemy.json  (MODE = arena / brawl / gw)
         """
         import json as _json
         from datetime import datetime as _dt
@@ -11473,9 +11508,26 @@ $(document).ready(function(){
         ts      = _dt.now().strftime('%Y%m%d_%H%M%S')
         result  = log_data.get('result', 'UNKNOWN')
         enemy   = log_data.get('enemy_name', 'Unknown').replace(' ', '_')
-        fname   = f"{ts}_{result}_vs_{enemy}.json"
+        _mode   = str(log_data.get('mode') or 'unknown').lower().replace(' ', '_')
+        fname   = f"{ts}_{_mode}_{result}_vs_{enemy}.json"
         fpath   = os.path.join(log_dir, fname)
 
+        # Last game turn of the fight (events_after holds the whole rest of the fight after the sim stops).
+        # The game ends a fight without a dead commander after 50 game turns: a LOSS that reaches turn 50
+        # is a stall loss (a regular loss exactly in turn 50 is possible but very unlikely).
+        try:
+            _lt = 0
+            for _t in (log_data.get('turns') or []):
+                for _k in (_t.get('events_after') or {}):
+                    _lt = max(_lt, int(_k))
+            log_data['last_game_turn'] = _lt or None
+            if _lt:
+                if log_data.get('result') == 'LOSS':
+                    log_data['end_reason'] = ('stall' if _lt >= 50 else 'commander_dead')
+                elif log_data.get('result') == 'WIN':
+                    log_data['end_reason'] = 'win'
+        except Exception:
+            pass
         # The readable report lives inside the JSON (key 'report', one line per list entry) - no separate .txt file.
         try:
             log_data['report'] = self._write_combat_report(log_data, None)
@@ -12413,7 +12465,7 @@ $(document).ready(function(){
                 # ── Combat log: capture this turn ────────────────────
                 # Save pre-sim snapshot BEFORE playCard so api_card_states
                 # matches what was actually passed to TUO this turn.
-                _pre_sim_states = dict(_cl_card_states)
+                _pre_sim_states = {_k: (dict(_v) if isinstance(_v, dict) else _v) for _k, _v in _cl_card_states.items()}
                 # Mark cumulatively-killed cards as h=0 in the snapshot too,
                 # matching what _states_for_range excludes via _killed —
                 # otherwise stale buff-only entries (avenge_attack, stasis,
@@ -12457,6 +12509,7 @@ $(document).ready(function(){
                         'card_map':        _pre_sim_card_map,
                         'card_name_map':   _pre_sim_name_map,
                         'tuo_cmd':         getattr(self, '_last_tuo_cmd', None),
+                        'tuo_run':         getattr(self, '_last_tuo_run', None),
                     })
 
                 if battle_result:
@@ -13077,7 +13130,7 @@ $(document).ready(function(){
                             brawl_wasted += 1
 
                 # ── Combat log: capture this turn (brawl) ────────────
-                _pre_sim_states = dict(_cl_card_states)
+                _pre_sim_states = {_k: (dict(_v) if isinstance(_v, dict) else _v) for _k, _v in _cl_card_states.items()}
                 # See arena equivalent: skip UIDs reused by a new alive card.
                 for _kuid in _killed:
                     _kuid_str = str(_kuid)
@@ -13115,6 +13168,7 @@ $(document).ready(function(){
                         'card_map':        _pre_sim_card_map,
                         'card_name_map':   _pre_sim_name_map,
                         'tuo_cmd':         getattr(self, '_last_tuo_cmd', None),
+                        'tuo_run':         getattr(self, '_last_tuo_run', None),
                     })
 
                 if battle_result:
@@ -13716,7 +13770,7 @@ $(document).ready(function(){
                                                       skip='0')
 
                 # ── Combat log: capture this turn (GW) ───────────────
-                _pre_sim_states = dict(_gw_card_states)
+                _pre_sim_states = {_k: (dict(_v) if isinstance(_v, dict) else _v) for _k, _v in _gw_card_states.items()}
                 # See arena equivalent: skip UIDs reused by a new alive card,
                 # mark cumulatively-killed UIDs as h=0 unless reoccupied.
                 # (_gw_killed/_gw_field_hp/_gw_card_map only exist if sim_deck
@@ -13758,6 +13812,7 @@ $(document).ready(function(){
                         'card_map':        _pre_sim_card_map,
                         'card_name_map':   _pre_sim_name_map,
                         'tuo_cmd':         getattr(self, '_last_tuo_cmd', None),
+                        'tuo_run':         getattr(self, '_last_tuo_run', None),
                     })
 
                 if not battle_result or battle_result.get('result') not in (True, 1, '1', 'true'):

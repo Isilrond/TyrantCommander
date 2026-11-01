@@ -988,10 +988,10 @@ void prepend_on_death(Field* fd, bool paybacked=false)
                          avenge_value);
                 if (!adj_status->m_sundered)
                 {
-                    // Observed in the real game: an Avenge trigger wipes the attack gained from Berserk so far
-                    // (attack = base + avenge total + Berserk gained afterwards)
-                    adj_status->m_perm_attack_buff -= std::min(adj_status->m_berserk_attack, adj_status->m_perm_attack_buff);
-                    adj_status->m_berserk_attack = 0;
+                    // An Avenge trigger only ADDS its value; the attack gained from Berserk stays.
+                    // (Real game, HackjuneL log: Nexor's Eye hit with 17 + 314 + 39 = 370 right after its Avenge
+                    // trigger, 314 = Berserk 208+52+39 gained before + Avenge 15. The game reports the sum as
+                    // 'avenge_attack', which is why the script drops its own Berserk sum at an Avenge on import.)
                     adj_status->m_perm_attack_buff += avenge_value;
                 }
                 adj_status->ext_hp(avenge_value);

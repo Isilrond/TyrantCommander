@@ -820,15 +820,17 @@ def check_log(path):
         compare_hs(exp_own,   actual_hs,  'OWN',   turn_issues)
         compare_hs(exp_enemy, actual_ehs, 'ENEMY', turn_issues)
 
-        # The API reports a berserk_attack that is too high right after an Enrage-boosted attack
-        # (seen: 43 reported while the unit really hit with 29; both agree again one turn later).
-        # The script sums the berserk events, which matches the real damage, so an API value
-        # above the script's is only a warning. A script value above the API's stays an issue.
+        # Logs of script versions before 2026.10.31-12 show a berserk_attack that is too high right after an
+        # Enrage-boosted attack (seen: 43 logged while the unit really hit with 29; both agree again one turn
+        # later). Cause was a log artifact: the pre-play snapshot was a shallow copy and the berserk sum was
+        # written into the shared card dict after the snapshot (the sim got the correct value). The script sums
+        # the berserk events, which matches the real damage, so a logged value above the script's is only a
+        # warning (own and enemy side). A script value above the logged one stays an issue.
         _kept = []
         for _m in turn_issues:
-            _mm = re.search(r"ENEMY WRONG 'berserk_attack': expected=(\d+) actual=(\d+)", _m)
+            _mm = re.search(r"(?:OWN|ENEMY) WRONG 'berserk_attack': expected=(\d+) actual=(\d+)", _m)
             if _mm and int(_mm.group(1)) > int(_mm.group(2)):
-                soft_warns.setdefault(turn_num, []).append(' ' + _m.strip() + '  [API ahead of the berserk events]')
+                soft_warns.setdefault(turn_num, []).append(' ' + _m.strip() + '  [logged value ahead of the berserk events]')
             else:
                 _kept.append(_m)
         turn_issues = _kept
