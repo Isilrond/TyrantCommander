@@ -37,6 +37,9 @@ INT_FLAGS  = {
     'enhance_fortify', 'enhance_hunt', 'enhance_inhibit', 'enhance_leech',
     'enhance_legion', 'enhance_mark', 'enhance_poison', 'enhance_stasis',
     'enhance_swipe', 'enhance_tribute', 'enhance_venom', 'enhance_refresh',
+    # Enhance targets in the card data without a log example so far (mostly old event cards)
+    'enhance_absorb', 'enhance_pierce', 'enhance_weaken', 'enhance_rupture', 'enhance_strike', 'enhance_protect',
+    'enhance_enfeeble', 'enhance_sunder', 'enhance_mimic', 'enhance_revenge', 'enhance_rally',
 }
 BOOL_FLAGS = {'jammed', 'overloaded', 'sunder', 'enrage'}
 # cmd_damage = commander damage handed to the sim (derived from events, not an API card state)
@@ -734,7 +737,12 @@ def check_log(path):
             enemy_summon_range = []
 
             # Process in hand-state order: match each entry to the best unassigned UID
-            def _assign_entries(hs_entries, result_list, skip_counts=None):
+            # Tie-break only: summon UIDs 152-199 normally belong to the side whose commander is 150,
+            # 52-99 to the other side (same card names on both sides, e.g. Gehennic Gigant, otherwise
+            # tie on the first, lower UID = the other side's card).
+            _own_high = any(u in (150, 151) for u in own_range)
+
+            def _assign_entries(hs_entries, result_list, skip_counts=None, prefer_high=None):
                 _skips = dict(skip_counts or {})
                 for base, entry_flags in hs_entries:
                     # Skip if already covered by a non-summon UID (e.g. dominion with same name)
@@ -747,6 +755,8 @@ def check_log(path):
                         if uid_i in assigned or cbase != base:
                             continue
                         s = _match_score(cflag_set, entry_flags)
+                        if prefer_high is not None:
+                            s += 0.5 if ((uid_i >= 152) == prefer_high) else 0
                         if best_score is None or s > best_score:
                             best_score = s
                             best = uid_i
@@ -782,8 +792,8 @@ def check_log(path):
                     _nm = name_map.get(str(_u), '').rsplit('-', 1)[0].strip().lower()
                     if _nm: _dom_enemy_counts[_nm] += 1
 
-            _assign_entries(own_hs_entries,   own_summon_range,   _dom_own_counts)
-            _assign_entries(enemy_hs_entries, enemy_summon_range, _dom_enemy_counts)
+            _assign_entries(own_hs_entries,   own_summon_range,   _dom_own_counts,   prefer_high=_own_high)
+            _assign_entries(enemy_hs_entries, enemy_summon_range, _dom_enemy_counts, prefer_high=(not _own_high))
 
             assault_dom_own   = [u for u in own_range   if u < 52 or (100 <= u < 152)]
             assault_dom_enemy = [u for u in enemy_range if u < 52 or (100 <= u < 152)]

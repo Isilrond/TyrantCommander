@@ -600,6 +600,29 @@ static void apply_live_state(CardStatus* status, const std::map<std::string, int
         status->m_enhanced_value[Skill::mortar] = f.at("enhance_besiege");
     if (f.count("enhance_refresh"))
         status->m_enhanced_value[Skill::refresh] = f.at("enhance_refresh");
+    // Enhance targets that exist in the card data (tu_data.json) but were not imported before (mostly old event cards)
+    if (f.count("enhance_absorb"))
+        status->m_enhanced_value[Skill::absorb] = f.at("enhance_absorb");
+    if (f.count("enhance_pierce"))
+        status->m_enhanced_value[Skill::pierce] = f.at("enhance_pierce");
+    if (f.count("enhance_weaken"))
+        status->m_enhanced_value[Skill::weaken] = f.at("enhance_weaken");
+    if (f.count("enhance_rupture"))
+        status->m_enhanced_value[Skill::rupture] = f.at("enhance_rupture");
+    if (f.count("enhance_strike"))
+        status->m_enhanced_value[Skill::strike] = f.at("enhance_strike");
+    if (f.count("enhance_protect"))
+        status->m_enhanced_value[Skill::protect] = f.at("enhance_protect");
+    if (f.count("enhance_enfeeble"))
+        status->m_enhanced_value[Skill::enfeeble] = f.at("enhance_enfeeble");
+    if (f.count("enhance_sunder"))
+        status->m_enhanced_value[Skill::sunder] = f.at("enhance_sunder");
+    if (f.count("enhance_mimic"))
+        status->m_enhanced_value[Skill::mimic] = f.at("enhance_mimic");
+    if (f.count("enhance_revenge"))
+        status->m_enhanced_value[Skill::revenge] = f.at("enhance_revenge");
+    if (f.count("enhance_rally"))
+        status->m_enhanced_value[Skill::rally] = f.at("enhance_rally");
     // Disease
     if (f.count("disease"))
         status->m_diseased = f.at("disease");
