@@ -156,7 +156,7 @@ _DROPS_POSITIVE_RALLY = False
 def _set_rally_mode(script_version):
     """Set _DROPS_POSITIVE_RALLY for the log being checked from its script_version."""
     global _DROPS_POSITIVE_RALLY
-    m = re.match(r'^(\d+)\.(\d+)\.(\d+)-(\d+)$', str(script_version or ''))
+    m = re.match(r'^(\d+)\.(\d+)\.(\d+)-(\d+)[a-z]?$', str(script_version or ''))  # -14b etc.: letter suffix = same number
     _DROPS_POSITIVE_RALLY = (not m) or (tuple(int(x) for x in m.groups()) < (2026, 10, 30, 7))
 
 
