@@ -146,13 +146,16 @@ if DEBUG_MODE:
 
 # Script version: written into every combat log, so old logs can be told apart from fixed behaviour.
 # Format YYYY.MM.DD-N; raise it with every behaviour change.
-SCRIPT_VERSION = "2026.10.31-12"
+SCRIPT_VERSION = "2026.11.04-21"
+# Forecast = flex value of the card that is played (known before the card is played). When it differs from
+# the reorder forecast by at least this many points, the turn gets a marker in the log and on the console.
+FORECAST_DIFF_FLAG = 40
 # Flexible mode, probe games per hand card: FLEX_SIM_ITER inside the forecast simulation (every simulated
 # game decides its cards with it, so it is the big time factor), FLEX_PICK_ITER for the single card choice run
 # of the real turn. More = more exact, slower.
 FLEX_SIM_ITER = 50
 LIVE_REORDER_N = 5000    # simulated games of the live forecast per turn (was 10000)
-FLEX_PICK_ITER = 100
+FLEX_PICK_ITER = 300
 
 import json
 import xml.etree.ElementTree as ET
@@ -3423,6 +3426,7 @@ $(document).ready(function(){
             ("mini_packs_36i.xml",      base_url + "mini_packs_36i.xml"),
             ("assetbundles5_4_2.xml",   base_url + "assetbundles5_4_2.xml"),
             ("assetbundles4_6.xml",     base_url + "assetbundles4_6.xml"),
+            ("codex.xml",              base_url + "codex.xml"),
         ]
         for i in range(1, 22):
             files_to_download.append((f"cards_section_{i}.xml", base_url + f"cards_section_{i}.xml"))
@@ -7007,6 +7011,704 @@ $(document).ready(function(){
         if skipped:
             print(f"\n  ({skipped} file(s) without a clear result skipped)")
 
+    # ── Log analysis reports (Menu F > 9) ─────────────────────────────────────────────────────────
+
+    LOGREP_CACHE_VERSION = 1
+
+    @staticmethod
+    def _logrep_parse(path, size):
+        """Reduce one combat log JSON to a small record (None = not a finished WIN/LOSS fight)."""
+        import json as _json, re as _re
+        try:
+            with open(path, encoding='utf-8') as f:
+                d = _json.load(f)
+        except Exception:
+            return {'bad': 1, 'sz': size}
+        res = str(d.get('result', '')).upper()
+        if res not in ('WIN', 'LOSS'):
+            return {'bad': 1, 'sz': size}
+        tb = d.get('tuo_build') or {}
+        cards = sorted(_re.sub(r'-\d+$', '', c.strip()) for c in str(d.get('my_deck') or '').split(',') if c.strip())
+        turns = []
+        for t in (d.get('turns') or []):
+            fc = t.get('forecast') or {}
+            turns.append([t.get('turn'), t.get('tuo_win_pct'), fc.get('reorder'), 1 if t.get('enemy_deck_known') else 0])
+        return {'sz': size, 'win': 1 if res == 'WIN' else 0, 'mode': d.get('mode') or '?',
+                'acct': d.get('account') or '?', 'enemy': d.get('enemy_name') or '?',
+                'ver': str(d.get('script_version') or ''), 'tuo': str(tb.get('sha12') or tb.get('mtime') or '-'),
+                'deck': ', '.join(cards), 'turns': turns}
+
+    def _logrep_index(self, min_version=''):
+        """Light index of all combat logs in combatlog/ and combatlog_archiv/ (suspicious/ skipped, duplicate file names
+        counted once). Parsing the large JSON files is slow, so every record is cached in export/log_index_cache.json
+        (keyed by file name and size); only new or changed files are parsed again. Returns records sorted by time."""
+        import json as _json
+        export_dir = os.path.join(SCRIPT_DIR, 'export')
+        cache_path = os.path.join(export_dir, 'log_index_cache.json')
+        cache = {}
+        try:
+            with open(cache_path, encoding='utf-8') as f:
+                c = _json.load(f)
+            if c.get('v') == self.LOGREP_CACHE_VERSION:
+                cache = c.get('rec', {})
+        except Exception:
+            cache = {}
+        files = {}
+        for base in (os.path.join(SCRIPT_DIR, 'combatlog'), os.path.join(SCRIPT_DIR, 'combatlog_archiv')):
+            if not os.path.isdir(base):
+                continue
+            for root, dirs, fnames in os.walk(base):
+                dirs[:] = [d for d in dirs if d.lower() != 'suspicious']
+                for fn in fnames:
+                    if fn.endswith('.json') and fn not in files:
+                        p = os.path.join(root, fn)
+                        try:
+                            files[fn] = (p, os.path.getsize(p))
+                        except OSError:
+                            pass
+        todo = [fn for fn, (p, sz) in files.items() if not (fn in cache and cache[fn].get('sz') == sz)]
+        new_cache = {fn: cache[fn] for fn in files if fn in cache and cache[fn].get('sz') == files[fn][1]}
+        if todo:
+            print(f"\n  Indexing {len(todo)} new combat log(s) (first run can take a few minutes, later runs are fast)...")
+        done = 0
+        try:
+            for fn in todo:
+                p, sz = files[fn]
+                new_cache[fn] = self._logrep_parse(p, sz)
+                done += 1
+                if done % 500 == 0:
+                    print(f"    {done}/{len(todo)}")
+        except KeyboardInterrupt:
+            print("\n  ⚠ Indexing aborted - partial index saved, run again to continue")
+        finally:
+            if todo:
+                try:
+                    os.makedirs(export_dir, exist_ok=True)
+                    with open(cache_path, 'w', encoding='utf-8') as f:
+                        _json.dump({'v': self.LOGREP_CACHE_VERSION, 'rec': new_cache}, f)
+                except Exception as e:
+                    print(f"  ⚠ Index cache not written: {e}")
+        recs = []
+        for fn in sorted(files):
+            r = new_cache.get(fn)
+            if not r or r.get('bad'):
+                continue
+            if min_version and r['ver'] < min_version:
+                continue
+            r = dict(r)
+            r['fn'] = fn
+            r['day'] = fn[:8]
+            r['hour'] = fn[9:11]
+            recs.append(r)
+        recs.sort(key=lambda r: r['fn'])
+        return recs
+
+    def _logrep_write(self, name, lines):
+        """Print a report and write it to export/<name>.txt."""
+        print("\n" + "\n".join(lines))
+        try:
+            export_dir = os.path.join(SCRIPT_DIR, 'export')
+            os.makedirs(export_dir, exist_ok=True)
+            path = os.path.join(export_dir, name + '.txt')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(lines) + "\n")
+            print(f"\n  ✓ Report written to {path}")
+        except Exception as e:
+            print(f"\n  ⚠ Report file not written: {e}")
+
+    def report_winrate_trends(self, min_version='', min_fights=10):
+        """Menu F > 9 > 1. Win rate by day, hour, script version and TUO build, plus same-account comparisons
+        (earlier days vs latest day, newest TUO build vs its predecessor) that remove account/deck mix effects."""
+        from collections import defaultdict
+        recs = self._logrep_index(min_version)
+        if not recs:
+            print("\n  ✗ No usable combat logs found")
+            return
+        out = []
+        P = out.append
+        P(f"WIN RATE TRENDS  |  {len(recs)} fights  |  script version >= {min_version or 'any'}")
+        P("")
+
+        def table(title, keyf, mode=None, minn=1):
+            g = defaultdict(lambda: [0, 0])
+            for r in recs:
+                if mode and r['mode'] != mode:
+                    continue
+                k = keyf(r)
+                g[k][0] += 1
+                g[k][1] += r['win']
+            P(title)
+            for k in sorted(g):
+                n, w = g[k]
+                if n >= minn:
+                    P(f"  {str(k):<28} {n:>6} fights  {100.0 * w / n:>6.1f} % wins")
+            P("")
+
+        for mode in ('brawl', 'arena'):
+            table(f"== {mode}: by day ==", lambda r: r['day'], mode)
+        table("== brawl: by day and hour (>= 5 fights) ==", lambda r: f"{r['day']} {r['hour']}h", 'brawl', 5)
+        for mode in ('brawl', 'arena'):
+            table(f"== {mode}: by script version ==", lambda r: r['ver'], mode)
+            table(f"== {mode}: by TUO build ==", lambda r: r['tuo'], mode)
+        table("== brawl: enemy deck only partly known? ==",
+              lambda r: 'partly known' if any(t[3] for t in r['turns']) else 'complete / unknown', 'brawl')
+
+        def p1bucket(r):
+            p = r['turns'][0][1] if r['turns'] else None
+            if p is None:
+                return 'n/a'
+            lo = min(int(p // 20) * 20, 80)
+            return f"{lo:02d}-{lo + 20:02d} %"
+        table("== brawl: first-turn forecast bucket ==", p1bucket, 'brawl')
+
+        def paired(title, is_new, rs):
+            P(title)
+            for mode in ('brawl', 'arena'):
+                a = defaultdict(lambda: [0, 0])
+                b = defaultdict(lambda: [0, 0])
+                for r in rs:
+                    if r['mode'] != mode:
+                        continue
+                    t = b if is_new(r) else a
+                    t[r['acct']][0] += 1
+                    t[r['acct']][1] += r['win']
+                common = [k for k in a if k in b and a[k][0] >= min_fights and b[k][0] >= min_fights]
+                if not common:
+                    P(f"  {mode:<6} no account with >= {min_fights} fights in both groups")
+                    continue
+                na = sum(a[k][0] for k in common); wa = sum(a[k][1] for k in common)
+                nb = sum(b[k][0] for k in common); wb = sum(b[k][1] for k in common)
+                dm = sum(b[k][1] / b[k][0] - a[k][1] / a[k][0] for k in common) / len(common) * 100.0
+                P(f"  {mode:<6} {len(common)} accounts: earlier {100.0 * wa / na:5.1f} % ({na}) | new {100.0 * wb / nb:5.1f} % ({nb})"
+                  f" | diff {100.0 * wb / nb - 100.0 * wa / na:+.1f} | mean per-account diff {dm:+.1f}")
+            P("")
+
+        days = sorted({r['day'] for r in recs})
+        if len(days) > 1:
+            last = days[-1]
+            paired(f"== same accounts: earlier days vs {last} ==", lambda r: r['day'] == last, recs)
+        first = {}
+        for r in recs:
+            if r['tuo'] != '-' and r['tuo'] not in first:
+                first[r['tuo']] = r['fn'][:15]
+        order = sorted(first, key=lambda k: first[k])
+        if len(order) > 1:
+            newb, prevb = order[-1], order[-2]
+            P_title = f"== same accounts: newest TUO build {newb} (from {first[newb]}) vs predecessor {prevb} (from {first[prevb]}) =="
+            paired(P_title, lambda r: r['tuo'] == newb, [r for r in recs if r['tuo'] in (newb, prevb)])
+
+        P("== opponent strength proxy: mean first-turn forecast vs real win rate (mode / script version) ==")
+        g2 = defaultdict(lambda: [0, 0.0, 0])
+        for r in recs:
+            if r['turns'] and r['turns'][0][1] is not None:
+                k = (r['mode'], r['ver'])
+                g2[k][0] += 1
+                g2[k][1] += r['turns'][0][1]
+                g2[k][2] += r['win']
+        for k in sorted(g2):
+            n, sp, w = g2[k]
+            P(f"  {k[0]:<6} {k[1]:<16} {n:>6} fights | mean forecast T1 {sp / n:5.1f} % | win rate {100.0 * w / n:5.1f} %")
+        P("")
+        gd = defaultdict(lambda: [set(), 0])
+        for r in recs:
+            if r['mode'] == 'brawl':
+                gd[r['day']][0].add(r['enemy'])
+                gd[r['day']][1] += 1
+        P("== brawl: distinct opponents per day ==")
+        for k in sorted(gd):
+            P(f"  {k}  {len(gd[k][0])} opponents, {gd[k][1]} fights")
+        self._logrep_write('report_winrate_trends', out)
+
+    def report_forecast_calibration(self, min_version=''):
+        """Menu F > 9 > 2. Compares the forecast shown each turn (and the raw reorder value) with the real fight result:
+        Brier score (lower = better) and a calibration table (forecast bucket vs real win rate)."""
+        recs = self._logrep_index(min_version)
+        if not recs:
+            print("\n  ✗ No usable combat logs found")
+            return
+        rows = []   # (turn, shown, reorder, win, mode, partly-known deck)
+        for r in recs:
+            for t in r['turns']:
+                if t[1] is not None and t[0] is not None:
+                    rows.append((t[0], t[1], t[2], r['win'], r['mode'], bool(t[3])))
+        nw = sum(r['win'] for r in recs)
+        out = []
+        P = out.append
+        P(f"FORECAST CALIBRATION  |  script version >= {min_version or 'any'}  |  {len(recs)} fights ({nw} wins = {100.0 * nw / len(recs):.1f} %)  |  {len(rows)} turn forecasts")
+        P("")
+
+        def brier(rs, i):
+            v = [(r[i] / 100.0 - r[3]) ** 2 for r in rs if r[i] is not None]
+            return (sum(v) / len(v), len(v)) if v else (None, 0)
+
+        def block(title, rs):
+            P(title)
+            b, n = brier(rs, 1)
+            r_, n2 = brier(rs, 2)
+            bs = f"{b:.4f}" if b is not None else '-'
+            rs_ = f"{r_:.4f}" if r_ is not None else '-'
+            P(f"  Brier shown {bs} (n={n}) | Brier reorder {rs_} (n={n2})   [lower = better]")
+            P(f"  {'forecast':<12} {'turns':>6} {'mean fcst':>10} {'real wins':>10}")
+            for lo, hi in ((0, 10), (10, 30), (30, 50), (50, 70), (70, 90), (90, 98), (98, 100.01)):
+                s = [r for r in rs if lo <= r[1] < hi]
+                if s:
+                    P(f"  {lo:>3g}-{min(hi, 100):<8g} {len(s):>6} {sum(r[1] for r in s) / len(s):>9.1f}% {100.0 * sum(r[3] for r in s) / len(s):>9.1f}%")
+            P("")
+
+        block("== turns 1-5 (where card choices are made) ==", [r for r in rows if r[0] <= 5])
+        block("== turns 6-9 ==", [r for r in rows if 6 <= r[0] <= 9])
+        block("== turns 1-9, enemy deck complete / unknown ==", [r for r in rows if r[0] <= 9 and not r[5]])
+        block("== turns 1-9, enemy deck only partly known ==", [r for r in rows if r[0] <= 9 and r[5]])
+        for m in ('arena', 'brawl'):
+            block(f"== turns 1-9, {m} ==", [r for r in rows if r[0] <= 9 and r[4] == m])
+        self._logrep_write('report_forecast_calibration', out)
+
+    def report_deck_changes(self, min_version='', min_fights=20):
+        """Menu F > 9 > 3. Accounts whose deck changed (in time order, win rate per deck) and the most played decks.
+        The card order inside a deck is ignored."""
+        from collections import defaultdict
+        recs = self._logrep_index(min_version)
+        if not recs:
+            print("\n  ✗ No usable combat logs found")
+            return
+        out = []
+        P = out.append
+        P(f"DECK CHANGES  |  {len(recs)} fights  |  script version >= {min_version or 'any'}")
+        P("")
+        by_acct = defaultdict(list)
+        for r in recs:
+            by_acct[(r['acct'], r['mode'])].append(r)
+        P("== accounts with a deck change (per account and mode, decks in time order) ==")
+        n_chg = 0
+        for (a, m), rs in sorted(by_acct.items(), key=lambda x: (x[0][0].lower(), x[0][1])):
+            decks = []
+            for r in rs:
+                if not decks or decks[-1][0] != r['deck']:
+                    decks.append([r['deck'], 0, 0, r['fn'][:13]])
+                decks[-1][1] += 1
+                decks[-1][2] += r['win']
+            if len({x[0] for x in decks}) > 1:
+                n_chg += 1
+                P(f"  {a} [{m}]: {len(rs)} fights")
+                for i, (dk, n, w, ts) in enumerate(decks, 1):
+                    P(f"    #{i} from {ts} | {n:>4} fights | {100.0 * w / n:5.1f} % | {dk[:110]}")
+        if not n_chg:
+            P("  none")
+        P("")
+        for mode in ('brawl', 'arena'):
+            g = defaultdict(lambda: [0, 0, set()])
+            for r in recs:
+                if r['mode'] == mode:
+                    g[r['deck']][0] += 1
+                    g[r['deck']][1] += r['win']
+                    g[r['deck']][2].add(r['acct'])
+            P(f"== {mode}: most played decks (>= {min_fights} fights) ==")
+            for dk, (n, w, acc) in sorted(g.items(), key=lambda x: -x[1][0]):
+                if n >= min_fights:
+                    P(f"  {n:>5} fights | {100.0 * w / n:5.1f} % | {len(acc)} accounts | {dk[:110]}")
+            P("")
+        self._logrep_write('report_deck_changes', out)
+
+    def report_sim_ranking(self, sim_dir='', since='', min_deck_fights=10):
+        """Menu F > 9 > 4. Does the ranking of the accounts in your TUO sim result files (attack sims against the cleaned
+        gauntlet, e.g. 2_BRAWL_attack_random.txt / 1_ARENA_random.txt) match the real win rates? Reports the rank
+        correlation (Spearman) and the win rate of the sim-value thirds. Defense sims (name contains 'def') are ignored."""
+        import re as _re
+        from collections import defaultdict
+        sim_dir = sim_dir or os.path.join(SCRIPT_DIR, 'import')
+        if not os.path.isdir(sim_dir):
+            print(f"\n  ✗ Sim folder not found: {sim_dir}")
+            return
+
+        def cards_of(s):
+            return tuple(sorted(_re.sub(r'-\d+$', '', c.strip()) for c in str(s or '').split(',') if c.strip()))
+
+        def ranks(v):
+            idx = sorted(range(len(v)), key=lambda i: v[i])
+            r = [0.0] * len(v)
+            i = 0
+            while i < len(idx):
+                j = i
+                while j + 1 < len(idx) and v[idx[j + 1]] == v[idx[i]]:
+                    j += 1
+                for k in range(i, j + 1):
+                    r[idx[k]] = (i + j) / 2.0 + 1
+                i = j + 1
+            return r
+
+        def pearson(x, y):
+            n = len(x)
+            mx = sum(x) / n
+            my = sum(y) / n
+            sx = sum((a - mx) ** 2 for a in x) ** .5
+            sy = sum((b - my) ** 2 for b in y) ** .5
+            return sum((a - mx) * (b - my) for a, b in zip(x, y)) / (sx * sy) if sx and sy else float('nan')
+
+        found = {}   # mode -> newest matching file
+        for fn in os.listdir(sim_dir):
+            fl = fn.lower()
+            full = os.path.join(sim_dir, fn)
+            if not os.path.isfile(full) or '.txt' not in fl or 'random' not in fl or 'def' in fl:
+                continue
+            mode = 'arena' if 'arena' in fl else ('brawl' if 'brawl' in fl else None)
+            if mode and (mode not in found or os.path.getmtime(full) > os.path.getmtime(found[mode])):
+                found[mode] = full
+        if not found:
+            print(f"\n  ✗ No attack sim file (name with ARENA/BRAWL and 'random') found in {sim_dir}")
+            return
+        recs = self._logrep_index('')
+        out = []
+        P = out.append
+        P(f"SIM RANKING VS REAL WIN RATE  |  sim folder {sim_dir}  |  logs since {since or 'beginning'}")
+        for mode, simfile in sorted(found.items()):
+            sim = {}
+            with open(simfile, encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    m = _re.match(r'\s*(\S+)\s*:\s*Optimized Deck:.*?\$\d+\s+([\d.]+):\s*(.*)$', line)
+                    if m:
+                        sim[m.group(1).lower()] = (m.group(1), float(m.group(2)), cards_of(m.group(3)))
+            P("")
+            P("=" * 70)
+            P(f"{mode}: {simfile}  ({len(sim)} accounts in the sim file)")
+            stats = defaultdict(lambda: {'all': [0, 0], 'same': [0, 0]})
+            for r in recs:
+                if r['mode'] != mode or r['fn'][:8] < (since or '00000000'):
+                    continue
+                a = str(r['acct']).lower()
+                if a not in sim:
+                    continue
+                s = stats[a]
+                s['all'][0] += 1
+                s['all'][1] += r['win']
+                if cards_of(r['deck']) == sim[a][2]:
+                    s['same'][0] += 1
+                    s['same'][1] += r['win']
+            rows = []
+            for a, (name, v, dk) in sim.items():
+                s = stats.get(a)
+                if s and s['all'][0]:
+                    rows.append((v, name, s['all'][0], s['all'][1] / s['all'][0] * 100, s['same'][0],
+                                 (s['same'][1] / s['same'][0] * 100) if s['same'][0] else None))
+            rows.sort(reverse=True)
+            P("")
+            P(f"{'account':<16} {'sim':>7} | {'fights':>6} {'rate':>7} | {'w/ sim deck':>11} {'rate':>7}")
+            for v, name, n, q, n2, q2 in rows:
+                P(f"{name:<16} {v:>7.2f} | {n:>6} {q:>6.1f}% | {n2:>11} {(f'{q2:.1f}%' if q2 is not None else '-'):>7}")
+            P("")
+
+            def corr(title, pts):
+                if len(pts) < 5:
+                    P(f"{title}: too few accounts")
+                    return
+                x = [p[0] for p in pts]
+                y = [p[1] for p in pts]
+                rho = pearson(ranks(x), ranks(y))
+                n = len(pts)
+                t = rho * ((n - 2) / max(1e-9, 1 - rho * rho)) ** .5
+                P(f"{title}: {n} accounts | Spearman rank correlation {rho:.2f} | t={t:.1f}  (|t| > 2: unlikely to be chance)")
+            corr("All logs of the accounts", [(r[0], r[3]) for r in rows])
+            corr(f"Only fights with the sim deck (>= {min_deck_fights} fights)",
+                 [(r[0], r[5]) for r in rows if r[4] >= min_deck_fights and r[5] is not None])
+            edges = sorted(r[0] for r in rows)
+            if len(edges) >= 6:
+                q1 = edges[len(edges) // 3]
+                q2 = edges[2 * len(edges) // 3]
+                P("")
+                P("Thirds by sim value:")
+                for lab, test in (('lower', lambda v: v < q1), ('middle', lambda v: q1 <= v < q2), ('upper', lambda v: v >= q2)):
+                    g = [r for r in rows if test(r[0])]
+                    n = sum(r[2] for r in g)
+                    w = sum(r[2] * r[3] / 100 for r in g)
+                    P(f"  {lab:<7} sim {min(r[0] for r in g):5.1f}-{max(r[0] for r in g):5.1f} | {len(g):>2} accounts | {n:>5} fights | win rate {100 * w / max(n, 1):.1f} %")
+        self._logrep_write('report_sim_ranking', out)
+
+    def log_reports_menu(self):
+        """Menu F > 6. Submenu with the combat log analysis reports. Every parameter is asked here (Enter = default)."""
+        def ask(prompt, default):
+            v = input_with_esc(f"  {prompt} [{default if str(default) else 'all'}]: ", allow_empty=True)
+            if v is None:
+                return None
+            v = v.strip()
+            return v if v else str(default)
+
+        def ask_int(prompt, default):
+            v = ask(prompt, default)
+            if v is None:
+                return None
+            try:
+                return int(v)
+            except ValueError:
+                print(f"  ✗ Not a number, using {default}")
+                return default
+
+        while True:
+            print("\n" + "=" * 52)
+            print("  LOG ANALYSIS REPORTS")
+            print("=" * 52)
+            print("  1.   Win rate trends (day / hour / version / TUO build / same accounts)")
+            print("  2.   Forecast calibration (forecast vs. real win rate)")
+            print("  3.   Deck changes per account")
+            print("  4.   Sim ranking vs. real win rate (needs sim files in import/)")
+            print("  5.   Check Suspicious Combat Logs (Loss ≥95% / Win ≤5%)")
+            print("  6.   Win Rate per Mode and Account (from Combat Logs)")
+            print("  7.   Brawl Opponent Match Log Analysis (pattern search)")
+            print("  8.   Replay Check of the suspicious logs (re-run the forecasts with tuo.exe, 20000 games)")
+            print("─" * 52)
+            print("  0.   ← Back")
+            print("=" * 52)
+            print(f"  Logs are read from combatlog/ and combatlog_archiv/ (suspicious/ is skipped). ESC = cancel a question.")
+            try:
+                c = input("\n  Select: ").strip()
+            except KeyboardInterrupt:
+                print("\n\n  ⚠ Aborted - returning to menu")
+                return
+            if c == "0":
+                return
+            try:
+                if c == "1":
+                    mv = ask("Minimum script version, empty = all", "")
+                    if mv is None: continue
+                    mf = ask_int("Min. fights per account for the same-account comparison", 10)
+                    if mf is None: continue
+                    self.report_winrate_trends(mv if mv != '' else '', mf)
+                elif c == "2":
+                    mv = ask("Minimum script version", SCRIPT_VERSION)
+                    if mv is None: continue
+                    self.report_forecast_calibration(mv)
+                elif c == "3":
+                    mv = ask("Minimum script version, empty = all", "")
+                    if mv is None: continue
+                    mf = ask_int("List decks with at least N fights", 20)
+                    if mf is None: continue
+                    self.report_deck_changes(mv, mf)
+                elif c == "4":
+                    sd = ask("Folder with the sim result files", os.path.join(SCRIPT_DIR, 'import'))
+                    if sd is None: continue
+                    sc = ask("Use only logs since (YYYYMMDD), empty = all", "")
+                    if sc is None: continue
+                    mdf = ask_int("Min. fights with the sim deck for the second correlation", 10)
+                    if mdf is None: continue
+                    self.report_sim_ranking(sd, sc, mdf)
+                elif c == "5":
+                    self.check_suspicious_combat_logs()
+                elif c == "6":
+                    self.combat_log_winrates()
+                elif c == "7":
+                    self.analyze_brawl_matchlog()
+                elif c == "8":
+                    self.run_replay_check_menu(ask, ask_int)
+                else:
+                    print("✗ Invalid option")
+                    continue
+            except KeyboardInterrupt:
+                print("\n\n  ⚠ Aborted - returning to menu")
+                continue
+            input("\n[ENTER] to continue...")
+
+    def run_replay_check_menu(self, ask, ask_int):
+        """Menu F > 6 > 8. Starts replay_check.py (same folder as this script) on combatlog/suspicious: recalculates the
+        conspicuous turns with many more games (A replay, B enemy deck completed with the cards really played,
+        optional C flex-iter). Read only; result in replay_check.txt / replay_check.csv (resumable)."""
+        import subprocess
+        script = os.path.join(SCRIPT_DIR, 'replay_check.py')
+        sus = os.path.join(SCRIPT_DIR, 'combatlog', 'suspicious')
+        if not os.path.isfile(script):
+            print(f"\n  ✗ replay_check.py not found next to the script ({script})")
+            return
+        if not os.path.isfile(self._tuo_path):
+            print(f"\n  ✗ tuo.exe not found at {self._tuo_path}")
+            return
+        if not os.path.isdir(sus) or not any(f.endswith('.json') for f in os.listdir(sus)):
+            print(f"\n  ✗ No logs in {sus} (run menu 5 first)")
+            return
+        print(f"\n  Logs: {sus}  ({sum(1 for f in os.listdir(sus) if f.endswith('.json'))} files)")
+        n = ask_int("Games per recalculation", 20000)
+        if n is None: return
+        lim = ask_int("Only the first N logs, 0 = all", 0)
+        if lim is None: return
+        wk = ask_int("Parallel tuo processes", 2)
+        if wk is None: return
+        th = ask_int("Threads per process", self.tuo_threads)
+        if th is None: return
+        fl = ask_int("Variant C flex-iter (live 50), 0 = off", 0)
+        if fl is None: return
+        al = ask("All turns instead of only the conspicuous ones (y/n)", "n")
+        if al is None: return
+        cmd = [sys.executable, script, sus, '--tuo', self._tuo_path, '--n', str(n), '--workers', str(wk),
+               '--threads', str(th), '--resume', '--out', os.path.join(SCRIPT_DIR, 'replay_check')]
+        if lim: cmd += ['--limit', str(lim)]
+        if fl: cmd += ['--flex-iter', str(fl)]
+        if al.lower().startswith('y'): cmd += ['--all-turns']
+        print("\n  Running replay_check (Ctrl+C aborts, run again to resume)...\n")
+        try:
+            subprocess.call(cmd, cwd=SCRIPT_DIR)
+        except KeyboardInterrupt:
+            print("\n  ⚠ Aborted - run again to resume")
+        print(f"\n  Result: {os.path.join(SCRIPT_DIR, 'replay_check.txt')} / replay_check.csv")
+
+    def analyze_brawl_matchlog(self):
+        """
+        Menu F > 8. Evaluates export/brawl_matchlog.jsonl (written for every assigned Brawl opponent) and looks for
+        patterns in the opponent assignment: repeat rates, pool size estimate, the known own-guild rule, guild and
+        time-of-day distribution, win rate and every numeric field the game sent with the match.
+        The report is printed and also written to export/brawl_matchlog_report.txt.
+        """
+        import sys, json, collections
+        from datetime import datetime
+        path = os.path.join(SCRIPT_DIR, 'export', 'brawl_matchlog.jsonl')
+        def load(p):
+            rows = []
+            with open(p, encoding='utf-8') as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        rows.append(json.loads(ln))
+                    except ValueError:
+                        pass
+            return rows
+
+        def expected_distinct(n_pool, n_draws):
+            return n_pool * (1 - (1 - 1 / n_pool) ** n_draws)
+
+        def estimate_pool(n_draws, n_distinct):
+            if n_distinct >= n_draws:
+                return None
+            lo, hi = n_distinct, 10_000_000
+            for _ in range(80):
+                mid = (lo + hi) / 2
+                if expected_distinct(mid, n_draws) < n_distinct:
+                    lo = mid
+                else:
+                    hi = mid
+            return int(round(hi))
+
+        def main(path):
+            out = []
+            P = out.append
+            if not os.path.isfile(path):
+                print(f"File not found: {path}")
+                return out
+            rows = load(path)
+            matches = [r for r in rows if r.get('type') == 'match']
+            results = {r.get('battle_id'): r for r in rows if r.get('type') == 'result'}
+            P(f"Brawl match log: {path}")
+            P(f"{len(matches)} matches, {len(results)} results\n")
+            if not matches:
+                return out
+
+            by_brawl = collections.defaultdict(list)
+            for m in matches:
+                by_brawl[m.get('brawl') or '?'].append(m)
+
+            for brawl, ms in sorted(by_brawl.items()):
+                ms.sort(key=lambda r: r.get('ts', ''))
+                P("=" * 70)
+                P(f"BRAWL: {brawl}   ({len(ms)} matches)")
+                P("=" * 70)
+                names = [m['enemy_name'] for m in ms]
+                cnt = collections.Counter(names)
+                accts = collections.Counter(m['account'] for m in ms)
+                P(f"accounts: {len(accts)}   distinct opponents: {len(cnt)}")
+                pool = estimate_pool(len(names), len(cnt))
+                if pool:
+                    P(f"pool size if drawn uniformly at random (estimate): about {pool}")
+                else:
+                    P("no repeats at all: pool size cannot be estimated (too few matches)")
+                top = [(n, c) for n, c in cnt.most_common(10) if c > 1]
+                if top:
+                    P("opponents seen more than once: " + ", ".join(f"{n} x{c}" for n, c in top))
+                # same opponent twice in a row per account
+                cons = tot = 0
+                per_acct = collections.defaultdict(list)
+                for m in ms:
+                    per_acct[m['account']].append(m)
+                for a, l in per_acct.items():
+                    for x, y in zip(l, l[1:]):
+                        tot += 1
+                        cons += x['enemy_name'] == y['enemy_name']
+                P(f"same opponent twice in a row (same account): {cons} of {tot} pairs")
+                # same opponent for several accounts
+                multi = collections.defaultdict(set)
+                for m in ms:
+                    multi[m['enemy_name']].add(m['account'])
+                shared = sum(1 for v in multi.values() if len(v) > 1)
+                P(f"opponents faced by more than one of your accounts: {shared} of {len(multi)}")
+
+                # own-guild rule
+                bad = [m for m in ms if m.get('own_guild') and m.get('enemy_guild_cached')
+                       and m['own_guild'].lower() == m['enemy_guild_cached'].lower()]
+                known = sum(1 for m in ms if m.get('enemy_guild_cached'))
+                P(f"own-guild rule: guild of the opponent known in {known} of {len(ms)} matches; "
+                  f"violations (opponent in own guild): {len(bad)}")
+                for m in bad[:5]:
+                    P(f"   !! {m['account']} ({m['own_guild']}) vs {m['enemy_name']}")
+                gc = collections.Counter(m['enemy_guild_cached'] for m in ms if m.get('enemy_guild_cached'))
+                if gc:
+                    P("opponent guilds: " + ", ".join(f"{g} x{c}" for g, c in gc.most_common(10)))
+
+                # time of day
+                hrs = collections.Counter()
+                for m in ms:
+                    try:
+                        hrs[datetime.fromisoformat(m['ts']).hour] += 1
+                    except Exception:
+                        pass
+                if hrs:
+                    P("matches per hour of day: " + " ".join(f"{h:02d}h:{hrs[h]}" for h in sorted(hrs)))
+
+                # position within the brawl for the account
+                pos_names = collections.defaultdict(collections.Counter)
+                for a, l in per_acct.items():
+                    for i, m in enumerate(l[:20], 1):
+                        pos_names[i][m['enemy_name']] += 1
+
+                # results
+                w = l_ = 0
+                for m in ms:
+                    r = results.get(m.get('battle_id'))
+                    if r:
+                        w += r.get('result') == 'WIN'
+                        l_ += r.get('result') == 'LOSS'
+                if w + l_:
+                    P(f"results: {w} WIN / {l_} LOSS ({100 * w / (w + l_):.1f} % wins)")
+
+                # numeric fields
+                cols = collections.defaultdict(list)
+                for m in ms:
+                    for grp in ('battle_data', 'active_brawl', 'player_brawl'):
+                        for k, v in (m.get(grp) or {}).items():
+                            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                                cols[f"{grp}.{k}"].append(v)
+                    if isinstance(m.get('own_points'), (int, float)):
+                        cols['own_points'].append(m['own_points'])
+                varying = {k: v for k, v in cols.items() if len(set(v)) > 1}
+                if varying:
+                    P("numeric fields that vary between matches:")
+                    for k, v in sorted(varying.items()):
+                        P(f"   {k:45s} n={len(v):4d} min={min(v)} mean={sum(v)/len(v):.1f} max={max(v)}")
+                P("")
+            return out
+
+
+        lines = main(path)
+        txt = "\n".join(lines)
+        print("\n" + "=" * 70)
+        print("  BRAWL OPPONENT MATCH LOG ANALYSIS")
+        print("=" * 70)
+        print(txt)
+        if os.path.isfile(path):
+            try:
+                rp = os.path.join(os.path.dirname(path), 'brawl_matchlog_report.txt')
+                with open(rp, 'w', encoding='utf-8') as f:
+                    f.write(txt + "\n")
+                print(f"\n  Report written to {rp}")
+            except Exception as e:
+                print(f"\n  (report file not written: {e})")
+        else:
+            print("\n  ✗ export/brawl_matchlog.jsonl does not exist yet - it is written during the Brawl auto-battle loop.")
+
     def check_suspicious_combat_logs(self):
         """
         Scans combatlog/ (all accounts) for suspicious battles and copies them to combatlog/suspicious/:
@@ -7058,8 +7760,14 @@ $(document).ready(function(){
             if result not in ('LOSS', 'WIN'):
                 continue
             turns = data.get('turns', []) or []
+            # Forecasts from the late fixed-order fallback (source 'reorder', <= 2 hand cards) are
+            # extreme and not comparable (100 -> 0 flips) -> not used for the suspicious check.
+            def _late_fb(_t):
+                _fc = _t.get('forecast') or {}
+                return bool(_fc.get('late_fallback')
+                            or (_fc.get('source') == 'reorder' and len(_t.get('hand') or []) <= 2))
             pcts = [(t.get('turn'), t.get('tuo_win_pct'), t.get('card_played'))
-                    for t in turns if t.get('tuo_win_pct') is not None]
+                    for t in turns if t.get('tuo_win_pct') is not None and not _late_fb(t)]
             if not pcts:
                 continue
             if result == 'LOSS':
@@ -9375,6 +10083,120 @@ $(document).ready(function(){
 
     # ==================== [S10] GAUNTLET DATA MERGE AND LIVE ENEMY-DECK LOOKUP ====================
 
+    def rebuild_brawl_gauntlet_from_arenagauntlet(self):
+        """
+        C->15: Rebuild export/Previous_Brawl.txt keeping the ORDER (ranks) of the
+        existing file, but taking the decks from arenagauntlet.txt.
+
+        Use case: after a Guild Brawl the leaderboard decks written by C->13/14
+        are unusable, while the player order is still valid.
+
+        Per entry (key = Previous_Brawl_<Name>_<Guild>_<Rank>) the deck is looked
+        up in arenagauntlet.txt: tier GUILD_ > WIN_ > LOSS_; within a tier an exact
+        Name_Guild match beats a name-only match; among equals the newest
+        '//Last seen on:' wins. Players without any entry stay in the file as a
+        comment line (order is kept, TUO ignores them) and are retried next run.
+        The original file is backed up to export/backup/ first.
+        """
+        import re as _re, shutil as _sh
+        export_dir = os.path.join(SCRIPT_DIR, 'export')
+        src = os.path.join(export_dir, 'Previous_Brawl.txt')
+        gfile = os.path.join(SCRIPT_DIR, 'arenagauntlet.txt')
+        print(f"\n{'='*65}\n  REBUILD PREVIOUS BRAWL GAUNTLET (order from file, decks from arenagauntlet.txt)\n{'='*65}")
+        if not os.path.isfile(src):
+            print(f"  ✗ {src} not found - run C->13 first"); return
+        if not os.path.isfile(gfile):
+            print(f"  ✗ {gfile} not found"); return
+
+        # ── read arenagauntlet.txt ─────────────────────────────────
+        TIERS = {'GUILD': 0, 'WIN': 1, 'LOSS': 2}
+        entries = []   # (tier_rank, key_part, last_seen, deck)
+        last_seen = ''
+        with open(gfile, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('//Last seen on:'):
+                    last_seen = line[len('//Last seen on:'):].strip(); continue
+                if not line or line.startswith('//'):
+                    continue
+                m = _re.match(r'^(GUILD|WIN|LOSS)_(.+?): (.+)$', line)
+                if m:
+                    entries.append((TIERS[m.group(1)], m.group(2), last_seen, m.group(3).strip()))
+                last_seen = ''
+
+        def _find(mid):
+            """mid = '<Name>_<Guild>' or '<Name>'; returns (deck, tier, exact) or None."""
+            names = {mid}
+            if '_' in mid:
+                names.add(mid.rsplit('_', 1)[0])
+            best = None
+            for tier, key, seen, deck in entries:
+                exact = (key == mid)
+                partial = (not exact) and any(key == n or key.startswith(n + '_') for n in names)
+                if not exact and not partial:
+                    continue
+                score = (tier, 0 if exact else 1, tuple(-ord(c) for c in seen))
+                if best is None or score < best[0]:
+                    best = (score, deck, tier, exact)
+            return None if best is None else (best[1], best[2], best[3])
+
+        # ── read current Previous_Brawl.txt (order) ───────────────
+        with open(src, 'r', encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        header = None
+        order = []   # (mid, rank)
+        for ln in lines:
+            t = ln.strip()
+            if t.startswith('//'):
+                t = t[2:].strip()
+            if header is None and _re.match(r'^Previous_Brawl: ', t):
+                header = t; continue
+            m = _re.match(r'^Previous_Brawl_(.+)_(\d+): ', t)
+            if m:
+                order.append((m.group(1), m.group(2)))
+        if not order:
+            print("  ✗ No entries found in Previous_Brawl.txt"); return
+        if header is None:
+            header = 'Previous_Brawl: /Previous_Brawl_.*$/'
+
+        # ── backup + write ─────────────────────────────────────────
+        bdir = os.path.join(export_dir, 'backup')
+        os.makedirs(bdir, exist_ok=True)
+        bpath = os.path.join(bdir, f"Previous_Brawl_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        _n = 1
+        while os.path.exists(bpath):
+            bpath = bpath[:-4].split('_x')[0] + f"_x{_n}.txt"; _n += 1
+        _sh.copy2(src, bpath)
+
+        out = [header]
+        stat = {'GUILD': 0, 'WIN': 0, 'LOSS': 0}
+        partial_n = 0
+        missing = []
+        names_t = {0: 'GUILD', 1: 'WIN', 2: 'LOSS'}
+        for mid, rank in order:
+            r = _find(mid)
+            key = f"Previous_Brawl_{mid}_{rank}"
+            if r:
+                out.append(f"{key}: {r[0]}")
+                stat[names_t[r[1]]] += 1
+                if not r[2]: partial_n += 1
+            else:
+                out.append(f"// {key}: [not in arenagauntlet.txt]")
+                missing.append(f"{rank}. {mid}")
+        with open(src, 'w', encoding='utf-8', newline='\n') as f:
+            f.write('\n'.join(out) + '\n')
+
+        found = sum(stat.values())
+        print(f"  Entries in order : {len(order)}")
+        print(f"  Decks found      : {found}  (GUILD {stat['GUILD']}, WIN {stat['WIN']}, LOSS {stat['LOSS']}; name-only match {partial_n})")
+        print(f"  Not found        : {len(missing)}  (kept as comment lines)")
+        for m_ in missing[:40]:
+            print(f"     - {m_}")
+        if len(missing) > 40:
+            print(f"     ... +{len(missing)-40} more")
+        print(f"  Written          : {src}")
+        print(f"  Backup           : {bpath}")
+
     def merge_arenagauntlet(self):
         """
         Merges arenagauntlet.txt files from SCRIPT_DIR/import/ into the main
@@ -10539,6 +11361,7 @@ $(document).ready(function(){
         import subprocess, re as _re, random as _random
 
         self._last_flex_pick = None      # set again below when the card choice run succeeds
+        self._last_forecast_info = None  # forecast source / reorder value / marker, set below
 
         if not self._tuo_available():
             return None, None, ""
@@ -10780,6 +11603,25 @@ $(document).ready(function(){
                           + ("" if recommended == _pick['deck_order_card']
                              else f"  (first hand card would have been {_pick['deck_order_card']})"),
                           flush=True)
+                    # The forecast is the flex value of the card that is played: the same decision rule
+                    # as the real game play, and available before the card is played.
+                    _fv = _pick['values'].get(recommended)
+                    if _fv is not None:
+                        _rp = win_pct
+                        win_pct = float(_fv)
+                        _diff = abs(_rp - win_pct)
+                        self._last_forecast_info = {
+                            'source': 'flex', 'reorder': round(_rp, 1), 'flex': win_pct,
+                            'diff': round(_diff, 1), 'flag': _diff >= FORECAST_DIFF_FLAG}
+                        if _diff >= FORECAST_DIFF_FLAG:
+                            print(f"  ⚠ Forecast marker: reorder {_rp:.1f}% vs flex {win_pct:.0f}% "
+                                  f"(difference {_diff:.0f} points)", flush=True)
+            if self._last_forecast_info is None:
+                self._last_forecast_info = {'source': 'reorder', 'reorder': round(win_pct, 1),
+                                            'flex': None, 'diff': None, 'flag': False,
+                                            # <= 2 hand cards: no flexible choice possible, the fixed-order
+                                            # value is extreme (0 / 100) and not comparable - see suspicious check
+                                            'late_fallback': len(hand_cards) <= 2}
 
             return win_pct, recommended, output
 
@@ -11493,6 +12335,33 @@ $(document).ready(function(){
             out['enemy_deck_added'] = list(_da)   # enemy cards the sim had to add (seen in play, not in the known deck)
         return out
 
+    @staticmethod
+    def _flat_scalars(obj, prefix='', depth=2, skip=()):
+        """Flatten the scalar values of a (nested) dict for the brawl match log; lists and big structures are skipped."""
+        out = {}
+        if not isinstance(obj, dict):
+            return out
+        for k, v in obj.items():
+            if k in skip:
+                continue
+            key = f"{prefix}{k}"
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                out[key] = v
+            elif isinstance(v, dict) and depth > 1 and len(v) <= 40:
+                out.update(TyrantCommander._flat_scalars(v, key + '.', depth - 1, skip))
+        return out
+
+    def _brawl_matchlog_append(self, rec):
+        """Append one JSON line to export/brawl_matchlog.jsonl (opponent assignment analysis over many brawls)."""
+        import json as _json
+        try:
+            d = os.path.join(SCRIPT_DIR, 'export')
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, 'brawl_matchlog.jsonl'), 'a', encoding='utf-8') as f:
+                f.write(_json.dumps(rec, ensure_ascii=False, default=str) + '\n')
+        except Exception as _e:
+            print(f"  ⚠ brawl match log not written: {_e}")
+
     def _write_combat_log(self, log_data, account_name=''):
         """
         Write a combat log JSON to combatlog/<account>/
@@ -11511,6 +12380,11 @@ $(document).ready(function(){
         _mode   = str(log_data.get('mode') or 'unknown').lower().replace(' ', '_')
         fname   = f"{ts}_{_mode}_{result}_vs_{enemy}.json"
         fpath   = os.path.join(log_dir, fname)
+        if _mode == 'brawl':
+            self._brawl_matchlog_append({'type': 'result', 'ts': _dt.now().isoformat(timespec='seconds'),
+                                         'account': account_name, 'battle_id': log_data.get('battle_id'),
+                                         'enemy_name': log_data.get('enemy_name'), 'result': result,
+                                         'turns': len(log_data.get('turns') or [])})
 
         # Last game turn of the fight (events_after holds the whole rest of the fight after the sim stops).
         # The game ends a fight without a dead commander after 50 game turns: a LOSS that reaches turn 50
@@ -12498,6 +13372,7 @@ $(document).ready(function(){
                         'tuo_flex':        getattr(self, '_last_flex_pick', None),
                         'hand':            [cname for (_, _, cname) in hand_display],
                         'field':           _cl_field,
+                        'forecast':         getattr(self, '_last_forecast_info', None),
                         'appear_seq':      dict(getattr(self, '_appear_seq', {}) or {}),
                         **self._cl_turn_extra(_cl_bd_after if battle_result else None,
                                               vars().get('_cl_own_uids'), vars().get('_cl_enemy_uids'),
@@ -12795,6 +13670,29 @@ $(document).ready(function(){
                 print(f"  {_sym} Live fetch: {_fetch_status} – using cached deck")
             else:
                 print(f"  ⚠ Live fetch: {_fetch_status} – no deck available")
+
+            # ── Brawl match log: one line per assigned opponent (export/brawl_matchlog.jsonl) ──
+            try:
+                from datetime import datetime as _mdt
+                _pbd_m = pbd if isinstance(pbd, dict) else {}
+                _fac_m = self.init_data.get('faction') or {}
+                self._brawl_matchlog_append({
+                    'type': 'match', 'ts': _mdt.now().isoformat(timespec='seconds'),
+                    'account': self.api.settings.get('request_data', {}).get('kong_name', ''),
+                    'brawl': brawl_name, 'brawl_id': abd.get('id') if isinstance(abd, dict) else None,
+                    'bge': bge_name, 'battle_id': battle_id, 'enemy_name': enemy_name,
+                    'enemy_guild_cached': _cached_guild or '',
+                    'own_guild': _fac_m.get('name', ''), 'own_guild_id': _fac_m.get('faction_id', _fac_m.get('id', '')),
+                    'own_points': _pbd_m.get('points'),
+                    'enemy_commander': atk_cmd, 'enemy_deck': enemy_deck_str, 'enemy_deck_source': _fetch_status,
+                    'host_is_attacker': battle_data.get('host_is_attacker'),
+                    'battle_data_keys': sorted(battle_data.keys()),
+                    'battle_data': self._flat_scalars(battle_data, skip=('card_map', 'turn', 'field', 'attack_deck', 'defend_deck', 'tokens', 'eds', 'rewards')),
+                    'active_brawl': self._flat_scalars(abd if isinstance(abd, dict) else {}, skip=('rules', 'rewards', 'levels')),
+                    'player_brawl': self._flat_scalars(_pbd_m, skip=('rewards',)),
+                })
+            except Exception as _me:
+                print(f"  ⚠ brawl match log not written: {_me}")
 
             # ── Enemy's first played card (turn 1) ────────────────────
             turn_data      = battle_data.get('turn', {})
@@ -13157,6 +14055,7 @@ $(document).ready(function(){
                         'tuo_flex':        getattr(self, '_last_flex_pick', None),
                         'hand':            [cname for (_, _, cname) in hand_display],
                         'field':           _cl_field,
+                        'forecast':         getattr(self, '_last_forecast_info', None),
                         'appear_seq':      dict(getattr(self, '_appear_seq', {}) or {}),
                         **self._cl_turn_extra(_cl_bd_after if battle_result else None,
                                               vars().get('_cl_own_uids'), vars().get('_cl_enemy_uids'),
@@ -13801,6 +14700,7 @@ $(document).ready(function(){
                         'tuo_flex':        getattr(self, '_last_flex_pick', None),
                         'hand':            [cname for (_, _, cname) in hand_display],
                         'field':           _cl_field,
+                        'forecast':         getattr(self, '_last_forecast_info', None),
                         'appear_seq':      dict(getattr(self, '_appear_seq', {}) or {}),
                         **self._cl_turn_extra(_cl_bd_after if battle_result else None,
                                               vars().get('_cl_own_uids'), vars().get('_cl_enemy_uids'),
@@ -27819,6 +28719,8 @@ def interactive_menu():
             commander.build_brawl_gauntlet(mode='previous'); input("\n[ENTER] to continue...")
         elif choice == "18b":
             commander.build_brawl_gauntlet(mode='current'); input("\n[ENTER] to continue...")
+        elif choice == "18c":
+            commander.rebuild_brawl_gauntlet_from_arenagauntlet(); input("\n[ENTER] to continue...")
         elif choice == "19":
             try:
                 n_input = input_with_esc("Number of packages (ESC=Cancel): ")
@@ -28179,6 +29081,10 @@ def interactive_menu():
             commander.combat_log_winrates(); input("\n[ENTER] to continue...")
         elif choice == "suspicious_logs":
             commander.check_suspicious_combat_logs(); input("\n[ENTER] to continue...")
+        elif choice == "brawl_matchlog":
+            commander.analyze_brawl_matchlog(); input("\n[ENTER] to continue...")
+        elif choice == "log_reports":
+            commander.log_reports_menu()
         elif choice == "92":
             db_mb = commander._tuo_database_size_mb()
             print(f"\n  database.yml: {db_mb:.1f} MB  ({commander._tuo_database_path()})")
@@ -28320,6 +29226,7 @@ def interactive_menu():
             '12': '17',
             '13': '18',
             '14': '18b',
+            '15': '18c',
         }
         while True:
             print("\n" + "="*52)
@@ -28339,6 +29246,7 @@ def interactive_menu():
             print(" 12.   Merge arenagauntlet.txt (from import folder)")
             print(" 13.   Build Brawl Gauntlet – last brawl  (defense + attack)")
             print(" 14.   Build Brawl Gauntlet – current brawl  (defense + attack)")
+            print(" 15.   Build Gauntlet with last Previous_Brawl.txt  (order from file, decks from arenagauntlet.txt)")
             print("─"*52)
             print("  0.   ← Back to Main Menu")
             print("="*52)
@@ -28473,7 +29381,8 @@ def interactive_menu():
     # ── Submenu: Settings ─────────────────────────────────────────────────────
 
     def _menu_settings():
-        _map = {'1': '3', '2': '91', '3': '92', '4': '37', '5': 'scan_flags', '6': 'suspicious_logs', '7': 'winrates'}
+        _map = {'1': '3', '2': '91', '3': '92', '4': '37', '5': 'scan_flags', '6': 'log_reports',
+                '7': 'winrates', '8': 'brawl_matchlog', '9': 'log_reports'}  # 7-9: hidden aliases of the old numbers
         while True:
             t_val  = commander.tuo_threads
             _db_mb = commander._tuo_database_size_mb()
@@ -28486,8 +29395,7 @@ def interactive_menu():
             print(f"  3.   database.yml ({db_str})")
             print("  4.   Clear Old Gauntlet Entries (>7 days)")
             print("  5.   Scan Combat Logs for Unknown sim.cpp Flags")
-            print("  6.   Check Suspicious Combat Logs (Loss ≥95% / Win ≤5%)")
-            print("  7.   Win Rate per Mode and Account (from Combat Logs)")
+            print("  6.   Log Analysis Reports (suspicious logs, win rates, calibration, decks, sim ranking, brawl match log)")
             print("─"*52)
             print("  0.   ← Back to Main Menu")
             print("="*52)
