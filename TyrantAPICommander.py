@@ -146,7 +146,7 @@ if DEBUG_MODE:
 
 # Script version: written into every combat log, so old logs can be told apart from fixed behaviour.
 # Format YYYY.MM.DD-N; raise it with every behaviour change.
-SCRIPT_VERSION = "2026.11.04-21"
+SCRIPT_VERSION = "2026.11.07-23"
 # Forecast = flex value of the card that is played (known before the card is played). When it differs from
 # the reorder forecast by at least this many points, the turn gets a marker in the log and on the console.
 FORECAST_DIFF_FLAG = 40
@@ -1779,6 +1779,8 @@ $(document).ready(function(){
         if energy <= 0:
             if not silent:
                 print("  ⚡ No energy – nothing to do.")
+            if _s6_exists and _prev_slot_m != MISSION_SLOT:
+                self.api.call('setActiveDeck', deck_id=_prev_slot_m)   # was left on the mission slot before
             return 0, 0, 0
 
         run = wins = losses = gold_total = 0
@@ -7942,8 +7944,10 @@ $(document).ready(function(){
         if os.path.isfile(sim_path):
             with open(sim_path, 'r', encoding='utf-8', errors='ignore') as f:
                 sim_src = f.read()
-            # Match all f.count("flag_name") and f.at("flag_name") patterns
-            KNOWN = set(_re.findall(r'f\.(?:count|at)\("([^"]+)"', sim_src))
+            # Match every .count("flag_name") / .at("flag_name") / ->count(...) access, whatever the map variable is called
+            # (f, fl, sit->second, dit->second ...). The old pattern only knew "f." and reported flags that sim.cpp
+            # handles under another variable name (played_turns, summon_turns, summon_src, cmd_damage, dead).
+            KNOWN = set(_re.findall(r'(?:\.|->)(?:count|at)\("([^"]+)"\)', sim_src))
             print(f"\n  ✓ Loaded {len(KNOWN)} known flags from sim.cpp")
         else:
             print(f"\n  ⚠ sim.cpp not found at {sim_path}")
@@ -14869,16 +14873,28 @@ $(document).ready(function(){
         elif not _slot5_exists:
             print(f"  ⚠ Slot {RAID_SLOT} (Raid) not unlocked — using current deck")
 
+        def _restore_raid_slot():
+            """Put the previous deck slot back on EVERY exit path (early returns used to leave the account on slot 5)."""
+            if _slot5_exists and _prev_slot != RAID_SLOT:
+                try:
+                    self.api.call('setActiveDeck', deck_id=_prev_slot)
+                    if not silent:
+                        print(f"  ↩ Restored active deck -> Slot {_prev_slot}")
+                except Exception as _e:
+                    print(f"  ⚠ Could not restore deck slot {_prev_slot}: {_e}")
+
         # ── Initial raid info via getRaidInfo ─────────────────────────────────
         try:
             ri_result = self.api.call('getRaidInfo')
             raid_info = (ri_result or {}).get('raid_info', {})
         except Exception as e:
             print(f"  ✗ getRaidInfo failed: {e}")
+            _restore_raid_slot()
             return 0, 0, 0
 
         if not raid_info:
             print("  ✗ No active raid found")
+            _restore_raid_slot()
             return 0, 0, 0
 
         # Pick first active raid (status '0'); fall back to first entry
@@ -14918,11 +14934,13 @@ $(document).ready(function(){
 
         if battle_energy <= 0:
             print("  ✗ No battle energy – nothing to do")
+            _restore_raid_slot()
             return 0, 0, 0
 
         if not silent:
             sel = input_with_esc("\n  [Enter] Start  (ESC=Cancel): ", allow_empty=True)
             if sel is None:
+                _restore_raid_slot()
                 return 0, 0, 0
 
         # ── Stats ─────────────────────────────────────────────────────────────
@@ -15074,10 +15092,7 @@ $(document).ready(function(){
             print("═"*65)
 
         # ── Restore original deck slot ────────────────────────────────────────
-        if _slot5_exists and _prev_slot != RAID_SLOT:
-            self.api.call('setActiveDeck', deck_id=_prev_slot)
-            if not silent:
-                print(f"  ↩ Restored active deck -> Slot {_prev_slot}")
+        _restore_raid_slot()
 
         return total_battles, total_damage, total_gold
 
